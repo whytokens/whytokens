@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>whytokens dashboard</title>
+<link rel="stylesheet" href="/static/styles.css">
+<script>
+/* Apply a saved theme before first paint (no flash). Same key as theme.js. */
+try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+</head>
+<body>
+<nav id="tab-bar" aria-label="Screens">
+  <div class="brand"><span class="brand-icon" role="img" aria-label="whytokens"></span><span class="brand-name">whytokens</span></div>
+  <button class="tab-btn" id="tab-overview" data-tab="overview" aria-current="page" aria-controls="panel-overview" aria-label="Overview" title="Overview"><span class="ico" aria-hidden="true">&#9684;</span><span class="lbl">Overview</span></button>
+  <button class="tab-btn" id="tab-sessions" data-tab="sessions" aria-controls="panel-sessions" aria-label="Sessions" title="Sessions"><span class="ico" aria-hidden="true">&#9776;</span><span class="lbl">Sessions</span></button>
+  <button class="tab-btn" id="tab-trace" data-tab="trace" aria-controls="panel-trace" aria-label="Trace" title="Trace"><span class="ico" aria-hidden="true">&#8767;</span><span class="lbl">Trace</span></button>
+  <button class="tab-btn" id="tab-waste" data-tab="waste" aria-controls="panel-waste" aria-label="Waste" title="Waste"><span class="ico" aria-hidden="true">&#9660;</span><span class="lbl">Waste</span></button>
+  <button class="tab-btn" id="tab-sources" data-tab="sources" aria-controls="panel-sources" aria-label="Sources" title="Sources"><span class="ico" aria-hidden="true">&#9921;</span><span class="lbl">Sources</span></button>
+  <button class="tab-btn" id="tab-settings" data-tab="settings" aria-controls="panel-settings" aria-label="Settings" title="Settings"><span class="ico" aria-hidden="true">&#9881;</span><span class="lbl">Settings</span></button>
+  <div class="rail-spacer"></div>
+  <button class="tab-btn" id="rail-toggle" aria-expanded="false" aria-controls="tab-bar" aria-label="Navigation labels" title="Expand navigation" onclick="toggleRail()"><span class="ico" id="rail-arrow" aria-hidden="true">&#8250;</span><span class="lbl">Collapse</span></button>
+</nav>
+
+<div class="col">
+<div id="filter-bar" role="toolbar" aria-label="Filters">
+  <div class="filter-label">Models</div>
+  <div id="model-checkboxes"></div>
+  <button class="filter-btn" onclick="selectAllModels()">All</button>
+  <button class="filter-btn" onclick="clearAllModels()">None</button>
+  <span id="project-chip-slot"></span>
+  <div class="filter-sep"></div>
+  <div class="filter-label">Range</div>
+  <div class="range-group">
+    <button class="range-btn" data-range="today" onclick="setRange('today')">Today</button>
+    <button class="range-btn" data-range="week" onclick="setRange('week')">This Week</button>
+    <button class="range-btn" data-range="month" onclick="setRange('month')">This Month</button>
+    <button class="range-btn" data-range="prev-month" onclick="setRange('prev-month')">Prev Month</button>
+    <button class="range-btn" data-range="7d"  onclick="setRange('7d')">7d</button>
+    <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
+    <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
+    <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
+  </div>
+  <div class="filter-sep"></div>
+  <div class="filter-label" title="Calendar every day bucket, range bound and timestamp is reported in. Claude's own usage page reports UTC.">Time</div>
+  <div class="tz-group">
+    <button class="tz-btn" data-tz="local" onclick="setDisplayTZ('local')">Local</button>
+    <button class="tz-btn" data-tz="utc"   onclick="setDisplayTZ('utc')">UTC</button>
+  </div>
+  <div class="filter-meta" id="meta">Loading...</div>
+</div>
+<div id="status-banner" role="status" hidden></div>
+
+<main class="container" id="dashboard-view">
+  <h1 class="sr-only">whytokens</h1>
+
+  <section class="tab-panel" id="panel-overview" data-panel="overview">
+    <div class="stats-row" id="stats-row"></div>
+    <div class="charts-grid">
+      <div class="chart-card wide">
+        <h2 id="daily-chart-title">Daily Token Usage</h2>
+        <div class="chart-wrap tall"><canvas id="chart-daily"></canvas></div>
+      </div>
+      <div class="chart-card wide">
+        <div class="chart-header">
+          <h2 id="hourly-chart-title">Average Hourly Distribution</h2>
+          <div class="chart-header-right">
+            <span class="peak-legend" title="Mon–Fri 05:00–11:00 PT — Anthropic peak-hour throttling window"><span class="peak-swatch"></span>Peak hours (PT)</span>
+            <span class="chart-day-count" id="hourly-day-count"></span>
+          </div>
+        </div>
+        <div class="chart-wrap"><canvas id="chart-hourly"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <h2>By Model</h2>
+        <div class="chart-wrap"><canvas id="chart-model"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <h2>Top Projects by Tokens</h2>
+        <div class="chart-wrap"><canvas id="chart-project"></canvas></div>
+      </div>
+    </div>
+    <div class="table-card">
+      <div class="section-title">Cost by Model</div>
+      <table>
+        <thead><tr>
+          <th>Model</th>
+          <th class="sortable" onclick="setModelSort('turns')">Turns <span class="sort-icon" id="msort-turns"></span></th>
+          <th class="sortable" onclick="setModelSort('input')">Input <span class="sort-icon" id="msort-input"></span></th>
+          <th class="sortable" onclick="setModelSort('output')">Output <span class="sort-icon" id="msort-output"></span></th>
+          <th class="sortable" onclick="setModelSort('cache_read')">Cache Read <span class="sort-icon" id="msort-cache_read"></span></th>
+          <th class="sortable" onclick="setModelSort('cache_creation')">Cache Creation <span class="sort-icon" id="msort-cache_creation"></span></th>
+          <th class="sortable" onclick="setModelSort('cost')">Est. Cost <span class="sort-icon" id="msort-cost"></span></th>
+        </tr></thead>
+        <tbody id="model-cost-body"></tbody>
+      </table>
+      <div class="table-foot" id="model-cost-foot"></div>
+    </div>
+    <details class="table-card collapsible">
+      <summary>Cost by Effort Level</summary>
+      <table>
+        <thead><tr>
+          <th>Effort</th>
+          <th>Turns</th>
+          <th>Input</th>
+          <th>Output</th>
+          <th>Cache Read</th>
+          <th>Cache Creation</th>
+          <th>Est. Cost</th>
+        </tr></thead>
+        <tbody id="effort-cost-body"></tbody>
+      </table>
+    </details>
+    <details class="table-card collapsible">
+      <summary>Cost Breakdown</summary>
+      <table>
+        <thead><tr>
+          <th>Input</th>
+          <th>Output</th>
+          <th>Cache Read</th>
+          <th>Cache Creation</th>
+          <th>Total</th>
+          <th>Est. Cache Savings</th>
+          <th>Cache Share</th>
+        </tr></thead>
+        <tbody id="cost-breakdown-body"></tbody>
+      </table>
+    </details>
+    <h2 class="sub-section" id="projects">By project</h2>
+    <div class="table-card">
+      <div class="section-header"><div class="section-title">Cost by Project</div><button class="export-btn" onclick="exportProjectsCSV()" title="Export all projects to CSV">&#x2913; CSV</button></div>
+      <p class="table-hint">Projects with more than one branch expand to a per-branch breakdown — click the ▸ caret.</p>
+      <table>
+        <thead><tr>
+          <th>Project</th>
+          <th class="sortable" onclick="setProjectSort('sessions')">Sessions <span class="sort-icon" id="psort-sessions"></span></th>
+          <th class="sortable" onclick="setProjectSort('turns')">Turns <span class="sort-icon" id="psort-turns"></span></th>
+          <th class="sortable" onclick="setProjectSort('input')">Input <span class="sort-icon" id="psort-input"></span></th>
+          <th class="sortable" onclick="setProjectSort('output')">Output <span class="sort-icon" id="psort-output"></span></th>
+          <th class="sortable" onclick="setProjectSort('cost')">Est. Cost <span class="sort-icon" id="psort-cost"></span></th>
+        </tr></thead>
+        <tbody id="project-cost-body"></tbody>
+      </table>
+      <div class="table-foot" id="project-cost-foot"></div>
+    </div>
+    <details class="table-card collapsible">
+      <summary>Cost by Project &amp; Branch <button class="export-btn" onclick="event.preventDefault(); event.stopPropagation(); exportProjectBranchCSV()" title="Export project+branch breakdown to CSV">&#x2913; CSV</button></summary>
+      <table>
+        <thead><tr>
+          <th>Project</th>
+          <th>Branch</th>
+          <th class="sortable" onclick="setProjectBranchSort('sessions')">Sessions <span class="sort-icon" id="pbsort-sessions"></span></th>
+          <th class="sortable" onclick="setProjectBranchSort('turns')">Turns <span class="sort-icon" id="pbsort-turns"></span></th>
+          <th class="sortable" onclick="setProjectBranchSort('input')">Input <span class="sort-icon" id="pbsort-input"></span></th>
+          <th class="sortable" onclick="setProjectBranchSort('output')">Output <span class="sort-icon" id="pbsort-output"></span></th>
+          <th class="sortable" onclick="setProjectBranchSort('cost')">Est. Cost <span class="sort-icon" id="pbsort-cost"></span></th>
+        </tr></thead>
+        <tbody id="project-branch-cost-body"></tbody>
+      </table>
+      <div class="table-foot" id="project-branch-cost-foot"></div>
+    </details>
+    <details class="collapsible" id="tools">
+      <summary>By tool / MCP / subagent</summary>
+    <div class="table-card">
+      <div class="section-title">Turn Cost by First Tool</div>
+      <p class="muted">Each turn is counted once under its first tool, including all context tokens. This is whole-turn attribution, not marginal tool cost. Codex/GPT amounts are API-equivalent estimates; mixed totals include those estimates. All calls remain visible in session details.</p>
+      <table>
+        <thead><tr>
+          <th>Tool</th>
+          <th>Turns</th>
+          <th>Input</th>
+          <th>Output</th>
+          <th>Cache Read</th>
+          <th>Cache Creation</th>
+          <th>Est. Cost</th>
+        </tr></thead>
+        <tbody id="tool-cost-body"></tbody>
+      </table>
+    </div>
+    <div class="table-card">
+      <div class="section-title">Cost by MCP Server</div>
+      <div class="table-hint">Turns that consumed an MCP tool's result, by server. Overlaps the tool table above and the main/subagent/skill split &mdash; don't add them up. UUID names are claude.ai connectors.</div>
+      <table>
+        <thead><tr>
+          <th>MCP server</th>
+          <th>Turns</th>
+          <th>Input</th>
+          <th>Output</th>
+          <th>Cache Read</th>
+          <th>Cache Creation</th>
+          <th>Est. Cost</th>
+        </tr></thead>
+        <tbody id="mcp-cost-body"></tbody>
+      </table>
+    </div>
+    <div class="charts-grid">
+      <div class="chart-card wide">
+        <div class="section-title">Subagent Tokens by Type</div>
+        <p class="table-hint">Task/Agent (subagent) dispatches in range, tokens summed by agent type. Reported by Claude Code per dispatch. Claude only — Codex has no subagents.</p>
+        <div class="chart-wrap"><canvas id="chart-subagent"></canvas></div>
+      </div>
+    </div>
+    <details class="table-card collapsible">
+      <summary>Top Subagent Dispatches</summary>
+      <table>
+        <thead><tr>
+          <th>Agent Type</th>
+          <th>Session</th>
+          <th>Project</th>
+          <th>Tokens</th>
+          <th>Duration</th>
+          <th>Tool Uses</th>
+        </tr></thead>
+        <tbody id="subagent-dispatch-body"></tbody>
+      </table>
+    </details>
+    </details>
+  </section>
+
+  <section class="tab-panel" id="panel-sessions" data-panel="sessions" hidden>
+    <div class="table-card">
+      <div class="section-header"><div class="section-title">Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
+      <div class="session-filter-bar">
+        <div class="filter-field">
+          <label for="session-project-filter">Project</label>
+          <input id="session-project-filter" type="search" placeholder="Any project" oninput="onSessionFilterChange()">
+        </div>
+        <div class="filter-field">
+          <label for="session-branch-filter">Branch</label>
+          <input id="session-branch-filter" type="search" placeholder="Any branch" oninput="onSessionFilterChange()">
+        </div>
+        <div class="filter-field">
+          <label for="session-tool-filter">Tool</label>
+          <select id="session-tool-filter" onchange="onSessionFilterChange()"><option value="">All tools</option></select>
+        </div>
+        <div class="filter-field">
+          <label for="session-min-cost-filter">Min Cost</label>
+          <input id="session-min-cost-filter" type="number" min="0" step="0.01" placeholder="$0" oninput="onSessionFilterChange()">
+        </div>
+        <label class="filter-check"><input id="session-cache-filter" type="checkbox" onchange="onSessionFilterChange()">Cache creation</label>
+        <button class="filter-btn" onclick="clearSessionFilters()">Clear</button>
+      </div>
+      <table>
+        <thead><tr>
+          <th>Session</th>
+          <th>Project</th>
+          <th>Title</th>
+          <th class="sortable" onclick="setSessionSort('last')">Last Active <span class="sort-icon" id="sort-icon-last"></span></th>
+          <th class="sortable" onclick="setSessionSort('duration_min')">Duration <span class="sort-icon" id="sort-icon-duration_min"></span></th>
+          <th>Model</th>
+          <th class="sortable" onclick="setSessionSort('turns')">Turns <span class="sort-icon" id="sort-icon-turns"></span></th>
+          <th class="sortable" onclick="setSessionSort('input')">Input <span class="sort-icon" id="sort-icon-input"></span></th>
+          <th class="sortable" onclick="setSessionSort('output')">Output <span class="sort-icon" id="sort-icon-output"></span></th>
+          <th class="sortable" onclick="setSessionSort('cache_read')">Cache Read <span class="sort-icon" id="sort-icon-cache_read"></span></th>
+          <th class="sortable" onclick="setSessionSort('cache_creation')">Cache Creation <span class="sort-icon" id="sort-icon-cache_creation"></span></th>
+          <th class="sortable" onclick="setSessionSort('cost')">Est. Cost <span class="sort-icon" id="sort-icon-cost"></span></th>
+        </tr></thead>
+        <tbody id="sessions-body"></tbody>
+      </table>
+      <div class="table-foot" id="sessions-foot"></div>
+    </div>
+    <details class="table-card collapsible">
+      <summary>Expensive Session Signals</summary>
+      <table>
+        <thead><tr>
+          <th>Session</th>
+          <th>Project</th>
+          <th>Cost</th>
+          <th>Cost / Min</th>
+          <th>Tokens / Min</th>
+          <th>Output / Turn</th>
+          <th>Cache Share</th>
+        </tr></thead>
+        <tbody id="session-signals-body"></tbody>
+      </table>
+    </details>
+  </section>
+
+  <section class="tab-panel" id="panel-trace" data-panel="trace" hidden>
+    <div class="empty-state" id="trace-empty">No session selected. Pick a session on the Sessions screen, or follow a session link from Waste.</div>
+    <div class="hidden" id="session-detail-view">
+  <div class="detail-workspace-header">
+    <div class="detail-title-group">
+      <div class="detail-title" id="session-detail-title">Session Drilldown</div>
+      <div class="detail-subtitle" id="session-detail-subtitle"></div>
+    </div>
+    <div class="detail-actions">
+      <button class="export-btn" onclick="closeSessionDetail()" title="Back to Sessions">&larr; Sessions</button>
+      <button class="export-btn" onclick="exportSessionTurnsCSV()" title="Export selected session turns to CSV">&#x2913; CSV</button>
+    </div>
+  </div>
+  <div class="detail-stats" id="session-detail-stats"></div>
+  <div class="table-card">
+    <div class="section-title">Tool Breakdown</div>
+    <table>
+      <thead><tr>
+        <th>Tool</th>
+        <th>Turns</th>
+        <th>Input</th>
+        <th>Output</th>
+        <th>Cache Read</th>
+        <th>Cache Creation</th>
+        <th>Est. Cost</th>
+        <th>Cost Share</th>
+      </tr></thead>
+      <tbody id="session-tool-breakdown-body"></tbody>
+    </table>
+  </div>
+  <div class="table-card">
+    <div class="section-title">Session Timeline</div>
+    <div class="timeline-wrap"><canvas id="chart-session-timeline"></canvas></div>
+  </div>
+  <div class="table-card">
+    <div class="section-title">Turns</div>
+    <div id="session-actors" class="muted"></div>
+    <table>
+      <thead><tr>
+        <th>Time</th>
+        <th>Actor</th>
+        <th>Idle</th>
+        <th>Context</th>
+        <th>Tool</th>
+        <th>Model</th>
+        <th>Input</th>
+        <th>Output</th>
+        <th>Cache Read</th>
+        <th>Cache Creation</th>
+        <th>Cache 5m</th>
+        <th>Cache 1h</th>
+        <th>Duration</th>
+        <th>Stop</th>
+        <th>Tier</th>
+        <th>Est. Cost</th>
+      </tr></thead>
+      <tbody id="session-detail-body"></tbody>
+    </table>
+  </div>
+    </div>
+  </section>
+
+  <section class="tab-panel" id="panel-waste" data-panel="waste" hidden>
+    <div class="table-card">
+      <div class="section-title">Waste by cause</div>
+      <p class="muted" id="waste-basis">Priced at API list rate. Amounts are attributed, a lower bound, never savings.</p>
+      <table>
+        <thead><tr><th>Cause</th><th>Evidence tier</th><th>Sessions</th><th>Attributed (API list rate)</th></tr></thead>
+        <tbody id="waste-rollup-body"></tbody>
+      </table>
+    </div>
+    <div class="table-card">
+      <div class="section-title">Measurement status (cause &times; source)</div>
+      <table id="waste-measure"></table>
+    </div>
+    <div class="table-card">
+      <div class="section-title">Sessions</div>
+      <div id="waste-findings"></div>
+    </div>
+  </section>
+
+  <section class="tab-panel" id="panel-sources" data-panel="sources" hidden>
+    <div class="table-card">
+      <div class="section-header">
+        <div class="section-title">Sources</div>
+        <button class="action-btn" id="rescan-btn" onclick="triggerRescan()" title="Incrementally re-scan JSONL files for new or updated data (does not rebuild the database). Use if the dashboard looks stale.">&#x21bb; Rescan</button>
+      </div>
+      <p class="muted" id="sources-scan"></p>
+      <table>
+        <thead><tr><th>Source</th><th>Path</th><th>Status</th></tr></thead>
+        <tbody id="sources-body"></tbody>
+      </table>
+      <p class="table-hint" id="sources-note"></p>
+    </div>
+  </section>
+
+  <section class="tab-panel" id="panel-settings" data-panel="settings" hidden>
+    <div class="table-card">
+      <div class="section-title">Preferences</div>
+      <div class="settings-row">
+        <span class="filter-label" id="theme-label">Theme</span>
+        <div class="range-group" role="group" aria-labelledby="theme-label">
+          <button class="seg-btn" data-theme-opt="system" aria-pressed="true" onclick="setTheme('system')">System</button>
+          <button class="seg-btn" data-theme-opt="light" aria-pressed="false" onclick="setTheme('light')">Light</button>
+          <button class="seg-btn" data-theme-opt="dark" aria-pressed="false" onclick="setTheme('dark')">Dark</button>
+        </div>
+      </div>
+      <div class="settings-row">
+        <span class="filter-label" id="tzdef-label">Default time zone</span>
+        <div class="range-group" role="group" aria-labelledby="tzdef-label">
+          <button class="seg-btn" data-tzdef="local" aria-pressed="true" onclick="setDefaultTZ('local')">Local</button>
+          <button class="seg-btn" data-tzdef="utc" aria-pressed="false" onclick="setDefaultTZ('utc')">UTC</button>
+        </div>
+        <span class="muted">Used when the URL has no <code>tz</code>. The filter bar toggle changes the current view only.</span>
+      </div>
+      <div class="settings-row">
+        <span class="filter-label">Refresh</span>
+        <label class="autorefresh-label" title="Rescan every 30 seconds while the selected range includes today. Off by default.">
+          <input type="checkbox" id="autorefresh-cb" onchange="onAutoRefreshToggle()"> Auto-refresh every 30 seconds
+        </label>
+      </div>
+    </div>
+    <div id="pricing">
+    <div class="table-card">
+      <div class="section-header">
+        <div class="section-title">Pricing basis ($ / MTok)</div>
+        <button class="export-btn" onclick="resetPricing()" title="Restore built-in dashboard pricing">Reset</button>
+      </div>
+      <table>
+        <thead><tr>
+          <th>Model</th>
+          <th>Input</th>
+          <th>Output</th>
+          <th>Cache Read</th>
+          <th title="Cache creation, 5-minute TTL (1.25x input)">Cache Write 5m</th>
+          <th title="Cache creation, 1-hour TTL (2x input). Claude Code writes most of its cache at 1h.">Cache Write 1h</th>
+          <th>Source</th>
+        </tr></thead>
+        <tbody id="pricing-body"></tbody>
+      </table>
+    </div>
+    </div>
+  </section>
+</main>
+
+<div id="tool-detail-overlay" class="tool-overlay hidden" onclick="closeToolPanel()"></div>
+<aside id="tool-detail-panel" class="tool-panel hidden">
+  <div class="tool-panel-head">
+    <div>
+      <div class="title" id="tool-panel-title">Tool calls</div>
+      <div class="sub" id="tool-panel-sub"></div>
+    </div>
+    <button class="export-btn" onclick="closeToolPanel()" title="Close">&#x2715; Close</button>
+  </div>
+  <div class="tool-panel-body" id="tool-panel-body"></div>
+</aside>
+
+<footer>
+  <div class="footer-content">
+    <p>Cost estimates use editable dashboard pricing defaults: Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>, September 2026) and OpenAI API pricing (July 2026). Custom price edits are saved in this browser only. Anthropic models (<em>fable</em>/<em>opus</em>/<em>sonnet</em>/<em>haiku</em>) are priced at API rates; plan-included Codex/GPT usage is shown in a distinct color as an API-equivalent estimate. Other models show <em>n/a</em>. Actual costs for Max/Pro/Plus subscribers differ from API pricing.</p>
+    <p>
+      whytokens &middot; Apache-2.0
+      &nbsp;&middot;&nbsp;
+      Derived from <a href="https://github.com/phuryn/claude-usage" target="_blank">claude-usage</a> by Pawel Huryn (MIT)
+    </p>
+  </div>
+</footer>
+
+</div>
+
+<!-- Vendored Chart.js (UMD, attaches window.Chart). Classic script so it runs
+     before the deferred ES module below, which references Chart at import time.
+     Served locally so the dashboard works fully offline. -->
+<script src="/static/vendor/chart.umd.min.js"></script>
+<script type="module" src="/static/modules/app.js"></script>
+</body>
+</html>

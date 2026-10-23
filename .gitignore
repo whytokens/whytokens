@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+.venv/
+venv/
+.local-delegate/
+.claude/scheduled_tasks.lock
+run.log

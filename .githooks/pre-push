@@ -1,0 +1,3 @@
+#!/bin/sh
+# Push gate: the full suite must be green. Enabled with: git config core.hooksPath .githooks
+python -m unittest discover -s tests -q >/dev/null 2>&1 || { echo "WT-PRE-PUSH-REFUSED: tests red (python -m unittest discover -s tests)"; exit 1; }

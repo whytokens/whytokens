@@ -1,0 +1,17 @@
+* text=auto eol=lf
+*.png binary
+*.svg text eol=lf
+# Private-only paths, dropped by `git archive` in the release export (07 section 9).
+docs/private/ export-ignore
+.claude/ export-ignore
+scripts/nightly*.ps1 export-ignore
+ext/ export-ignore
+CHANGELOG.md export-ignore
+BACKLOG.md export-ignore
+RELEASES.md export-ignore
+scripts/release*.py export-ignore
+scripts/falsify_release*.py export-ignore
+docs/PHASE*.md export-ignore
+AGENTS.md export-ignore
+CLAUDE.md export-ignore
+DESIGN.md export-ignore
