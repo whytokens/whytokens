@@ -28,8 +28,36 @@ MUTANTS = [
     ("api.py", '"total_usd": sum(f["usd"] for f in findings)', '"total_usd": 0.0'),
     ("static/index.html", 'data-tab="waste"', 'data-tab="wasted"'),
     ("static/index.html", "Priced at API list rate. Amounts", "Priced at list. Amounts"),
+    # subagent lanes and synthetic rows
+    ("waste.py", 'if creation and not lane["preamble"]:', "if creation:"),
+    ("waste.py", 'lane = lanes.setdefault(turn["agent_id"],', "lane = lanes.setdefault(None,"),
+    ("waste.py", 'if turn["is_sidechain"] and not turn["agent_id"]:', "if False:"),
+    ("waste.py", 'if turn["is_sidechain"] and not turn["agent_id"]:', 'if turn["is_sidechain"] and turn["agent_id"] is None:'),
+    ("waste.py", 'elif creation and not compact and prev and prev["has_tool"]:', 'elif creation and prev and prev["has_tool"]:'),
+    ("waste.py", 'elif creation and not compact and prev and prev["repeated"]:', "elif False:"),
+    ("waste.py", '_tool_info(turn, lane["seen"])', "_tool_info(turn, seen_paths)"),
+    ("waste.py", "mid.startswith((ADVISOR_ID_PREFIX, AGENT_SUMMARY_ID_PREFIX))", "mid.startswith((ADVISOR_ID_PREFIX,))"),
+    ("waste.py", "mid.startswith((ADVISOR_ID_PREFIX, AGENT_SUMMARY_ID_PREFIX))", "mid.startswith((AGENT_SUMMARY_ID_PREFIX,))"),
+    ("waste.py", '\n            or (not mid and row["tool_name"] == "advisor" and not row["tool_calls"]))', ")"),
+    ("waste.py", '**{c: c if c in cols else "NULL" for c in ("message_id", "agent_id")}',
+     '**{c: c for c in ("message_id", "agent_id")}'),
+    # Waste view: scope, cause bars, habits grouped by project x cause
+    ("static/modules/app.js", "  const inScope = findings.filter(f => byId.has(f.session_id));", "  const inScope = findings;"),
+    ("static/modules/app.js", "    affectedUsd: [...spend.values()].reduce((sum, v) => sum + v, 0),",
+     "    affectedUsd: inScope.reduce((sum, f) => sum + f.session_usd, 0),"),
+    ("static/modules/app.js", "    if (cause && f.cause !== cause) continue;\n", ""),
+    ("static/modules/app.js", "    const c = causes.get(f.cause) || { cause: f.cause, tier: f.tier, usd: 0, sessions: 0 };\n",
+     "    if (cause && f.cause !== cause) continue;\n    const c = causes.get(f.cause) || { cause: f.cause, tier: f.tier, usd: 0, sessions: 0 };\n"),
+    ("static/modules/app.js", "  if (!causes.has(cause)) cause = null;\n", ""),
+    ("static/modules/app.js", "const g = groups.get(key) ||", "const g = groups.get(f.cause) ||"),
+    ("static/modules/app.js", "title: s.topic || ''", "title: s.topic"),
+    ("static/modules/app.js", "b.sessions.length - a.sessions.length", "0"),
+    ("static/modules/app.js", "  for (const g of groups.values()) g.sessions.sort(byUsd);\n", ""),
+    ("static/modules/app.js", "g.usd += f.usd; g.spend += f.session_usd;", "g.usd += f.usd; g.spend = f.session_usd;"),
+    ("static/modules/app.js", "document.querySelectorAll('.range-btn[data-range]').forEach(btn =>\n    btn.classList",
+     "document.querySelectorAll('.range-btn').forEach(btn =>\n    btn.classList"),
 ]
-TESTS = ["tests.test_waste", "tests.test_waste_tab"]
+TESTS = ["tests.test_waste", "tests.test_waste_tab", "tests.test_waste_view"]
 
 
 def run(tree):

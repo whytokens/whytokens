@@ -309,6 +309,22 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
   </div>
   <div class="table-card">
     <div class="section-title">Session Timeline</div>
+    <div class="timeline-controls">
+      <span class="filter-label">X axis</span>
+      <div class="range-group">
+        <button class="range-btn" data-tlx="elapsed" onclick="setTimelineX('elapsed')">Elapsed</button>
+        <button class="range-btn" data-tlx="clock" onclick="setTimelineX('clock')">Clock</button>
+        <button class="range-btn" data-tlx="call" onclick="setTimelineX('call')">Call #</button>
+      </div>
+      <span class="filter-label">Cost scale</span>
+      <div class="range-group">
+        <button class="range-btn" data-tly="linear" onclick="setTimelineLog(false)">Linear</button>
+        <button class="range-btn" data-tly="log" onclick="setTimelineLog(true)">Log</button>
+      </div>
+      <div class="range-group"><button class="range-btn" onclick="resetTimelineZoom()">Reset zoom</button></div>
+      <span class="muted">Drag across a panel to zoom, double-click to reset. Shaded = gap ≥ 5 min (cache may have expired). ▲ = context dropped below 60% (compaction or clear).</span>
+    </div>
+    <div class="timeline-wrap"><canvas id="chart-session-context"></canvas></div>
     <div class="timeline-wrap"><canvas id="chart-session-timeline"></canvas></div>
   </div>
   <div class="table-card">
@@ -341,20 +357,20 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
 
   <section class="tab-panel" id="panel-waste" data-panel="waste" hidden>
     <div class="table-card">
-      <div class="section-title">Waste by cause</div>
+      <div class="section-title">Waste</div>
+      <div id="waste-scope"></div>
       <p class="muted" id="waste-basis">Priced at API list rate. Amounts are attributed, a lower bound, never savings.</p>
-      <table>
-        <thead><tr><th>Cause</th><th>Evidence tier</th><th>Sessions</th><th>Attributed (API list rate)</th></tr></thead>
-        <tbody id="waste-rollup-body"></tbody>
-      </table>
+      <details id="waste-measure-wrap" class="waste-measure"><summary id="waste-measure-line" class="muted"></summary>
+        <table id="waste-measure"></table>
+      </details>
     </div>
     <div class="table-card">
-      <div class="section-title">Measurement status (cause &times; source)</div>
-      <table id="waste-measure"></table>
+      <div class="section-title">By cause <span class="muted">(click to filter the habits below)</span></div>
+      <div id="waste-bars"></div>
     </div>
     <div class="table-card">
-      <div class="section-title">Sessions</div>
-      <div id="waste-findings"></div>
+      <div class="section-title" id="waste-groups-title">Habits: project &times; cause</div>
+      <div id="waste-groups"></div>
     </div>
   </section>
 

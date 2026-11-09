@@ -60,3 +60,24 @@ class TestTrace(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLanes(unittest.TestCase):
+    def test_two_agents_of_one_type_are_two_lanes_and_main_stays_its_own(self):
+        f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        f.close()
+        db = Path(f.name)
+        c = get_db(db)
+        init_db(c)
+        c.execute("INSERT INTO sessions (session_id, project_name, first_timestamp, last_timestamp, turn_count)"
+                  " VALUES ('s2','p','2026-10-08T10:00:00Z','2026-10-08T10:20:00Z',4)")
+        for a in ("a1", "a2", "a3"):
+            c.execute("INSERT INTO agents (agent_id, agent_type) VALUES (?,?)", (a, "Plan" if a == "a3" else "Explore"))
+        for i, aid in enumerate([None, "a1", "a2", "a1", "a3"]):
+            c.execute("INSERT INTO turns (session_id,timestamp,model,input_tokens,output_tokens,"
+                      "cache_read_tokens,cache_creation_tokens,message_id,agent_id)"
+                      " VALUES ('s2',?,'m',1,1,1,1,?,?)", (f"2026-10-08T10:00:0{i}Z", f"x{i}", aid))
+        c.commit()
+        c.close()
+        lanes = [t["lane"] for t in get_session_detail("s2", db_path=db)["turns"]]
+        self.assertEqual(lanes, ["main", "Explore #1", "Explore #2", "Explore #1", "Plan"])

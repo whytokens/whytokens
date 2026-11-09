@@ -11,7 +11,9 @@ Causes (all derivable from ``turns``; ctx(turn) = input + cache_read + cache_cre
   resident_output    context growth after a tool turn, carried by every later main-chain
                      turn. EXCLUDES growth claimed by repeated_reads (disjoint).
   repeated_reads     growth after the 2nd+ Read of the SAME file_path in one session.
-  subagent_preamble  cache_creation on is_sidechain=1 turns (the inherited preamble).
+  subagent_preamble  the FIRST cache_creation of each subagent (agent_id; a cold read
+                     starts a lane when agent_id is NULL). Later sidechain writes follow
+                     the resident_output / repeated_reads rules within that agent.
   idle_gap           cache re-creation on the first turn after a >= 30-minute gap.
   uncached_input     input_tokens billed at full price that a cache would have served.
 
@@ -44,19 +46,26 @@ def _ts(minutes, seconds=0):
     return (T0 + timedelta(minutes=minutes, seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _rec(sid, n, ts, inp=200, read=0, create=400, out=300, tools=(), side=False):
+def _rec(sid, n, ts, inp=200, read=0, create=400, out=300, tools=(), side=False, agent=None, advisor=0,
+         mid=True, compact=False):
     """One assistant record in the Claude Code envelope the scanner parses."""
     content = [{"type": "text", "text": "..."}] + [
         {"type": "tool_use", "id": f"tu-{sid}-{n}-{i}", "name": name, "input": arg}
         for i, (name, arg) in enumerate(tools)]
     return json.dumps({
         "type": "assistant", "sessionId": sid, "timestamp": ts, "cwd": "/home/dev/acme/app",
-        "isSidechain": side, "version": "2.1.220",
-        "message": {"id": f"msg-{sid}-{n}", "model": MODEL, "content": content,
+        "isSidechain": side, "version": "2.1.220", **({"agentId": agent} if agent is not None else {}),
+        **({"isCompactSummary": True} if compact else {}),
+        "message": {**({"id": f"msg-{sid}-{n}"} if mid else {}), "model": MODEL, "content": content,
                     "stop_reason": "tool_use" if tools else "end_turn",
                     "usage": {"input_tokens": inp, "output_tokens": out,
                               "cache_read_input_tokens": read,
-                              "cache_creation_input_tokens": create}},
+                              "cache_creation_input_tokens": create,
+                              # ``advisor`` adds an advisor iteration: the scanner mints a
+                              # synthetic ``advisor:`` turn (no cache, tool_name "advisor")
+                              **({"iterations": [{"type": "message"},
+                                                 {"type": "advisor_message", "input_tokens": advisor,
+                                                  "output_tokens": 2_000}]} if advisor else {})}},
     })
 
 
@@ -142,9 +151,78 @@ def _busy_gap_session():
 
 
 FIXTURES["busy_gap"] = _busy_gap_session()
+
+PREAMBLE, GROWTH = 30_000, 20_000
+
+
+def _subagent_growth_session(sid, ids=True):
+    """Two subagents run interleaved. Each writes a 30k preamble once, then calls its own
+    tool (a1 Bash, a2 Grep) every turn and grows its OWN context 20k per turn for 9 turns.
+    Only the two first writes are preamble; the growth is tool output kept in that
+    agent's context, so each tool must be charged exactly its own agent's growth.
+    a1's 4th turn and the last main turn also call the advisor: the synthetic advisor
+    rows must not split a lane, overwrite tool state, or count as uncached input.
+    ``ids=False`` drops agentId (NULL agent_id), ``ids=""`` writes an empty one: either way
+    the agents cannot be told apart, so only the cold preamble writes may be claimed."""
+    lines = [_rec(sid, 1, _ts(0), read=0, create=10_000, tools=[("Agent", {"prompt": "a"}),
+                                                                 ("Agent", {"prompt": "b"})])]
+    n, ctx = 1, {"a1": PREAMBLE, "a2": PREAMBLE}
+    for k in range(10):
+        for j, (agent, tool) in enumerate((("a1", "Bash"), ("a2", "Grep"))):
+            n += 1
+            ts = _ts(1 + k, 20 * j)
+            call = [(tool, {"command": f"step {k}"})]
+            advisor = 50_000 if (agent, k) == ("a1", 3) else 0
+            if k == 0:
+                lines.append(_rec(sid, n, ts, read=0, create=PREAMBLE, tools=call, side=True,
+                                  agent=agent if ids is True else ("" if ids == "" else None)))
+            else:
+                lines.append(_rec(sid, n, ts, read=ctx[agent], create=GROWTH, tools=call, side=True,
+                                  agent=agent if ids is True else ("" if ids == "" else None), advisor=advisor))
+                ctx[agent] += GROWTH
+    lines.append(_rec(sid, n + 1, _ts(12), read=10_000, create=400, advisor=50_000))
+    return lines
+
+
+FIXTURES["sub_growth"] = _subagent_growth_session("sub_growth")
+FIXTURES["sub_growth_noid"] = _subagent_growth_session("sub_growth_noid", ids=False)
+FIXTURES["sub_growth_blankid"] = _subagent_growth_session("sub_growth_blankid", ids="")
+# Two interleaved agents both Read /src/x.py on every turn. Only a1 reads it a second time
+# within its OWN lane, so only a1's growth after that re-read is repeated_reads; a2's single
+# read is ordinary resident output, never "repeated" because a1 read the same path.
+READ_X = ("Read", {"file_path": "/src/x.py"})
+FIXTURES["sub_reads"] = [_rec("sub_reads", 1, _ts(0), read=0, create=10_000,
+                              tools=[("Agent", {"prompt": "a"}), ("Agent", {"prompt": "b"})])] + [
+    _rec("sub_reads", 2 + 2 * k + j, _ts(1 + k, 20 * j), read=0 if k == 0 else PREAMBLE + GROWTH * (k - 1),
+         create=PREAMBLE if k == 0 else GROWTH, tools=[READ_X] if (agent == "a1" or k == 0) else [],
+         side=True, agent=agent)
+    for k in range(3) for j, agent in enumerate(("a1", "a2"))]
+# One subagent compacts mid-run: its 150k rewrite is a compaction, not output of the
+# Bash call before it. As on the main chain, the compaction turn's own tool call is not
+# carried forward either, so Bash is charged exactly the one 20k write before compaction.
+FIXTURES["sub_compact"] = [_rec("sub_compact", 1, _ts(0), read=0, create=10_000, tools=[("Agent", {"prompt": "a"})])] + [
+    _rec("sub_compact", 2 + k, _ts(1 + k), read=r, create=c, tools=[("Bash", {"command": str(k)})],
+         side=True, agent="a1", compact=(k == 2))
+    for k, (r, c) in enumerate(((0, PREAMBLE), (PREAMBLE, GROWTH), (0, 150_000), (150_000, GROWTH)))]
+# A cached main chain whose last message has no message.id and calls the advisor: the
+# scanner stores that advisor row with an EMPTY message_id (no prefix to recognise it by),
+# and its 50k uncached input must still not be reported as uncached_input.
+FIXTURES["advisor_noid"] = _main_chain("advisor_noid", 6, base=20_000)[:-1] + [
+    _rec("advisor_noid", 6, _ts(15), read=22_000, create=400, advisor=50_000, mid=False)]
+
+# Subagent transcript written under <session>/subagents/, so the scanner also mints its
+# AgentSummary row. a1 writes a 30k preamble then grows 20k after each of 5 Bash calls.
+SUBAGENT_FILES = {("summary", "agent-a1"): [
+    _rec("summary", 100 + k, _ts(1 + k), read=0 if k == 0 else PREAMBLE + GROWTH * (k - 1),
+         create=PREAMBLE if k == 0 else GROWTH, tools=[("Bash", {"command": f"s{k}"})], side=True, agent="a1")
+    for k in range(6)]}
+FIXTURES["summary"] = [_rec("summary", 1, _ts(0), read=0, create=10_000, tools=[("Agent", {"prompt": "a"})]),
+                       _rec("summary", 2, _ts(8), read=10_000, create=400)]
 EXPECTED_TOP = {"resident": "resident_output", "reread": "repeated_reads",
                 "subagent": "subagent_preamble", "idle": "idle_gap",
-                "uncached": "uncached_input", "mixed": "repeated_reads"}
+                "uncached": "uncached_input", "mixed": "repeated_reads",
+                "sub_growth": "resident_output", "sub_growth_noid": "subagent_preamble",
+                "sub_growth_blankid": "subagent_preamble"}
 
 
 class _Scanned(unittest.TestCase):
@@ -155,6 +233,9 @@ class _Scanned(unittest.TestCase):
         proj.mkdir(parents=True)
         for sid, lines in FIXTURES.items():
             (proj / f"{sid}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        for (sid, stem), lines in SUBAGENT_FILES.items():
+            (proj / sid / "subagents").mkdir(parents=True)
+            (proj / sid / "subagents" / f"{stem}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
         cls.db = str(Path(cls.tmp) / "usage.db")
         scan(projects_dir=proj.parent, db_path=cls.db, verbose=False)
 
@@ -232,6 +313,77 @@ class TestWasteReport(_Scanned):
         causes = [f["cause"] for f in self.waste.report(self.db, session_id="mixed")]
         self.assertIn("idle_gap", causes)
         self.assertLess(causes.index("repeated_reads"), causes.index("idle_gap"))
+
+    def test_subagent_preamble_is_each_agents_first_write_only(self):
+        # Regression: every sidechain cache write used to count as preamble.
+        expected = pricing.calc_cost(MODEL, 0, 0, 0, 2 * PREAMBLE, _ts(1))
+        for sid in ("sub_growth", "sub_growth_noid", "sub_growth_blankid"):
+            with self.subTest(session=sid):
+                findings = {f["cause"]: f for f in self.waste.report(self.db, session_id=sid)}
+                self.assertAlmostEqual(findings["subagent_preamble"]["usd"], expected, places=9)
+                self.assertIn(f"{2 * PREAMBLE:,}", findings["subagent_preamble"]["detail"])
+                self.assertNotIn("uncached_input", findings)
+        findings = {f["cause"]: f for f in self.waste.report(self.db, session_id="sub_growth")}
+        detail = findings["resident_output"]["detail"]
+        self.assertIn(f"Bash ({9 * GROWTH:,})", detail)
+        self.assertIn(f"Grep ({9 * GROWTH:,})", detail)
+        self.assertNotIn("advisor", detail)
+        # NULL agent_id: growth cannot be pinned to an agent, so none is charged to a tool
+        for sid in ("sub_growth_noid", "sub_growth_blankid"):
+            causes = {f["cause"]: f for f in self.waste.report(self.db, session_id=sid)}
+            self.assertNotIn("resident_output", causes, sid)
+            self.assertAlmostEqual(causes["subagent_preamble"]["usd"], expected, places=9, msg=sid)
+
+    def test_subagent_repeated_reads_are_lane_local(self):
+        findings = {f["cause"]: f for f in self.waste.report(self.db, session_id="sub_reads")}
+        self.assertIn(f"added {GROWTH:,} cache-write tokens", findings["repeated_reads"]["detail"])
+        self.assertIn("x.py", findings["repeated_reads"]["detail"])
+        self.assertIn(f"Read ({2 * GROWTH:,})", findings["resident_output"]["detail"])
+
+    def test_subagent_compaction_is_not_tool_output(self):
+        self.assertEqual(self._rows("SELECT SUM(is_compact_summary) FROM turns WHERE session_id='sub_compact'"),
+                         [(1,)])
+        detail = {f["cause"]: f for f in self.waste.report(self.db, session_id="sub_compact")}["resident_output"]["detail"]
+        self.assertIn(f"Bash ({GROWTH:,}) caused {GROWTH:,} cache-write tokens", detail)
+
+    def test_advisor_row_without_message_id_is_not_uncached_input(self):
+        ids = self._rows("SELECT message_id FROM turns WHERE session_id='advisor_noid' AND tool_name='advisor'")
+        self.assertEqual(ids, [("",)])  # the fixture really has the unprefixed shape
+        self.assertEqual(self.waste.report(self.db, session_id="advisor_noid"), [])
+
+    def test_agent_summary_mid_lane_does_not_reset_tool_state(self):
+        # An incremental rescan can leave the AgentSummary row earlier than the agent's
+        # later turns. Move it mid-lane: Bash must still be charged all 5 growth writes.
+        db = str(Path(self.tmp) / "summary.db")
+        shutil.copy(self.db, db)
+        conn = sqlite3.connect(db)
+        try:
+            (mid_ts,), = conn.execute("SELECT timestamp FROM turns WHERE session_id='summary'"
+                                      " AND is_sidechain=1 ORDER BY timestamp LIMIT 1 OFFSET 2").fetchall()
+            moved = conn.execute("UPDATE turns SET timestamp=? WHERE message_id LIKE 'agent_summary:%'"
+                                 " AND session_id='summary'", (mid_ts,)).rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(moved, 1)  # the scanner did mint the summary row
+        detail = {f["cause"]: f for f in self.waste.report(db, session_id="summary")}["resident_output"]["detail"]
+        self.assertIn(f"Bash ({5 * GROWTH:,})", detail)
+
+    def test_db_without_message_id_or_agent_id_columns_still_reports(self):
+        db = str(Path(self.tmp) / "old.db")
+        shutil.copy(self.db, db)
+        conn = sqlite3.connect(db)
+        try:
+            for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='index'"
+                                        " AND tbl_name='turns' AND sql IS NOT NULL").fetchall():
+                conn.execute(f"DROP INDEX {name}")
+            conn.execute("ALTER TABLE turns DROP COLUMN message_id")
+            conn.execute("ALTER TABLE turns DROP COLUMN agent_id")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self.waste.report(db, session_id="clean"), [])
+        self.assertTrue(self.waste.report(db, session_id="resident"))
 
     def test_gap_filled_by_subagent_work_is_not_idle(self):
         causes = [f["cause"] for f in self.waste.report(self.db, session_id="busy_gap")]

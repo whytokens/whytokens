@@ -10,3 +10,5 @@ venv/
 .local-delegate/
 .claude/scheduled_tasks.lock
 run.log
+build/
+*.egg-info/

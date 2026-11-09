@@ -576,6 +576,7 @@ def get_session_detail(session_id, db_path=None):
             {turn_expr('is_compact_summary', '0')},
             {turn_expr('tool_calls', 'NULL')},
             {turn_expr('estimated', '0')},
+            {turn_expr('message_id', "''")},
             turns.agent_id as agent_id, agents.agent_type as agent_type,
             COALESCE(tool_name, '<none>') as tool_name,
             cwd,
@@ -607,6 +608,16 @@ def get_session_detail(session_id, db_path=None):
             pass
         traced.append((r, actor, gap))
 
+    # One swimlane per agent_id; two agents of one type get "Explore #1", "Explore #2" in first-seen order.
+    ids_by_actor = {}
+    for r, actor, _ in traced:
+        ids_by_actor.setdefault(actor, [])
+        if (r["agent_id"] or "main") not in ids_by_actor[actor]:
+            ids_by_actor[actor].append(r["agent_id"] or "main")
+    def lane_of(r, actor):
+        ids = ids_by_actor[actor]
+        return actor if len(ids) < 2 else f"{actor} #{ids.index(r['agent_id'] or 'main') + 1}"
+
     result = {
         "session": {
             "session_id":       session["session_id"],
@@ -627,7 +638,9 @@ def get_session_detail(session_id, db_path=None):
             "timestamp":      (r["timestamp"] or "")[:16].replace("T", " "),
             "ts":             r["timestamp"] or "",
             "actor":          actor,
+            "lane":           lane_of(r, actor),
             "agent_id":       r["agent_id"] or "",
+            "message_id":     r["message_id"] or "",
             "estimated":      bool(r["estimated"]),
             "context":        (r["input_tokens"] or 0) + (r["cache_read_tokens"] or 0) + (r["cache_creation_tokens"] or 0),
             "gap_s":          gap,

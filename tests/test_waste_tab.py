@@ -33,7 +33,7 @@ class TestAdvice(_Scanned):
             self.assertTrue(f["evidence"], f["cause"])
             self.assertLessEqual(len(f["evidence"]), 5)
             for e in f["evidence"]:
-                self.assertEqual(set(e), {"at", "tokens", "usd", "tool"})
+                self.assertEqual(set(e), {"at", "tokens", "usd", "tool", "message_id", "agent_id"})
                 self.assertNotIn("/", str(e["tool"] or ""))
 
     def test_session_usd_is_the_list_price_total(self):
@@ -116,3 +116,16 @@ class TestUi(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEvidenceIds(_Scanned):
+    def test_evidence_message_ids_round_trip_to_the_trace(self):
+        p = api.get_waste(db_path=self.db)
+        checked = 0
+        for f in p["findings"]:
+            trace = {t["message_id"] for t in api.get_session_detail(f["session_id"], db_path=Path(self.db))["turns"]}
+            for e in f["evidence"]:
+                if e["message_id"]:
+                    self.assertIn(e["message_id"], trace, f["cause"])
+                    checked += 1
+        self.assertGreater(checked, 0)

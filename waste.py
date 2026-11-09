@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pricing
+from scanner import ADVISOR_ID_PREFIX, AGENT_SUMMARY_ID_PREFIX
 
 
 CAUSES = ("resident_output", "repeated_reads", "subagent_preamble", "idle_gap", "uncached_input")
@@ -29,6 +30,12 @@ _MEASURED = {"claude"}
 _WHY = {"codex": "Codex reports cached input but no cache-write tokens, tool-call file paths or "
                  "sidechain turns, so this detector has no signal"}
 _WHY_DEFAULT = "no detector is validated for this source"
+def _synthetic(row):
+    """Scanner-minted estimate rows. An advisor row under a parent with no message.id is
+    stored with an empty id (scanner keeps it un-deduped), so it is also known by its tool."""
+    mid = row["message_id"] or ""
+    return (mid.startswith((ADVISOR_ID_PREFIX, AGENT_SUMMARY_ID_PREFIX))
+            or (not mid and row["tool_name"] == "advisor" and not row["tool_calls"]))
 
 
 def measurement(db_path):
@@ -76,7 +83,8 @@ def _claim(claims, cause, turn, tokens, detail, tool, inp=False):
     usd = _cost(turn, inp=tokens) if inp else _cost(turn, creation=tokens)
     claims[cause][0] += usd
     claims[cause][1].append(detail)
-    claims[cause][2].append({"at": turn["timestamp"], "tokens": tokens, "usd": usd, "tool": tool})
+    claims[cause][2].append({"at": turn["timestamp"], "tokens": tokens, "usd": usd, "tool": tool,
+                              "message_id": turn["message_id"], "agent_id": turn["agent_id"]})
 
 
 def _gap(a, b):
@@ -96,9 +104,11 @@ def report(db_path, session_id=None):
         sql = """SELECT id, session_id, timestamp, model, input_tokens, output_tokens,
                          cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens,
                          tool_name, tool_calls, is_sidechain, is_compact_summary, agent,
-                         {mult} AS mult
-                  FROM turns""".format(mult=pricing.price_mult_sql(
-                      {r[1] for r in conn.execute("PRAGMA table_info(turns)")}))
+                         {message_id} AS message_id, {agent_id} AS agent_id, {mult} AS mult
+                  FROM turns"""
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)")}
+        sql = sql.format(mult=pricing.price_mult_sql(cols),
+                         **{c: c if c in cols else "NULL" for c in ("message_id", "agent_id")})
         rows = conn.execute(sql + (" WHERE session_id=?" if session_id else "") +
                             " ORDER BY session_id, timestamp, id", (session_id,) if session_id else ()).fetchall()
     finally:
@@ -113,11 +123,39 @@ def report(db_path, session_id=None):
     for sid, turns in sessions.items():
         claims = {cause: [0.0, [], []] for cause in CAUSES}
         seen_paths, previous_main, previous_turn = set(), None, None
+        lanes = {}  # per-subagent state: each agent's cache prefix is its own
         for turn in turns:
             creation = turn["cache_creation_tokens"] or 0
-            if turn["is_sidechain"]:
-                if creation:
+            if _synthetic(turn):
+                # Scanner-minted estimates (advisor iterations, AgentSummary forks): their
+                # cost stays in the session total, but they carry no cache prefix or tool
+                # output of their own, so they claim nothing and must not move lane state.
+                previous_turn = turn
+                continue
+            if turn["is_sidechain"] and not turn["agent_id"]:
+                # Rows with no (or an empty) agent_id: interleaved agents cannot be told apart, so
+                # only a cold write (no cache_read) is claimed, as a preamble; growth stays
+                # unattributed rather than charged to another agent's tool.
+                if creation and not (turn["cache_read_tokens"] or 0):
                     _claim(claims, "subagent_preamble", turn, creation, creation, "Agent")
+                previous_turn = turn
+                continue
+            if turn["is_sidechain"]:
+                # Only an agent's first cache write is its preamble; later writes are its own
+                # context growth, attributed like main-chain growth.
+                lane = lanes.setdefault(turn["agent_id"], {"seen": set(), "prev": None, "preamble": False})
+                compact = turn["is_compact_summary"]  # same guard as the main chain below
+                has_tool, repeated = _tool_info(turn, lane["seen"]) if not compact else (False, [])
+                prev = lane["prev"]
+                if creation and not lane["preamble"]:
+                    lane["preamble"] = True
+                    _claim(claims, "subagent_preamble", turn, creation, creation, "Agent")
+                elif creation and not compact and prev and prev["repeated"]:
+                    _claim(claims, "repeated_reads", turn, creation, (prev["repeated"], creation), "Read")
+                elif creation and not compact and prev and prev["has_tool"]:
+                    _claim(claims, "resident_output", turn, creation,
+                           (prev["tool_name"] or "tool", creation), prev["tool_name"])
+                lane["prev"] = {"has_tool": has_tool, "repeated": repeated, "tool_name": turn["tool_name"]}
                 previous_turn = turn
                 continue
             compact = turn["is_compact_summary"]
@@ -165,7 +203,7 @@ def report(db_path, session_id=None):
                                "Give subagents narrower prompts and reuse fewer independent agents.")
             elif cause == "idle_gap":
                 minutes = max((g.total_seconds() / 60 for g, _ in details), default=0)
-                detail, fix = (f"{len(details)} idle gaps (longest {minutes:.0f} min) rewrote {sum(n for _, n in details):,} cache tokens.",
+                detail, fix = (f"{len(details)} idle gap{'' if len(details) == 1 else 's'} (longest {minutes:.0f} min) rewrote {sum(n for _, n in details):,} cache tokens.",
                                ("Start a fresh session instead of resuming a stale one; re-onboard from the handoff file."
                                 if minutes > 240 else
                                 "Resume before the cache expires, or compact context before a long pause."))

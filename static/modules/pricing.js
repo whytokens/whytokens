@@ -239,6 +239,13 @@ export function sessionCost(s, day) {
   return sessionCostBreakdown(s, day).total;
 }
 
+/** Session cost at server list rates (browser price overrides ignored): the basis of Python-side waste $. */
+export function sessionCostAtListRates(s, day) {
+  const saved = pricingOverrides;
+  pricingOverrides = {};
+  try { return sessionCost(s, day); } finally { pricingOverrides = saved; }
+}
+
 export function calcCostBreakdown(model, inp, out, cacheRead, cacheCreation, day, cacheCreation1h = 0) {
   const zero = { input: 0, output: 0, cache_read: 0, cache_creation: 0, total: 0, cache_savings: 0 };
   // Gate on getPricing (mirrors Python calc_cost): prices Anthropic models AND the
@@ -254,6 +261,34 @@ export function calcCostBreakdown(model, inp, out, cacheRead, cacheCreation, day
   const cache_read = cacheRead * p.cache_read / 1e6;
   const cache_creation = ((cacheCreation - cc1h) * p.cache_write
     + cc1h * (p.cache_write_1h ?? p.cache_write)) / 1e6;
-  const cache_savings = cacheRead * Math.max(p.input - p.cache_read, 0) / 1e6;
+  // Net of what the writes cost over plain input (5m 1.25x, 1h 2x): a session that only
+  // ever rewrote its prefix saved nothing, so this can go negative.
+  const cache_savings = (cacheRead * Math.max(p.input - p.cache_read, 0)
+    - (cacheCreation - cc1h) * (p.cache_write - p.input)
+    - cc1h * ((p.cache_write_1h ?? p.cache_write) - p.input)) / 1e6;
   return { input, output, cache_read, cache_creation, total: input + output + cache_read + cache_creation, cache_savings };
+}
+
+/** Fraction of prompt tokens served from cache. Reads only: a write is a cost, not a hit. */
+export function cacheShare(r) {
+  const prompt = (r.input || 0) + (r.cache_read || 0) + (r.cache_creation || 0);
+  return prompt ? (r.cache_read || 0) / prompt : 0;
+}
+
+/**
+ * Cold restarts: main-thread turns that rewrote the prefix after idling past the cache TTL
+ * (1h when the rewrite was written at the 1h tier, else 5m). `turns` are session-detail turns
+ * (gap_s is per actor, so a subagent turn never hides a main-thread gap).
+ * @returns {{count: number, tokens: number, cost: number}}
+ */
+export function coldRestarts(turns) {
+  const out = { count: 0, tokens: 0, cost: 0 };
+  for (const t of turns) {
+    if (t.actor !== 'main' || t.gap_s == null || !t.cache_creation) continue;
+    if (t.gap_s <= (t.cache_creation_1h > 0 ? 3600 : 300)) continue;
+    out.count++;
+    out.tokens += t.cache_creation;
+    out.cost += rowCostBreakdown(t, (t.timestamp || '').slice(0, 10)).cache_creation;
+  }
+  return out;
 }

@@ -12,8 +12,9 @@ import { esc, fmt, fmtCost, fmtCostBig, fmtPct, fmtLocalDateTime } from './forma
 import {
   DEFAULT_PRICING, PRICING, getOverrides, applyDefaultPricing,
   loadPricing, setOverride, clearOverrides,
-  isBillable, isEstimated, getPricing, calcCost, rowCost,
-  sessionCost, sessionCostBreakdown,
+  isBillable, isEstimated, getPricing, calcCost, rowCost, rowCostBreakdown,
+  sessionCost, sessionCostBreakdown, sessionCostAtListRates,
+  cacheShare, coldRestarts,
 } from './pricing.js';
 import { VALID_TABS, resolveTab, applyTabVisibility, addExtRailItem, toggleRail, initRail } from './nav.js';
 import { store, TZ_KEY, alpha, fillTokens, initTheme, setThemePref } from './theme.js';
@@ -57,6 +58,7 @@ let lastHotSessions = [];
 const extTabs = new Map();
 let activeTab = 'overview';
 let selectedSessionDetail = null;
+let traceHighlight = new Set();  // message_ids of a finding's evidence calls, marked in the trace table
 let sessionFilters = { project: '', branch: '', tool: '', minCost: 0, hasCacheCreation: false };
 let sessionSortDir = 'desc';
 
@@ -291,7 +293,7 @@ function readURLRange() {
 
 function setRange(range) {
   selectedRange = range;
-  document.querySelectorAll('.range-btn').forEach(btn =>
+  document.querySelectorAll('.range-btn[data-range]').forEach(btn =>
     btn.classList.toggle('active', btn.dataset.range === range)
   );
   updateURL();
@@ -576,10 +578,10 @@ function aggregateCostBreakdown(rows) {
     acc.cache_creation += c.cache_creation;
     acc.total += c.total;
     acc.cache_savings += c.cache_savings;
-    acc.tokens += (r.input || 0) + (r.output || 0) + (r.cache_read || 0) + (r.cache_creation || 0);
-    acc.cache_tokens += (r.cache_read || 0) + (r.cache_creation || 0);
+    acc.prompt += (r.input || 0) + (r.cache_read || 0) + (r.cache_creation || 0);  // same basis as cacheShare()
+    acc.cache_tokens += r.cache_read || 0;
     return acc;
-  }, { input: 0, output: 0, cache_read: 0, cache_creation: 0, total: 0, cache_savings: 0, tokens: 0, cache_tokens: 0 });
+  }, { input: 0, output: 0, cache_read: 0, cache_creation: 0, total: 0, cache_savings: 0, prompt: 0, cache_tokens: 0 });
 }
 
 function sessionSignals(sessions) {
@@ -587,14 +589,13 @@ function sessionSignals(sessions) {
     const cost = sessionCost(s, s.last_date);
     const minutes = Math.max(parseFloat(s.duration_min) || 0, 1 / 60);
     const tokens = (s.input || 0) + (s.output || 0) + (s.cache_read || 0) + (s.cache_creation || 0);
-    const promptTokens = (s.input || 0) + (s.cache_read || 0) + (s.cache_creation || 0);
     return {
       ...s,
       cost,
       cost_per_min: cost / minutes,
       tokens_per_min: tokens / minutes,
       output_per_turn: s.turns ? (s.output || 0) / s.turns : 0,
-      cache_share: promptTokens ? ((s.cache_read || 0) + (s.cache_creation || 0)) / promptTokens : 0,
+      cache_share: cacheShare(s),
     };
   }).sort((a, b) => b.cost - a.cost);
 }
@@ -865,30 +866,189 @@ const CAUSE_LABEL = {
   subagent_preamble: 'Subagent preambles', idle_gap: 'Idle gaps (cache expiry)',
   uncached_input: 'Uncached input',
 };
+// Finding drawer: what happened, the fix, the evidence calls as a mini-trace, then the full
+// trace with those calls highlighted. Evidence message_ids ride along on the button.
+function evidenceDrawer(s, fix) {
+  const ev = s.evidence || [], ids = ev.map(e => e.message_id).filter(Boolean);
+  return `<tr class="wg-drawer"><td colspan="5"><details><summary class="muted">Evidence: ${ev.length} call${ev.length === 1 ? '' : 's'}</summary>` +
+    `<p>${esc(s.detail)}</p><p class="wg-fix"><strong>Fix:</strong> ${esc(fix)}</p>` +
+    '<table><thead><tr><th>When</th><th>Tool</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>' +
+    ev.map(e => `<tr><td class="muted">${esc(String(e.at || '').replace('T', ' ').replace('Z', ''))}</td><td>${esc(e.tool || '')}</td>` +
+      `<td class="num">${fmt(e.tokens)}</td><td class="num">${fmtCostBig(e.usd)}</td></tr>`).join('') +
+    `</tbody></table><button class="filter-btn" data-session="${esc(s.id)}" data-ids="${esc(ids.join(','))}"` +
+    ` onclick="openSessionDetail(this.dataset.session, this.dataset.ids)">Open full trace</button></details></td></tr>`;
+}
+
+// Group findings into what a user acts on: a habit = (project, cause), not one session.
+// Only findings from `sessions` (the list every other tab shows: model, range and project
+// filters applied) count. `cause` narrows the habits; the scope and cause bars stay whole
+// so the bars can still be clicked to switch cause. A cause no longer in scope (the range
+// or a filter changed) is dropped, and the result's `cause` says which filter applied.
+function groupWaste(findings, sessions, cause = null) {
+  const byId = new Map(sessions.map(s => [s.full_session_id, s]));
+  const inScope = findings.filter(f => byId.has(f.session_id));
+  const spend = new Map(inScope.map(f => [f.session_id, f.session_usd]));
+  const causes = new Map(), groups = new Map();
+  for (const f of inScope) {
+    const c = causes.get(f.cause) || { cause: f.cause, tier: f.tier, usd: 0, sessions: 0 };
+    c.usd += f.usd; c.sessions++;
+    causes.set(f.cause, c);
+  }
+  if (!causes.has(cause)) cause = null;
+  for (const f of inScope) {
+    if (cause && f.cause !== cause) continue;
+    const s = byId.get(f.session_id), key = s.project + '\u0000' + f.cause;
+    const g = groups.get(key) || { project: s.project, cause: f.cause, tier: f.tier, fix: f.fix, usd: 0, spend: 0, sessions: [] };
+    g.usd += f.usd; g.spend += f.session_usd;
+    g.sessions.push({ id: f.session_id, title: s.topic || '', date: s.last_date, usd: f.usd,
+                      session_usd: f.session_usd, detail: f.detail, evidence: f.evidence });
+    groups.set(key, g);
+  }
+  const byUsd = (a, b) => b.usd - a.usd;
+  for (const g of groups.values()) g.sessions.sort(byUsd);
+  const total = inScope.reduce((sum, f) => sum + f.usd, 0);
+  for (const c of causes.values()) c.share = total ? c.usd / total : 0;  // of all attributed waste
+  return {
+    cause,
+    total,
+    affectedUsd: [...spend.values()].reduce((sum, v) => sum + v, 0),
+    affectedSessions: spend.size,
+    causes: [...causes.values()].sort(byUsd),
+    // ties: the habit spanning more sessions first, then by project name (stable across renders)
+    groups: [...groups.values()].sort((a, b) => b.usd - a.usd || b.sessions.length - a.sessions.length
+                                            || a.project.localeCompare(b.project)),
+  };
+}
+
+// Weekly attributed waste as % of ALL spend that week (not just affected sessions), so busy and
+// quiet weeks compare. Both sides bucket by the session's last_date week (Monday start), over
+// the same `sessions` the rest of the tab uses; `costOf(session)` prices a session. Weeks
+// between the first and last are filled with 0 so a gap reads as a gap.
+function weeklyWaste(findings, sessions, costOf) {
+  const weekOf = d => {
+    const t = new Date(d + 'T00:00:00Z');
+    t.setUTCDate(t.getUTCDate() - (t.getUTCDay() + 6) % 7);
+    return t.toISOString().slice(0, 10);
+  };
+  const byId = new Map(sessions.map(s => [s.full_session_id, s]));
+  const wk = new Map();
+  const at = k => wk.get(k) || wk.set(k, { week: k, spend: 0, waste: 0 }).get(k);
+  for (const s of sessions) if (s.last_date) at(weekOf(s.last_date)).spend += costOf(s);
+  for (const f of findings) { const s = byId.get(f.session_id); if (s && s.last_date) at(weekOf(s.last_date)).waste += f.usd; }
+  const keys = [...wk.keys()].sort();
+  if (!keys.length) return [];
+  const out = [];
+  for (let k = keys[0]; k <= keys[keys.length - 1]; ) {
+    const w = wk.get(k) || { week: k, spend: 0, waste: 0 };
+    out.push({ ...w, pct: w.spend ? w.waste / w.spend : 0 });
+    const t = new Date(k + 'T00:00:00Z'); t.setUTCDate(t.getUTCDate() + 7); k = t.toISOString().slice(0, 10);
+  }
+  return out;
+}
+
+function wasteSparkline(weeks) {
+  if (weeks.length < 2) return '';
+  const W = 240, H = 36, max = Math.max(...weeks.map(w => w.pct)) || 1;
+  const pts = weeks.map((w, i) => [(i * W / (weeks.length - 1)).toFixed(1), (H - 3 - (H - 6) * w.pct / max).toFixed(1)]);
+  return `<svg class="waste-spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" ` +
+    `aria-label="Weekly attributed waste as a share of all spend, ${esc(weeks[0].week)} to ${esc(weeks[weeks.length - 1].week)}">` +
+    `<polyline fill="none" stroke="currentColor" stroke-width="1.5" points="${pts.map(p => p.join(',')).join(' ')}"/>` +
+    pts.map((p, i) => `<circle cx="${p[0]}" cy="${p[1]}" r="2"><title>Week of ${esc(weeks[i].week)}: ${fmtPct(weeks[i].pct)} ` +
+      `(${fmtCostBig(weeks[i].waste)} of ${fmtCostBig(weeks[i].spend)})</title></circle>`).join('') + '</svg>' +
+    `<div class="muted">Weekly attributed waste, % of all spend that week (peak ${fmtPct(max)})</div>`;
+}
+
+let wastePayload = null;   // /api/waste is whole-DB; fetched once per data load, filtered here
+let wasteGen = 0;          // bumped on every data load; a response from an older one is dropped
+let wasteFetch = null;     // { gen, promise }: one request in flight per data load
+let wasteCause = null;     // cause-bar filter
+let wasteShowAll = false;  // habits beyond the first WASTE_PAGE
+const WASTE_PAGE = 25;
+async function setWasteCause(c) {
+  wasteCause = wasteCause === c ? null : c;
+  wasteShowAll = false;
+  await renderWasteTab();
+  // the bars were re-rendered: put keyboard focus back on the one just activated
+  document.querySelector(`.waste-bar[data-cause="${CSS.escape(c)}"]`)?.focus();
+}
+function showAllWaste() { wasteShowAll = true; renderWasteTab(); }
+
 async function renderWasteTab() {
-  let w;
-  try { w = await fetchWaste(); } catch (e) { w = null; }
   const el = id => document.getElementById(id);
-  if (!w) { el('waste-findings').textContent = 'Failed to load waste data.'; return; }
+  if (!wastePayload) {
+    const gen = wasteGen;
+    if (!wasteFetch || wasteFetch.gen !== gen) wasteFetch = { gen, promise: fetchWaste() };
+    let payload = null;
+    const req = wasteFetch;
+    // a failed request is forgotten so the next render retries, unless a newer one replaced it
+    try { payload = await req.promise; } catch (e) { if (wasteFetch === req) wasteFetch = null; }
+    if (gen !== wasteGen) return;  // the data reloaded meanwhile; that load renders again
+    wastePayload = payload;
+  }
+  const w = wastePayload;
+  if (!w) {  // never leave an earlier load's numbers on screen as if current
+    el('waste-scope').textContent = 'Failed to load waste data.';
+    for (const id of ['waste-bars', 'waste-groups', 'waste-measure', 'waste-measure-line']) el(id).textContent = '';
+    return;
+  }
   const label = c => CAUSE_LABEL[c] || c;
+  const v = groupWaste(w.findings, lastFilteredSessions, wasteCause);
+  wasteCause = v.cause;  // a cause that left the scope stops filtering
+  const { start, end } = getRangeBounds(selectedRange);
+
+  // Scope: what was searched, what was found, against what spend.
+  el('waste-scope').innerHTML = v.affectedSessions
+    ? `<div class="waste-headline">${fmtCostBig(v.total)} attributed to waste</div>` +
+      `<div class="muted">${fmtPct(v.affectedUsd ? v.total / v.affectedUsd : 0)} of the ${fmtCostBig(v.affectedUsd)} spent in the ` +
+      `${v.affectedSessions} affected session${v.affectedSessions === 1 ? '' : 's'} · ${esc(RANGE_LABELS[selectedRange] || selectedRange)}` +
+      `${start ? ' (' + esc(start) + (end ? ' to ' + esc(end) : ' to today') + ')' : ''} · current model and project filters</div>` +
+      wasteSparkline(weeklyWaste(w.findings, lastFilteredSessions, x => sessionCostAtListRates(x, x.last_date)))
+    : `<div class="muted">No material waste in ${esc(RANGE_LABELS[selectedRange] || selectedRange)} for the current filters.</div>`;
   el('waste-basis').textContent = 'Priced at ' + w.basis.pricing + ' (' + w.basis.label + '). Local price overrides do not apply here.';
-  el('waste-rollup-body').innerHTML = w.rollup.length ? w.rollup.map(r =>
-    `<tr><td>${esc(label(r.cause))}</td><td>${esc(r.tier)}</td><td>${r.sessions}</td><td>${fmtCost(r.usd)}</td></tr>`).join('')
-    : '<tr><td colspan="4" class="muted">No material waste found.</td></tr>';
-  const m = w.measurement, srcs = m.sources;
-  el('waste-measure').innerHTML = '<thead><tr><th>Cause</th>' + srcs.map(s => `<th>${esc(s)}</th>`).join('') + '</tr></thead><tbody>' +
-    Object.keys(m.causes).map(c => `<tr><td>${esc(label(c))}</td>` + srcs.map(s => {
-      const x = m.causes[c][s];
-      return x.status === 'measured' ? '<td>measured</td>'
-        : `<td class="muted" title="${esc(x.reason)}">not measurable<br><small>${esc(x.reason)}</small></td>`;
-    }).join('') + '</tr>').join('') + '</tbody>';
-  el('waste-findings').innerHTML = w.findings.length ? w.findings.slice(0, 100).map(f =>
-    `<details><summary><button class="link-btn" data-session="${esc(f.session_id)}" onclick="openSessionDetail(this.dataset.session)">${esc(f.session_id.slice(0, 8))}&hellip;</button> ` +
-    `${esc(label(f.cause))} &mdash; ${fmtCost(f.usd)} of ${fmtCost(f.session_usd)} <span class="muted">(${esc(f.tier)})</span></summary>` +
-    `<p>${esc(f.detail)}</p><p><strong>${esc(f.advice)}</strong></p>` +
-    '<table><thead><tr><th>Turn</th><th>Tool</th><th>Tokens</th><th>Attributed</th></tr></thead><tbody>' +
-    f.evidence.map(e => `<tr><td>${esc(e.at)}</td><td>${esc(e.tool || '')}</td><td>${fmt(e.tokens)}</td><td>${fmtCost(e.usd)}</td></tr>`).join('') +
-    '</tbody></table></details>').join('') : '<p class="muted">No material waste found.</p>';
+
+  // Measurement status: one line; the per-cause matrix only behind the expander.
+  const m = w.measurement, causesM = Object.keys(m.causes);
+  const measured = m.sources.filter(s => causesM.every(c => m.causes[c][s].status === 'measured'));
+  const not = m.sources.filter(s => !measured.includes(s));
+  el('waste-measure-line').textContent = 'Measured for: ' + (measured.join(', ') || 'none') +
+    (not.length ? ' · Not measurable: ' + not.join(', ') + ' (why?)' : '');
+  el('waste-measure').innerHTML = not.length ? '<tbody>' + not.map(s => {
+    const reasons = [...new Set(causesM.map(c => m.causes[c][s]).filter(x => x.status !== 'measured').map(x => x.reason))];
+    return `<tr><td>${esc(s)}</td><td class="muted">${reasons.map(esc).join('<br>')}</td></tr>`;
+  }).join('') + '</tbody>' : '';
+  el('waste-measure-wrap').classList.toggle('plain', !not.length);  // coverage stays visible; no reasons to expand
+
+  // Cause bars: click one to narrow the habits below; click again to clear.
+  const top = v.causes.length ? v.causes[0].usd : 0;
+  el('waste-bars').innerHTML = v.causes.map(c =>
+    `<button class="waste-bar${wasteCause === c.cause ? ' active' : ''}" data-cause="${esc(c.cause)}" onclick="setWasteCause(this.dataset.cause)"` +
+    ` aria-pressed="${wasteCause === c.cause}" title="Evidence: ${esc(c.tier)}. Click to show only this cause below.">` +
+    `<span class="wb-label">${esc(label(c.cause))}</span>` +
+    `<span class="wb-track"><span class="wb-fill" style="width:${top ? (100 * c.usd / top).toFixed(1) : 0}%"></span></span>` +
+    `<span class="wb-val">${fmtCostBig(c.usd)} <span class="muted">· ${fmtPct(c.share)} · ${c.sessions} session${c.sessions === 1 ? '' : 's'}` +
+    // most causes are "attributed cause"; flag only the weaker tier on the bar itself
+    `${c.tier === 'attributed cause' ? '' : ' · ' + esc(c.tier)}</span></span></button>`
+  ).join('') || '<p class="muted">Nothing to show.</p>';
+
+  // Habits: (project, cause), biggest first; sessions inside, each opening its trace.
+  const shown = wasteShowAll ? v.groups : v.groups.slice(0, WASTE_PAGE);
+  el('waste-groups-title').textContent = 'Habits: project × cause' + (wasteCause ? ' — ' + label(wasteCause) : '');
+  el('waste-groups').innerHTML = shown.map(g =>
+    `<details class="waste-group"><summary>` +
+    `<span class="wg-project">${esc(g.project)}</span><span>${esc(label(g.cause))}</span>` +
+    `<span class="num">${fmtCostBig(g.usd)}</span>` +
+    `<span class="muted num">${g.sessions.length} session${g.sessions.length === 1 ? '' : 's'} · ${fmtPct(g.spend ? g.usd / g.spend : 0)} of their spend</span>` +
+    `</summary><p class="wg-fix"><strong>Fix:</strong> ${esc(g.fix)} <span class="muted">(${esc(g.tier)})</span></p>` +
+    '<table><thead><tr><th>Last active</th><th>Session</th><th>Attributed</th><th>Of session</th><th>What happened</th></tr></thead><tbody>' +
+    g.sessions.map(s => `<tr><td class="muted">${esc(s.date || '')}</td>` +
+      `<td><button class="link-btn" data-session="${esc(s.id)}" onclick="openSessionDetail(this.dataset.session)" title="Open trace">` +
+      `${esc(s.title || s.id.slice(0, 8) + '…')}</button></td>` +
+      `<td class="num">${fmtCostBig(s.usd)}</td><td class="num muted">${fmtCostBig(s.session_usd)}</td>` +
+      `<td class="muted">${esc(s.detail)}</td></tr>` + evidenceDrawer(s, g.fix)).join('') +
+    '</tbody></table></details>'
+  ).join('') + (shown.length < v.groups.length
+    ? `<button class="filter-btn" onclick="showAllWaste()">Show all ${v.groups.length} habits</button>` : '')
+    || '<p class="muted">No material waste found.</p>';
 }
 
 // ── Tabs ────────────────────────────────────────────────────────────────────
@@ -983,7 +1143,7 @@ function renderStats(t) {
 }
 
 function renderCostBreakdown(c) {
-  const cacheShare = c.tokens ? c.cache_tokens / c.tokens : 0;
+  const cacheShare = c.prompt ? c.cache_tokens / c.prompt : 0;
   document.getElementById('cost-breakdown-body').innerHTML = `<tr>
     <td class="cost">${fmtCost(c.input)}</td>
     <td class="cost">${fmtCost(c.output)}</td>
@@ -1604,7 +1764,7 @@ function renderSessionDetail(d) {
   // session that spawned a subagent on another model is otherwise mispriced.
   const c = sessionCostBreakdown({ model: s.model, by_model: d.turns }, (s.last || '').slice(0, 10));
   const tokens = (s.input || 0) + (s.output || 0) + (s.cache_read || 0) + (s.cache_creation || 0);
-  const promptTokens = (s.input || 0) + (s.cache_read || 0) + (s.cache_creation || 0);
+  const cold = coldRestarts(d.turns);
   document.getElementById('trace-empty').classList.add('hidden');
   document.getElementById('session-detail-view').classList.remove('hidden');
   document.getElementById('session-detail-title').textContent = 'Session Drilldown — ' + s.display_id + '…';
@@ -1616,12 +1776,14 @@ function renderSessionDetail(d) {
     ['Turns', fmt(s.turns)],
     ['Tokens', fmt(tokens)],
     ['Cost', fmtCost(c.total)],
-    ['Cache Share', fmtPct(promptTokens ? ((s.cache_read || 0) + (s.cache_creation || 0)) / promptTokens : 0)],
+    ['Cache Share', fmtPct(cacheShare(s))],
     ['Cache Savings', fmtCost(c.cache_savings)],
+    ['Cache Writes', fmtCost(c.cache_creation)],
+    ['Cold Restarts', cold.count ? `${cold.count} · ${fmt(cold.tokens)} tok · ${fmtCost(cold.cost)}` : '0'],
   ].map(([label, value]) => `<div class="detail-stat"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`).join('');
   document.getElementById('session-detail-body').innerHTML = d.turns.map((t, i) => {
     const cost = rowCost(t, t.timestamp.slice(0, 10));
-    return `<tr>
+    return `<tr${traceHighlight.has(t.message_id) ? ' class="hl" aria-label="evidence call"' : ''}>
       <td class="muted">${esc(t.ts.replace('T', ' ').replace('Z', ''))}</td>
       <td>${esc(t.actor)}${t.estimated ? ' <span class="muted" title="token counts estimated">(est.)</span>' : ''}</td>
       <td class="muted">${t.gap_s == null ? '' : fmtGap(t.gap_s)}</td>
@@ -1689,60 +1851,330 @@ function renderSessionToolBreakdown(turns) {
   }).join('');
 }
 
+// ── Session timeline: context panel above, cost panel below, one shared x axis ──
+// x is elapsed seconds (or call number), so idle gaps show as width, not as one more bar.
+// Zoom is one shared x range; both panels follow it.
+const TIMELINE_GAP_S = 300;  // the 5-minute cache TTL: a longer gap may force a rebuild
+let timelineX = 'elapsed';   // 'elapsed' | 'clock' | 'call'
+let timelineLog = false;
+let timelineZoom = null;     // { min, max } in x units, or null
+let timelineBounds = null;   // the session's own x range: the axis stops at the data
+let timelineTurns = null;    // the turns the zoom belongs to: another session starts unzoomed
+
+function fmtElapsed(sec) {
+  if (sec < 0) return '-' + fmtElapsed(-sec);  // a row whose time is earlier than the first call's
+  if (sec > 0 && sec < 60 && sec % 1) return sec.toFixed(1) + 's';  // sub-second zoom
+  const s = Math.max(0, Math.round(sec)), d = Math.floor(s / 86400);
+  const h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  const p = n => String(n).padStart(2, '0');
+  return d ? `${d}d${p(h)}h` : h ? `${h}h${p(m)}m` : m ? (s % 60 ? `${m}m${p(s % 60)}s` : `${m}m`) : `${s}s`;
+}
+
+// Round tick steps (1m, 5m, 1h...). Clock mode aligns them to wall time via `origin` (epoch s).
+const TICK_STEPS = [0.1, 0.2, 0.5, 1, 5, 10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400,
+                    172800, 604800, 1209600, 2592000];  // resumed sessions can span weeks
+function timeTicks(min, max, origin, minStep = 0.1) {
+  const step = TICK_STEPS.find(s => s >= minStep && (max - min) / s <= 8) || TICK_STEPS[TICK_STEPS.length - 1];
+  const ticks = [];
+  // integer multiples, so 0.1-second steps do not accumulate float error
+  for (let k = Math.ceil((origin + min) / step - 1e-9); k * step - origin <= max + 1e-9; k++) {
+    ticks.push({ value: Math.round((k * step - origin) * 1000) / 1000 });
+  }
+  // a range narrower than the smallest step still gets its two ends labelled
+  return ticks.length >= 2 ? ticks : [{ value: min }, { value: max }];
+}
+
+// Epoch ms of the first call with a parseable `ts` (undefined if none: only Call # works then).
+function timelineOrigin(turns) {
+  return turns.map(t => Date.parse(t.ts)).find(Number.isFinite);
+}
+
+// One x per call: its true seconds since the first dated call. An undated call sits at the
+// previous dated one. Calls may share an x (advisor rows inherit their parent's timestamp):
+// the cost panel draws floating bars from timelineCostBars, so they never stack together.
+function timelineXs(turns) {
+  const t0 = timelineOrigin(turns);
+  if (timelineX === 'call' || t0 === undefined) return turns.map((t, i) => i + 1);
+  let last = t0;
+  return turns.map(t => {
+    const ms = Date.parse(t.ts);
+    if (Number.isFinite(ms)) last = ms;
+    return (last - t0) / 1000;
+  });
+}
+
+// Per cost part, one [bottom, top] floating bar per call, stacked within that call only.
+// Chart.js's own stacking sums every bar at the same x, merging calls that share a time.
+// On a log axis the floor is LOG_FLOOR and a part that ends below it is not drawn.
+const COST_PARTS = ['cache_creation', 'cache_read', 'output', 'input'];
+const COST_LABELS = { cache_creation: 'Cache write', cache_read: 'Cache read', output: 'Output', input: 'Input' };
+const LOG_FLOOR = 0.001;
+function timelineCostBars(parts, log) {
+  const bars = Object.fromEntries(COST_PARTS.map(k => [k, []]));
+  for (const p of parts) {
+    let base = 0;
+    for (const k of COST_PARTS) {
+      const top = base + (p[k] || 0);
+      const lo = log ? Math.max(base, LOG_FLOOR) : base;
+      bars[k].push(p[k] > 0 && top > lo ? [lo, top] : null);
+      base = top;
+    }
+  }
+  return bars;
+}
+
+// [x0, x1] spans between consecutive DATED calls at least TIMELINE_GAP_S apart.
+function timelineGaps(turns, xs) {
+  const gaps = [];
+  let prev = null;
+  turns.forEach((t, i) => {
+    const ms = Date.parse(t.ts);
+    if (!Number.isFinite(ms)) return;
+    if (prev && (ms - prev.ms) / 1000 >= TIMELINE_GAP_S) gaps.push([prev.x, xs[i]]);
+    prev = { ms, x: xs[i] };
+  });
+  return gaps;
+}
+
+// Indices of calls whose actor's context fell below 60% of its previous call. Compaction:
+// turns.is_compact_summary is never set on assistant rows (Claude Code flags the user
+// record), so mark what a compaction looks like, plus the flag where it is set.
+function timelineDrops(turns) {
+  const last = {};
+  return turns.flatMap((t, i) => {
+    const prev = last[t.lane];  // per lane: two agents of one type are separate contexts
+    last[t.lane] = t.context;
+    return t.is_compact_summary || (prev > 0 && t.context < prev * 0.6) ? [i] : [];
+  });
+}
+
+// The x range to show: every position, not first..last (calls are not always in time order).
+function timelineRange(xs) {
+  let min = Infinity, max = -Infinity;
+  for (const x of xs) { if (x < min) min = x; if (x > max) max = x; }
+  return { min, max: Math.max(max, min + 1) };
+}
+
+// Every call sharing call i's x position (on a time axis they overlap), at most `cap` of them.
+// Chart.js's own 'x'/'index' modes pick elements by pixel and miss most of a dense stack.
+function timelineCallsAt(xs, i, cap = 6) {
+  const all = [];
+  xs.forEach((x, k) => { if (x === xs[i]) all.push(k); });
+  return { shown: all.slice(0, cap), more: Math.max(0, all.length - cap), all };
+}
+
+function timelineTick(turns) {
+  const t0 = timelineOrigin(turns);
+  if (timelineX === 'call') return v => Number.isInteger(v) ? '#' + v : '';
+  if (timelineX === 'clock') return v => {
+    const d = new Date(t0 + v * 1000), sec = d.getUTCSeconds();  // zone offsets are whole minutes
+    return fmtLocalDateTime(d.toISOString(), displayTZ).slice(11) + (sec ? ':' + String(sec).padStart(2, '0') : '');
+  };
+  return v => fmtElapsed(v);
+}
+
+// Gap bands and the drag-to-zoom rectangle, shared by both panels.
+const timelinePlugin = {
+  id: 'timelineOverlay',
+  beforeDatasetsDraw(chart) {
+    const { ctx, chartArea: a, scales: { x } } = chart;
+    ctx.save();
+    ctx.fillStyle = alpha(C.amber, 0.14);
+    for (const [x0, x1] of chart.canvas.$gaps || []) {
+      const p0 = Math.max(a.left, x.getPixelForValue(x0)), p1 = Math.min(a.right, x.getPixelForValue(x1));
+      if (p1 > a.left && p0 < a.right) ctx.fillRect(p0, a.top, Math.max(3, p1 - p0), a.bottom - a.top);
+    }
+    ctx.restore();
+  },
+  afterDraw(chart) {
+    const d = chart.$drag;
+    if (!d) return;
+    const { ctx, chartArea: a } = chart;
+    ctx.save();
+    ctx.fillStyle = alpha(C.accent, 0.15);
+    ctx.fillRect(Math.min(d.x0, d.x1), a.top, Math.abs(d.x1 - d.x0), a.bottom - a.top);
+    ctx.restore();
+  },
+  afterEvent(chart, args) {
+    const e = args.event, a = chart.chartArea;
+    const x = Math.min(a.right, Math.max(a.left, e.x));
+    if (e.type === 'mousedown' && e.x >= a.left && e.x <= a.right) {
+      chart.$drag = { x0: x, x1: x };
+    } else if (e.type === 'mousemove' && chart.$drag) {
+      chart.$drag.x1 = x;
+      args.changed = true;
+    } else if ((e.type === 'mouseup' || e.type === 'mouseout') && chart.$drag) {
+      const d = chart.$drag;
+      chart.$drag = null;
+      args.changed = true;
+      if (Math.abs(d.x1 - d.x0) > 5) {
+        const s = chart.scales.x;
+        setTimelineZoom({ min: s.getValueForPixel(Math.min(d.x0, d.x1)), max: s.getValueForPixel(Math.max(d.x0, d.x1)) });
+      }
+    } else if (e.type === 'dblclick') {
+      resetTimelineZoom();
+    }
+  },
+};
+
 function renderSessionTimeline(turns) {
-  const ctx = document.getElementById('chart-session-timeline').getContext('2d');
-  if (charts.sessionTimeline) charts.sessionTimeline.destroy();
-  const labels = turns.map((t, i) => (i + 1) + ' · ' + t.actor + ' · ' + (t.tool || '<none>'));
-  charts.sessionTimeline = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels,
-      datasets: [
-        { label: 'Input',          data: turns.map(t => t.input),          backgroundColor: TOKEN_COLORS.input,          stack: 'tokens', yAxisID: 'y' },
-        { label: 'Output',         data: turns.map(t => t.output),         backgroundColor: TOKEN_COLORS.output,         stack: 'tokens', yAxisID: 'y' },
-        { label: 'Cache Read',     data: turns.map(t => t.cache_read),     backgroundColor: TOKEN_COLORS.cache_read,     stack: 'tokens', yAxisID: 'y' },
-        { label: 'Cache Creation', data: turns.map(t => t.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'tokens', yAxisID: 'y' },
-        {
-          label: 'Cost',
-          type: 'line',
-          data: turns.map(t => rowCost(t, t.timestamp.slice(0, 10))),
-          borderColor: C.green,
-          backgroundColor: alpha(C.green, 0.18),
-          pointRadius: 3,
-          tension: 0.25,
-          yAxisID: 'y1',
-        },
-      ]
+  for (const k of ['sessionContext', 'sessionTimeline']) if (charts[k]) { charts[k].destroy(); charts[k] = null; }
+  if (turns !== timelineTurns) { timelineTurns = turns; timelineZoom = null; }
+  if (turns.length && timelineOrigin(turns) === undefined) timelineX = 'call';  // no usable timestamps
+  document.querySelectorAll('[data-tlx]').forEach(b => b.classList.toggle('active', b.dataset.tlx === timelineX));
+  document.querySelectorAll('[data-tly]').forEach(b => b.classList.toggle('active', (b.dataset.tly === 'log') === timelineLog));
+  if (!turns.length) return;
+  const xs = timelineXs(turns);
+  timelineBounds = timelineRange(xs);
+  const t0 = timelineOrigin(turns);
+  const canvases = ['chart-session-context', 'chart-session-timeline'].map(id => document.getElementById(id));
+  const gaps = timelineGaps(turns, xs);
+  for (const c of canvases) c.$gaps = gaps;  // read by timelinePlugin, which draws during construction
+  const callTitle = i => {
+    const t = turns[i], ms = Date.parse(t.ts);
+    return [`#${i + 1} · ${t.ts || 'undated'}` + (Number.isFinite(ms) ? ` · +${fmtElapsed((ms - t0) / 1000)}` : ''),
+            `${t.actor} · ${t.tool || '<none>'}${t.estimated ? ' (est.)' : ''}`];
+  };
+  // Tooltips use only the nearest element to find a call, then read everything from that call.
+  const first = (item, k) => k === 0;
+  const title = items => {
+    if (!items.length) return '';
+    const at = timelineCallsAt(xs, items[0].raw.i);
+    return at.all.length === 1 ? callTitle(at.all[0])
+      : [`${at.all.length} calls at this point (Call # shows them apart)`];
+  };
+  // Several calls at one x: one line each (capped), valued by `value(i)`.
+  const callLines = (at, value) => at.shown
+    .map(i => ` ${callTitle(i)[0].split(' · ')[0]} · ${callTitle(i)[1]}: ${value(i)}`)
+    .concat(at.more ? [` +${at.more} more`] : []);
+  const xScale = () => ({
+    type: 'linear', offset: false, min: (timelineZoom || timelineBounds).min, max: (timelineZoom || timelineBounds).max,
+    ticks: { color: C.axis, maxRotation: 0, callback: timelineTick(turns) }, grid: { color: C.border },
+    afterBuildTicks: axis => {
+      if (timelineX !== 'call') axis.ticks = timeTicks(axis.min, axis.max, timelineX === 'clock' ? t0 / 1000 : 0, timelineX === 'clock' ? 1 : 0.1);
     },
+  });
+  const yWidth = axis => { axis.width = 64; };  // same gutter on both panels keeps their x axes aligned
+  const events = ['mousedown', 'mousemove', 'mouseup', 'mouseout', 'click', 'dblclick'];
+  const legend = { labels: { color: C.axis, boxWidth: 12, font: { size: 11 } } };
+  const heading = text => ({ display: true, text, color: C.axis, align: 'start' });
+
+  // Context panel: one stepped line per actor (main + each subagent), compactions marked.
+  const byActor = new Map();  // one lane per agent_id (server-labelled), so two Explore agents are two lines
+  turns.forEach((t, i) => {
+    if (!byActor.has(t.lane)) byActor.set(t.lane, []);
+    byActor.get(t.lane).push({ x: xs[i], y: t.context, i });
+  });
+  const ctxSets = [...byActor].map(([actor, data], k) => {
+    const col = actor === 'main' ? C.text : MODEL_COLORS[k % MODEL_COLORS.length];  // main stands apart from agents
+    return {
+      label: actor, type: 'line', stepped: 'before', borderWidth: 1.5, pointRadius: 0, pointHitRadius: 4,
+      borderColor: col, backgroundColor: col,
+      data,
+    };
+  });
+  const compact = timelineDrops(turns).map(i => ({ x: xs[i], y: turns[i].context, i }));
+  if (compact.length) ctxSets.push({ label: 'Context drop', type: 'scatter', data: compact, pointStyle: 'triangle',
+                                     pointRadius: 7, borderColor: C.red, backgroundColor: C.red });
+  charts.sessionContext = new Chart(canvases[0].getContext('2d'), {
+    data: { datasets: ctxSets },
     options: {
-      responsive: true,
-      maintainAspectRatio: false,
+      responsive: true, maintainAspectRatio: false, animation: false, events,
+      interaction: { mode: 'nearest', intersect: false, axis: 'x' },
       plugins: {
-        legend: { labels: { color: C.axis, boxWidth: 12, font: { size: 11 } } },
+        title: heading('Context size per call: tokens the model re-reads every call'),
+        legend,
+        tooltip: { filter: first, callbacks: { title, label: item => {
+          const at = timelineCallsAt(xs, item.raw.i);
+          return at.all.length === 1 ? ` ${item.dataset.label}: ${fmt(item.parsed.y)} tokens`
+            : callLines(at, i => `${fmt(turns[i].context)} tokens`);
+        } } },
+      },
+      scales: { x: xScale(), y: { beginAtZero: true, afterFit: yWidth, ticks: { color: C.axis, callback: v => fmt(v) }, grid: { color: C.border } } },
+    },
+    plugins: [timelinePlugin],
+  });
+
+  // Cost panel: $ per call, split by what it paid for.
+  const parts = turns.map(t => rowCostBreakdown(t, t.timestamp.slice(0, 10)));
+  const width = Math.max(1, Math.min(10, 900 / turns.length));
+  const bars = timelineCostBars(parts, timelineLog);
+  const costSet = (label, key, color) => ({
+    label, key, type: 'bar', backgroundColor: color, barThickness: width, grouped: false,
+    data: bars[key].map((y, i) => ({ x: xs[i], y, i })),
+  });
+  charts.sessionTimeline = new Chart(canvases[1].getContext('2d'), {
+    data: { datasets: [
+      costSet('Cache write', 'cache_creation', TOKEN_COLORS.cache_creation),
+      costSet('Cache read', 'cache_read', TOKEN_COLORS.cache_read),
+      costSet('Output', 'output', TOKEN_COLORS.output),
+      costSet('Input', 'input', TOKEN_COLORS.input),
+    ] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false, events,
+      interaction: { mode: 'nearest', intersect: false, axis: 'x' },
+      plugins: {
+        title: heading('Cost per call, by what it paid for (API list rate)'),
+        legend,
         tooltip: {
+          filter: first,
           callbacks: {
-            title: items => {
-              const t = turns[items[0].dataIndex];
-              return (t.ts || '') + ' · ' + t.actor + ' · ' + (t.tool || '<none>') + (t.estimated ? ' (est.)' : '');
+            title,
+            label: item => {
+              const at = timelineCallsAt(xs, item.raw.i);
+              if (at.all.length === 1) {
+                return COST_PARTS.filter(k => parts[item.raw.i][k] > 0)
+                  .map(k => ` ${COST_LABELS[k]}: ${fmtCost(parts[item.raw.i][k])}`);
+              }
+              return callLines(at, i => fmtCost(parts[i].total));
             },
-            label: item => item.dataset.label === 'Cost'
-              ? ' Cost: ' + fmtCost(item.parsed.y)
-              : ' ' + item.dataset.label + ': ' + fmt(item.parsed.y),
-          }
-        }
+            footer: items => {
+              if (!items.length) return '';
+              const at = timelineCallsAt(xs, items[0].raw.i);
+              return `Total: ${fmtCost(at.all.reduce((sum, i) => sum + parts[i].total, 0))}`;
+            },
+          },
+        },
       },
       scales: {
-        x: { ticks: { color: C.axis, maxRotation: 0, autoSkip: true, maxTicksLimit: 12 }, grid: { color: C.border } },
-        y: { stacked: true, beginAtZero: true, ticks: { color: C.axis, callback: v => fmt(v) }, grid: { color: C.border } },
-        y1: { position: 'right', beginAtZero: true, ticks: { color: C.green, callback: v => '$' + Number(v).toFixed(2) }, grid: { drawOnChartArea: false } },
-      }
-    }
+        x: xScale(),
+        y: {
+          type: timelineLog ? 'logarithmic' : 'linear', beginAtZero: !timelineLog, afterFit: yWidth,
+          min: timelineLog ? LOG_FLOOR : undefined,  // sub-tenth-of-a-cent slivers would stretch the log axis
+          grid: { color: C.border },
+          ticks: { color: C.axis, callback: v => !timelineLog ? '$' + Number(v).toFixed(2)
+                     : Math.abs(Math.log10(v) - Math.round(Math.log10(v))) < 1e-9 ? '$' + Number(v) : '' },
+        },
+      },
+    },
+    plugins: [timelinePlugin],
   });
+}
+
+function setTimelineZoom(range) {
+  timelineZoom = range;
+  for (const c of [charts.sessionContext, charts.sessionTimeline]) {
+    if (!c) continue;
+    c.options.scales.x.min = (range || timelineBounds).min;
+    c.options.scales.x.max = (range || timelineBounds).max;
+    c.update('none');
+  }
+}
+function resetTimelineZoom() { setTimelineZoom(null); }
+function setTimelineX(mode) {
+  timelineX = mode;
+  timelineZoom = null;  // units differ between modes
+  if (selectedSessionDetail) renderSessionTimeline(selectedSessionDetail.turns);
+}
+function setTimelineLog(on) {
+  timelineLog = on;
+  if (selectedSessionDetail) renderSessionTimeline(selectedSessionDetail.turns);
 }
 
 function closeSessionDetail() { setTab('sessions'); }
 
-async function openSessionDetail(sessionId) {
+async function openSessionDetail(sessionId, highlightIds = '') {
+  traceHighlight = new Set(String(highlightIds || '').split(',').filter(Boolean));  // callers without ids clear it
   try {
     const d = await fetchSession(sessionId);
     if (d.error) throw new Error(d.error);
@@ -2093,6 +2525,8 @@ async function loadData() {
       buildFilterUI(d.all_models, new Set(wasAll ? d.all_models : d.all_models.filter(m => selectedModels.has(m))));
     }
     rawData = d;
+    wastePayload = null;  // findings follow the data: refetch on the next Waste render
+    wasteGen++;
     renderMeta();
 
     if (isFirstLoad) {
@@ -2103,7 +2537,7 @@ async function loadData() {
       applyTabVisibility(activeTab);
       // Restore range from URL, mark active button
       selectedRange = readURLRange();
-      document.querySelectorAll('.range-btn').forEach(btn =>
+      document.querySelectorAll('.range-btn[data-range]').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.range === selectedRange)
       );
       // Mark the active TZ button (displayTZ was read from the URL pre-fetch)
@@ -2168,6 +2602,7 @@ Object.assign(window, {
   moreModelRows, lessModelRows, moreSessionRows, lessSessionRows,
   moreProjectRows, lessProjectRows, moreBranchRows, lessBranchRows,
   onAutoRefreshToggle, toggleRail, setThemePref, setDefaultTZ, clearProjectChip,
+  setTimelineX, setTimelineLog, resetTimelineZoom, setWasteCause, showAllWaste,
 });
 window.setTheme = setThemePref;
 
