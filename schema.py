@@ -43,6 +43,10 @@ from pathlib import Path
 # directory moving. Neither carries usage, and project attribution still comes
 # from the per-turn `cwd`, so "relocated" needs no parsing. None carry usage.
 KNOWN_RECORD_TYPES = frozenset({
+    "atis-latch", "bridge-session", "api-request-blob", "api-request",
+    "file-history-delta", "cost-state", "api-request-shape",
+    "artifact-autoreact-ledger", "artifact-comment-monitor", "dev-mods",
+    "agent-setting", "worktree-state", "pr-link", "launched",
     "assistant", "user", "system", "attachment", "queue-operation",
     "ai-title", "custom-title", "last-prompt", "mode", "permission-mode",
     "file-history-snapshot", "started", "result", "frame-link",
@@ -62,6 +66,27 @@ KNOWN_RECORD_TYPES = frozenset({
 # agentName / relocatedCwd (the payloads of the two new record types above).
 # All metadata — none carry tokens.
 KNOWN_RECORD_KEYS = frozenset({
+    "apiBlockIndex", "perTurnEffort", "rendered", "serverClassifierRequest",
+    "wireToolInputs", "requestedModel", "renderedRole", "permissionDecision",
+    "serverClassifierContext", "thinkingDurationMs", "atis", "requestRef",
+    "wireIngestContext", "bridgeSessionId", "lastSequenceNum", "ownerAccountUuid",
+    "ownerOrganizationUuid", "hash", "thinkingDisplay", "shapeHash", "cacheControl",
+    "id", "keep", "params", "querySource", "requestDigest", "tail", "base",
+    "turnOrigin", "reason", "turnPosition", "renderedInHumanTurn", "commandUuid",
+    "deliveryId", "queueSkipAttachments", "renderedBesideToolResult", "backup",
+    "snapshotMessageId", "trackingPath", "sandboxed", "classifierBoundary",
+    "turnCompanion", "hasUnknownModelCost", "modelUsage", "startTime",
+    "totalAPIDuration", "totalAPIDurationWithoutRetries", "totalCostUSD",
+    "totalDuration", "totalLinesAdded", "totalLinesRemoved", "totalToolDuration",
+    "pendingBackgroundAgentCount", "shape", "queueSkipSlashCommands", "artifacts",
+    "v", "artifactCount", "projectsUserTurn", "verifiedSlackHumanTurn",
+    "accountUuid", "imagePasteIds", "url", "queuePriority", "queueTranscriptOnly",
+    "preventContinuation", "promptSubmitEnding", "joinedNoticeLengths",
+    "joinedNoticeOwn", "joinedNoticeRunIds", "folder", "agentSetting",
+    "worktreeSession", "commandRun", "summarizedTurnPromptUuids", "label", "phase",
+    "contextUsage", "quotaLimits", "usageReport", "mergedSendUuids",
+    "interruptedByShutdown", "interruptedMessageId", "prNumber", "prRepository",
+    "prUrl", "isAbortedMidStream",
     "advisorModel", "agentId", "agentName", "aiTitle", "apiError", "apiErrorStatus",
     "attachment", "attributionAgent",
     "attributionMcpServer", "attributionMcpTool", "attributionPlugin",
@@ -85,6 +110,7 @@ KNOWN_RECORD_KEYS = frozenset({
 # Keys of the assistant ``message`` object. ``container`` and ``context_management``
 # are recent additions (server-side context editing / container execution).
 KNOWN_MESSAGE_KEYS = frozenset({
+    "input_transformations", "output_config", "clear_at",
     "container", "content", "context_management", "diagnostics", "id", "model",
     "role", "stop_details", "stop_reason", "stop_sequence", "type", "usage",
 })
@@ -92,6 +118,7 @@ KNOWN_MESSAGE_KEYS = frozenset({
 # Keys of ``message.usage`` — the token-accounting surface. This is the highest-value
 # canary: a new token bucket here is money we'd silently stop counting.
 KNOWN_USAGE_KEYS = frozenset({
+    "fallback_credit",
     "cache_creation", "cache_creation_input_tokens", "cache_read_input_tokens",
     "inference_geo", "input_tokens", "iterations", "output_tokens",
     # output_tokens_details breaks output down (e.g. thinking_tokens); those are
@@ -109,6 +136,14 @@ KNOWN_CACHE_CREATION_KEYS = frozenset({
 # doctor reports any version not in this set as "unseen" — a prompt to re-verify the
 # envelope against that release. Update alongside the allowlists.
 KNOWN_VERSIONS = frozenset({
+    "2.1.227", "2.1.228", "2.1.229", "2.1.232", "2.1.233", "2.1.234", "2.1.235",
+    "2.1.237", "2.1.238", "2.1.241", "2.1.246", "2.1.247", "2.1.251", "2.1.255",
+    "2.1.257", "2.1.258", "2.1.260", "2.1.263", "2.1.266", "2.1.269", "2.1.274",
+    "2.1.275", "2.1.276", "2.1.278", "2.1.280", "2.1.281", "2.1.282", "2.1.283",
+    "2.1.284", "2.1.285", "2.1.286", "2.1.287", "2.1.288", "2.1.289", "2.1.291",
+    "2.1.292", "2.1.293", "2.1.294", "2.1.295", "2.1.296", "2.1.299", "2.1.300",
+    "2.1.301", "2.1.302", "2.1.303", "2.1.304", "2.1.305", "2.1.306", "2.1.308",
+    "2.1.309",
     "2.1.92", "2.1.111", "2.1.119", "2.1.121", "2.1.126", "2.1.128",
     "2.1.138", "2.1.142", "2.1.146", "2.1.148", "2.1.149", "2.1.150",
     "2.1.156", "2.1.158", "2.1.159", "2.1.160", "2.1.161", "2.1.165",
@@ -126,12 +161,15 @@ KNOWN_VERSIONS = frozenset({
 # ``{timestamp, type, payload}`` and token accounting lives only inside an
 # ``event_msg`` whose ``payload.type == "token_count"``.
 
-KNOWN_CODEX_ENVELOPE_KEYS = frozenset({"payload", "timestamp", "type"})
+KNOWN_CODEX_ENVELOPE_KEYS = frozenset({
+    "ordinal", "metadata",
+    "payload", "timestamp", "type"})
 
 # Envelope ``type`` values. token_count (the money record) rides inside event_msg.
 # world_state (env/AGENTS.md snapshot) and inter_agent_communication_metadata
 # (multi-agent trigger flag) are 0.14x additions — no token data.
 KNOWN_CODEX_TYPES = frozenset({
+    "token_usage_record", "realtime_item",
     "compacted", "event_msg", "inter_agent_communication_metadata",
     "response_item", "session_meta", "turn_context", "world_state",
 })
@@ -139,6 +177,8 @@ KNOWN_CODEX_TYPES = frozenset({
 # ``payload.type`` values across event_msg / response_item. A genuinely new one is
 # drift — it may carry data (tokens, a new tool) we'd silently miss.
 KNOWN_CODEX_PAYLOAD_TYPES = frozenset({
+    "transcript_segment", "additional_tools", "realtime_session_closed",
+    "realtime_session_started",
     "agent_message", "agent_reasoning", "context_compacted", "custom_tool_call",
     "custom_tool_call_output", "exec_command_end", "function_call",
     "function_call_output", "image_generation_call", "image_generation_end",

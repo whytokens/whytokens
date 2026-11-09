@@ -15,3 +15,4 @@ docs/PHASE*.md export-ignore
 AGENTS.md export-ignore
 CLAUDE.md export-ignore
 DESIGN.md export-ignore
+scripts/falsify_nightly*.ps1 export-ignore

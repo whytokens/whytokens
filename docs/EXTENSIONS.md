@@ -45,7 +45,5 @@ Extension routes are consulted after core routes, so an extension cannot shadow 
 ## Database location
 
 `~/.whytokens/whytokens.db` (`WHYTOKENS_HOME` overrides the dir, `WHYTOKENS_DB` the file).
-If that file is absent and a legacy `~/.claude/usage-profiler.db` exists, the first run copies it
-with the sqlite backup API (WAL-safe), verifies equal row counts per table, and keeps the legacy
-file. A failed verify deletes the new file and raises. A rescan never drops the database
+A first run starts empty; it never imports another tool's database. A rescan never drops the database
 (transcripts get pruned). External writers default to the same path.

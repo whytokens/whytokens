@@ -42,6 +42,26 @@ class EmptyStates(unittest.TestCase):
         self.tmp = Path(self._t.name)
         self.addCleanup(self._t.cleanup)
 
+    def test_stray_legacy_db_is_not_imported(self):
+        # a first run must start empty, not copy the old private profiler DB.
+        # Subprocess: config reads the home dir at import time, and under unittest it
+        # deliberately points elsewhere, so only a fresh interpreter sees the real path.
+        import os
+        import subprocess
+        legacy = self.tmp / ".claude" / "usage-profiler.db"
+        legacy.parent.mkdir()
+        conn = scanner.get_db(legacy)
+        scanner.init_db(conn)
+        conn.close()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("WHYTOKENS_")}
+        env.update(HOME=str(self.tmp), USERPROFILE=str(self.tmp))
+        r = subprocess.run([sys.executable, "-c", "import cli; cli.require_db()"],
+                           cwd=Path(__file__).resolve().parent.parent, env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("Database not found", r.stdout)
+        self.assertFalse((self.tmp / ".whytokens" / "whytokens.db").exists())
+
     def test_no_transcripts(self):
         st = status_with(self.tmp, [self.tmp / "nope"], self.tmp / "nope2")
         self.assertEqual(st["empty"], "no_transcripts")

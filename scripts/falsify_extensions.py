@@ -1,4 +1,4 @@
-"""Guard the guard: break the migration verify and the /ext containment (and route
+"""Guard the guard: break the /ext containment (and route
 precedence) in a temp copy of the repo and confirm tests/test_extensions.py goes red
 for every one.
 
@@ -14,9 +14,6 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # (file, original, mutant) - each must turn the suite red on its own.
 MUTANTS = [
-    ("config.py", "if _counts(tmp) != _counts(legacy):", "if False:"),
-    ("config.py", "        os.replace(tmp, new)\n    except BaseException:\n        for f in (tmp, new):",
-     "        os.replace(tmp, new)\n    except BaseException:\n        for f in (new,):"),
     ("extensions.py", "            cand.relative_to(root)\n        except ValueError:\n            continue",
      "            pass\n        except ValueError:\n            continue"),
     ("api.py", "        elif path == \"/api/extensions\":", "        elif path == \"/api/extensions\" or True:"),

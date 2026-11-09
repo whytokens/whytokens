@@ -16,7 +16,6 @@ import api
 import config
 import extensions
 import sources
-from scanner import get_db, init_db
 
 EXT_SRC = '''
 def _scan(conn):
@@ -193,72 +192,6 @@ class TestHookCommit(unittest.TestCase):
                 self.assertEqual(c.execute("SELECT count(*) FROM sat").fetchone()[0], 2)
             finally:
                 c.close()
-
-
-class TestMigration(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        self.legacy = self.root / "claude" / "usage-profiler.db"
-        self.new = self.root / "wt" / "whytokens.db"
-        conn = get_db(self.legacy)
-        init_db(conn)
-        conn.execute("CREATE TABLE sat (a)")
-        conn.executemany("INSERT INTO sat VALUES (?)", [(i,) for i in range(50)])
-        conn.commit()
-        conn.close()
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_copies_and_verifies_counts_keeps_legacy(self):
-        self.assertTrue(config.migrate_legacy_db(self.new, self.legacy))
-        self.assertTrue(self.legacy.exists())
-        self.assertEqual(config._counts(self.new), config._counts(self.legacy))
-        self.assertEqual(config._counts(self.new)["sat"], 50)
-
-    def test_noop_when_new_exists_or_legacy_absent(self):
-        self.new.parent.mkdir()
-        self.new.write_bytes(b"keep")
-        self.assertFalse(config.migrate_legacy_db(self.new, self.legacy))
-        self.assertEqual(self.new.read_bytes(), b"keep")
-        self.assertFalse(config.migrate_legacy_db(self.root / "n2.db", self.root / "absent.db"))
-
-    def test_racing_install_is_not_clobbered_or_deleted(self):
-        real = config._copy
-
-        def copy_then_other_run_wins(src, dst):
-            real(src, dst)
-            self.new.write_bytes(b"other run")  # a concurrent migration installed first
-        with mock.patch.object(config, "_copy", copy_then_other_run_wins):
-            self.assertFalse(config.migrate_legacy_db(self.new, self.legacy))
-        self.assertEqual(self.new.read_bytes(), b"other run")
-        self.assertEqual([p.name for p in self.new.parent.iterdir()], ["whytokens.db"])
-
-    def test_short_copy_rejected_and_removed(self):
-        real_copy = config._copy
-
-        def short_copy(src, dst):
-            real_copy(src, dst)
-            c = sqlite3.connect(dst)
-            c.execute("DELETE FROM sat WHERE a = 0")
-            c.commit()
-            c.close()
-        with mock.patch.object(config, "_copy", short_copy):
-            with self.assertRaisesRegex(RuntimeError, "verify failed"):
-                config.migrate_legacy_db(self.new, self.legacy)
-        self.assertFalse(self.new.exists())
-        self.assertEqual([p.name for p in self.new.parent.glob("*")], [])
-        self.assertTrue(self.legacy.exists())
-
-    def test_ensure_db_only_for_default_path(self):
-        with mock.patch.object(config, "DB_PATH", self.new), \
-                mock.patch.object(config, "LEGACY_DB_PATH", self.legacy), \
-                mock.patch.dict("os.environ", {"WHYTOKENS_DB": ""}):
-            self.assertFalse(config.ensure_db(self.root / "other.db"))
-            self.assertFalse(self.new.exists())
-            self.assertTrue(config.ensure_db(self.new))
-            self.assertTrue(self.new.exists())
 
 
 if __name__ == "__main__":

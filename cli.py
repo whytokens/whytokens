@@ -73,7 +73,6 @@ def hr(char="-", width=60):
     print(char * width)
 
 def require_db():
-    config.ensure_db(DB_PATH)
     if not DB_PATH.exists():
         print("Database not found. Run: whytokens scan")
         sys.exit(1)
@@ -93,7 +92,6 @@ def require_db():
 
 def cmd_scan(projects_dir=None):
     import sources
-    config.ensure_db(DB_PATH)
     # Scan every registered source (Claude Code + Codex) into config.DB_PATH.
     # `--projects-dir` overrides only the Claude location; Codex uses CODEX_PATH.
     sources.scan_all(db_path=DB_PATH, projects_dir=projects_dir)

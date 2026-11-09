@@ -13,7 +13,6 @@ with the ``PORT`` environment variable.
 """
 
 import os
-import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -21,14 +20,13 @@ from pathlib import Path
 import project_threads
 
 # Own data dir (WHYTOKENS_HOME), DB file overridable with WHYTOKENS_DB.
-# Under unittest the default home is a throwaway dir with no legacy DB, so no test run
-# can read the user's config.json (and its extensions) or migrate the real database
+# Under unittest the default home is a throwaway dir, so no test run can read the
+# user's config.json (and its extensions) or write the real database
 # (unittest discovery may import this before any tests/__init__ bootstrap runs).
 _TESTING = "unittest" in sys.modules and not os.environ.get("WHYTOKENS_HOME")
 DATA_DIR = Path(os.environ.get("WHYTOKENS_HOME") or
                 (tempfile.mkdtemp(prefix="whytokens-test-") if _TESTING else Path.home() / ".whytokens"))
 DB_PATH = Path(os.environ.get("WHYTOKENS_DB") or (DATA_DIR / "whytokens.db"))
-LEGACY_DB_PATH = DATA_DIR / "no-legacy.db" if _TESTING else Path.home() / ".claude" / "usage-profiler.db"
 
 # Default dashboard port (claude-usage uses 8080). Override with env PORT.
 DEFAULT_PORT = 8090
@@ -87,57 +85,3 @@ def discovered_roots(projects_dir=None):
     codex = CODEX_PATH / "sessions"
     roots.append({"source": "codex", "path": str(codex), "exists": codex.is_dir()})
     return roots
-
-
-def _counts(path):
-    conn = sqlite3.connect(path)
-    try:
-        names = [r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
-        return {n: conn.execute(f'SELECT COUNT(*) FROM "{n}"').fetchone()[0] for n in names}
-    finally:
-        conn.close()
-
-
-def _copy(src, dst):
-    s, d = sqlite3.connect(src), sqlite3.connect(dst)
-    try:
-        s.backup(d)  # WAL-safe, unlike copying the file
-    finally:
-        d.close()
-        s.close()
-
-
-def migrate_legacy_db(new=None, legacy=None):
-    """Copy the legacy DB to the new location once. Keeps the legacy file.
-
-    No-op when the new file exists or the legacy one is absent. Row counts per table
-    must match after the copy; otherwise the new file is deleted and RuntimeError raised.
-    """
-    new = Path(new or DB_PATH)
-    legacy = Path(legacy or LEGACY_DB_PATH)
-    if new.exists() or not legacy.exists():
-        return False
-    new.parent.mkdir(parents=True, exist_ok=True)
-    tmp = new.with_name(f"{new.name}.{os.getpid()}.migrating")  # per-attempt: concurrent runs don't share it
-    try:
-        _copy(legacy, tmp)
-        if _counts(tmp) != _counts(legacy):
-            raise RuntimeError(f"migration verify failed: {legacy} -> {new}")
-        try:
-            os.link(tmp, new)  # fails if a concurrent run installed it first; never clobbers
-        except FileExistsError:
-            return False
-    finally:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-    return True
-
-
-def ensure_db(db_path):
-    """Migrate the legacy DB, but only when ``db_path`` is the untouched default."""
-    if Path(db_path) == DB_PATH and not os.environ.get("WHYTOKENS_DB"):
-        return migrate_legacy_db()
-    return False

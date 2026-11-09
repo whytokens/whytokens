@@ -70,7 +70,7 @@ export async function fetchPricing() {
   return resp.json();
 }
 
-/** POST /api/rescan — destructive full DB rebuild across all sources (Claude +
+/** POST /api/rescan — incremental, non-destructive re-scan across all sources (Claude +
  * Codex). Returns flat totals {new, updated, skipped, turns, sessions} summed
  * over sources, plus a per-source breakdown under .sources. */
 export async function postRescan() {

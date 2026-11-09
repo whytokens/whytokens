@@ -184,6 +184,11 @@ class TestInspectRecordDrift(unittest.TestCase):
         info = schema.inspect_record(record)
         self.assertIn("telepathyField", info["unknown_record_keys"])
 
+    def test_codex_ordinal_metadata_are_known(self):
+        # Seen on every Codex rollout line in current logs; not on Claude records.
+        crec = {"timestamp": "t", "type": "event_msg", "payload": {}, "ordinal": 3, "metadata": {}}
+        self.assertEqual(schema.inspect_codex_record(crec)["unknown_envelope_keys"], [])
+
     def test_new_message_key_flagged(self):
         record = {"type": "assistant", "message": {"hologram": 1}}
         self.assertIn("hologram", schema.inspect_record(record)["unknown_message_keys"])

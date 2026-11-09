@@ -35,6 +35,8 @@ uvx --from git+https://github.com/whytokens/whytokens@v0.1.0 whytokens dashboard
 
 # or install the command
 pipx install git+https://github.com/whytokens/whytokens@v0.1.0
+# or, with uv
+uv tool install git+https://github.com/whytokens/whytokens@v0.1.0
 whytokens dashboard
 
 # or from a clone
@@ -97,8 +99,10 @@ loopback needs `--unsafe-host`.
 
 ## Data location
 
-`~/.whytokens/whytokens.db` (plus `-wal` and `-shm` files). Delete it to start over; it is
-rebuilt from the transcripts that still exist. The schema and the read API the dashboard
+`~/.whytokens/whytokens.db` (plus `-wal` and `-shm` files). To start over, move the file
+aside (or point `WHYTOKENS_DB` at a new path) rather than deleting it: a rescan rebuilds
+only from transcripts that still exist, and Claude Code prunes old ones, so the database
+is often the only copy of past sessions. The schema and the read API the dashboard
 serves are in [docs/SCHEMA.md](docs/SCHEMA.md).
 
 ## Limits

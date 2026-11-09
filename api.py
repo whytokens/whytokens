@@ -3,7 +3,7 @@ api.py - Local web dashboard server (stdlib http.server).
 
 Serves the frontend from ``static/`` (real HTML/CSS/ES-module files, no build, no
 CDN) and the JSON read-API the frontend calls. The SQLite schema is the contract;
-these endpoints only read it (except POST /api/rescan, which rebuilds the DB).
+these endpoints only read it (except POST /api/rescan, which incrementally re-scans into it).
 
 Routes:
   GET  /  , /index.html        -> static/index.html
@@ -1271,7 +1271,6 @@ def serve(host=None, port=None, unsafe_host=False, scan=False, projects_dir=None
     if _host_name(host) not in LOOPBACK_HOSTS and not unsafe_host:
         raise SystemExit(f"Refusing to listen on {host!r}: the dashboard serves your usage "
                          "data and can trigger rescans. Pass --unsafe-host to override.")
-    config.ensure_db(DB_PATH)
     DashboardHandler.extensions = extensions.load()
     DashboardHandler.token = secrets.token_urlsafe(32)
     DashboardHandler.allow_any_host = unsafe_host
