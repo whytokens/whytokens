@@ -83,7 +83,130 @@ def get_db(db_path=DB_PATH):
     return conn
 
 
+TURN_MIGRATIONS = {
+    "message_id": "TEXT",
+    "cache_creation_5m_tokens": "INTEGER DEFAULT 0",
+    "cache_creation_1h_tokens": "INTEGER DEFAULT 0",
+    "duration_ms": "INTEGER DEFAULT 0",
+    "stop_reason": "TEXT",
+    "service_tier": "TEXT",
+    "inference_geo": "TEXT",
+    # usage.speed: "fast" bills 2x (pricing.PRICE_MULT_SQL). Filled for old
+    # rows by ClaudeSource.backfill_speed.
+    "speed": "TEXT",
+    "is_sidechain": "INTEGER DEFAULT 0",
+    "is_compact_summary": "INTEGER DEFAULT 0",
+    "tool_calls": "TEXT",
+    # Multi-agent ingestion. `agent` tags the source ('claude' /
+    # 'codex'); DEFAULT 'claude' backfills every pre-existing row correctly.
+    # `reasoning_tokens` is informational (Codex reasoning is already inside
+    # output_tokens and is never billed separately).
+    "agent": "TEXT DEFAULT 'claude'",
+    "reasoning_tokens": "INTEGER DEFAULT 0",
+    # Subagent attribution: the dispatched-agent id carried on a subagent's own
+    # turns (matches agents.agent_id). NULL on ordinary main-chain turns.
+    "agent_id": "TEXT",
+    # Reasoning effort level ('high'/'medium'/'low'/'xhigh'). Claude Code
+    # writes it on assistant records from 2.1.215; Codex carries it in
+    # turn_context/thread_settings. NULL on migrated rows and on turns from
+    # older versions — queries normalise that to 'unknown'. Existing rows are
+    # never rewritten (INSERT OR IGNORE), so backfill = drop the DB + rescan.
+    "effort": "TEXT",
+    # Skill attribution: the skill that was active when Claude Code produced this
+    # turn ('next-task', 'local-delegate', ...), read from the record's top-level
+    # `attributionSkill`. NULL/'' on turns produced outside any skill and on rows
+    # migrated from before the column — ClaudeSource.backfill_skill fills those in
+    # once, since INSERT OR IGNORE never rewrites an existing row.
+    "skill": "TEXT",
+    # MCP/plugin attribution: `attributionMcpServer` / `attributionMcpTool` /
+    # `attributionPlugin` sit on the assistant turn that consumed that MCP
+    # tool's result (idea from upstream claude-usage). Orthogonal to the
+    # main/subagent/skill actor split — a subagent turn can carry one too.
+    # Filled for old rows by ClaudeSource.backfill_mcp.
+    "mcp_server": "TEXT",
+    "mcp_tool": "TEXT",
+    "plugin": "TEXT",
+    # 1 = some token count on this row is an estimate (truncated subagent
+    # output, unrecorded advisor call, or the synthetic agent_summary row).
+    "estimated": "INTEGER DEFAULT 0",
+    # genuine user prompts seen so far in this session's main transcript
+    # (see is_user_prompt); 0 before the first one. NULL on subagent turns and on
+    # rows whose transcript is gone, so no DEFAULT: unknown must stay NULL.
+    "prompt_seq": "INTEGER",
+}
+
+COLUMN_MIGRATIONS = {
+    "turns": TURN_MIGRATIONS,
+    "sessions": {
+        "agent": "TEXT DEFAULT 'claude'",
+        # Session topic (from custom-title / ai-title records). The one-time
+        # backfill is driven by backfill_topics_once() via the schema_meta
+        # 'topic_backfill_done' marker, not by the column-add event.
+        "topic": "TEXT",
+        # Provenance ('custom' / 'ai') so an incrementally appended ai-title can
+        # never clobber a user-set custom-title.
+        "topic_source": "TEXT",
+    },
+    # Keyed per (path, source) so two sources that discover the same path don't
+    # clobber each other (default 'claude' for legacy rows).
+    "processed_files": {"source": "TEXT DEFAULT 'claude'"},
+}
+
+CORE_TABLES = ("sessions", "turns", "processed_files", "schema_meta", "agents",
+               "tool_results")
+CORE_INDEXES = ("idx_turns_session", "idx_turns_timestamp", "idx_sessions_first",
+                "idx_agents_type", "idx_tool_results_message", "idx_tool_results_session",
+                "idx_turns_agent_id", "idx_turns_message_id")
+
+
+def _table_cols(conn, table):
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def schema_change_pending(conn):
+    """True when init_db would CREATE a table/index or ADD a column on an existing DB.
+
+    A DB without ``turns`` is brand new: nothing in it to preserve."""
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+    if "turns" not in tables:
+        return False
+    indexes = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
+    if not (set(CORE_TABLES) <= tables and set(CORE_INDEXES) <= indexes):
+        return True
+    return any(not set(cols) <= _table_cols(conn, table)
+               for table, cols in COLUMN_MIGRATIONS.items())
+
+
+def backup_before_migration(conn):
+    """Copy the DB to ``<db>.bak-YYYYMMDD`` before init_db changes its schema.
+
+    The DB is the only copy of sessions whose transcripts Claude Code has since
+    pruned, so a botched migration must be recoverable. The sqlite backup API (not
+    a file copy) also captures pages still in the -wal file. A same-day backup is
+    never overwritten: the first one is the pre-migration copy. Errors propagate,
+    so a failed backup stops the migration. Returns the backup path or None.
+    """
+    path = next((row[2] for row in conn.execute("PRAGMA database_list").fetchall()
+                 if row[1] == "main"), "")
+    if not path or not schema_change_pending(conn):
+        return None
+    bak = Path(f"{path}.bak-{datetime.now():%Y%m%d}")
+    if bak.exists():
+        return bak
+    tmp = Path(f"{bak}.tmp")
+    dest = sqlite3.connect(tmp)
+    try:
+        conn.backup(dest)
+    finally:
+        dest.close()
+    os.replace(tmp, bak)
+    return bak
+
+
 def init_db(conn):
+    backup_before_migration(conn)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id      TEXT PRIMARY KEY,
@@ -124,7 +247,8 @@ def init_db(conn):
             is_compact_summary      INTEGER DEFAULT 0,
             agent                   TEXT DEFAULT 'claude',
             reasoning_tokens        INTEGER DEFAULT 0,
-            effort                  TEXT
+            effort                  TEXT,
+            prompt_seq              INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS processed_files (
@@ -155,92 +279,32 @@ def init_db(conn):
             tool_use_count        INTEGER
         );
 
+        -- one row per tool call (Claude only), keyed by the tool_use id.
+        -- Either side may arrive first (the result often lands in a later scan),
+        -- so every write is a COALESCE upsert. result_bytes stays NULL until the
+        -- tool_result is seen: unknown, never 0 (see session_result_bytes).
+        CREATE TABLE IF NOT EXISTS tool_results (
+            call_id      TEXT PRIMARY KEY,
+            session_id   TEXT,
+            message_id   TEXT,
+            tool_name    TEXT,
+            result_bytes INTEGER
+        );
+
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
+        CREATE INDEX IF NOT EXISTS idx_tool_results_message ON tool_results(message_id);
+        CREATE INDEX IF NOT EXISTS idx_tool_results_session ON tool_results(session_id);
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
         CREATE INDEX IF NOT EXISTS idx_agents_type ON agents(agent_type);
     """)
-    # Add columns if upgrading from older schema.
-    existing_cols = {
-        row["name"] for row in conn.execute("PRAGMA table_info(turns)").fetchall()
-    }
-    migrations = {
-        "message_id": "TEXT",
-        "cache_creation_5m_tokens": "INTEGER DEFAULT 0",
-        "cache_creation_1h_tokens": "INTEGER DEFAULT 0",
-        "duration_ms": "INTEGER DEFAULT 0",
-        "stop_reason": "TEXT",
-        "service_tier": "TEXT",
-        "inference_geo": "TEXT",
-        # usage.speed: "fast" bills 2x (pricing.PRICE_MULT_SQL). Filled for old
-        # rows by ClaudeSource.backfill_speed.
-        "speed": "TEXT",
-        "is_sidechain": "INTEGER DEFAULT 0",
-        "is_compact_summary": "INTEGER DEFAULT 0",
-        "tool_calls": "TEXT",
-        # Multi-agent ingestion. `agent` tags the source ('claude' /
-        # 'codex'); DEFAULT 'claude' backfills every pre-existing row correctly.
-        # `reasoning_tokens` is informational (Codex reasoning is already inside
-        # output_tokens and is never billed separately).
-        "agent": "TEXT DEFAULT 'claude'",
-        "reasoning_tokens": "INTEGER DEFAULT 0",
-        # Subagent attribution: the dispatched-agent id carried on a subagent's own
-        # turns (matches agents.agent_id). NULL on ordinary main-chain turns.
-        "agent_id": "TEXT",
-        # Reasoning effort level ('high'/'medium'/'low'/'xhigh'). Claude Code
-        # writes it on assistant records from 2.1.215; Codex carries it in
-        # turn_context/thread_settings. NULL on migrated rows and on turns from
-        # older versions — queries normalise that to 'unknown'. Existing rows are
-        # never rewritten (INSERT OR IGNORE), so backfill = drop the DB + rescan.
-        "effort": "TEXT",
-        # Skill attribution: the skill that was active when Claude Code produced this
-        # turn ('next-task', 'local-delegate', ...), read from the record's top-level
-        # `attributionSkill`. NULL/'' on turns produced outside any skill and on rows
-        # migrated from before the column — ClaudeSource.backfill_skill fills those in
-        # once, since INSERT OR IGNORE never rewrites an existing row.
-        "skill": "TEXT",
-        # MCP/plugin attribution: `attributionMcpServer` / `attributionMcpTool` /
-        # `attributionPlugin` sit on the assistant turn that consumed that MCP
-        # tool's result (idea from upstream claude-usage). Orthogonal to the
-        # main/subagent/skill actor split — a subagent turn can carry one too.
-        # Filled for old rows by ClaudeSource.backfill_mcp.
-        "mcp_server": "TEXT",
-        "mcp_tool": "TEXT",
-        "plugin": "TEXT",
-        # 1 = some token count on this row is an estimate (truncated subagent
-        # output, unrecorded advisor call, or the synthetic agent_summary row).
-        "estimated": "INTEGER DEFAULT 0",
-    }
-    for col, spec in migrations.items():
-        if col not in existing_cols:
-            conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {spec}")
+    # Add columns if upgrading from older schema (see COLUMN_MIGRATIONS).
+    for table, migrations in COLUMN_MIGRATIONS.items():
+        existing_cols = _table_cols(conn, table)
+        for col, spec in migrations.items():
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {spec}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_agent_id ON turns(agent_id)")
-    # sessions also carry an `agent` column (same additive pattern).
-    session_cols = {
-        row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
-    }
-    if "agent" not in session_cols:
-        conn.execute("ALTER TABLE sessions ADD COLUMN agent TEXT DEFAULT 'claude'")
-    # Session topic (from custom-title / ai-title records; added in a later schema
-    # version). The one-time backfill of pre-existing sessions is driven by
-    # backfill_topics_once() via the schema_meta 'topic_backfill_done' marker (not by
-    # the column-add event), so it also covers DBs that gained the column from an
-    # earlier build that predated the backfill.
-    if "topic" not in session_cols:
-        conn.execute("ALTER TABLE sessions ADD COLUMN topic TEXT")
-    # topic_source records provenance ('custom' / 'ai') so an incrementally
-    # appended ai-title can never clobber a user-set custom-title (custom always
-    # wins; ai only overwrites a NULL topic or a previous ai-title).
-    if "topic_source" not in session_cols:
-        conn.execute("ALTER TABLE sessions ADD COLUMN topic_source TEXT")
-    # processed_files has a `source` column so the multi-source engine keys
-    # incremental bookkeeping per (path, source) — two sources that discover the
-    # same path don't clobber each other (default 'claude' for legacy rows).
-    pf_cols = {
-        row["name"] for row in conn.execute("PRAGMA table_info(processed_files)").fetchall()
-    }
-    if "source" not in pf_cols:
-        conn.execute("ALTER TABLE processed_files ADD COLUMN source TEXT DEFAULT 'claude'")
     # Conditional unique index: only dedup non-null message IDs
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
@@ -263,6 +327,79 @@ def extract_tool_calls(content):
                     "input": item.get("input") or {},
                 })
     return policy.redact_calls(calls)
+
+
+# Automated user-role records that are not a person typing: desktop-app session
+# events, background-task notices, local slash-command output, interrupts.
+_NOT_PROMPT_PREFIXES = (
+    "<side-sessions-event>", "<cross-session-message", "<ci-monitor-event>",
+    "<task-notification>", "<local-command-stdout>", "<local-command-stderr>",
+    "<local-command-caveat>", "[Request interrupted",
+)
+_REMINDER_OPEN, _REMINDER_CLOSE = "<system-reminder>", "</system-reminder>"
+
+
+def is_user_prompt(record):
+    """True for a genuine user prompt: what advances turns.prompt_seq.
+
+    Not a prompt: tool_result entries, isMeta (skill bodies, hook/peer injections),
+    compaction summaries, records whose ``origin.kind`` names a non-human producer,
+    and the automated records in _NOT_PROMPT_PREFIXES. Slash commands
+    (``<command-name>``) count. ``origin`` is absent on many real prompts (the
+    desktop app's writer), and the desktop app prefixes prompts with
+    ``<system-reminder>`` blocks, so those are stripped before the prefix test.
+    """
+    if record.get("type") != "user" or record.get("isMeta") or record.get("isCompactSummary"):
+        return False
+    origin = record.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        return False
+    content = (record.get("message") or {}).get("content")
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return False
+        # A pasted image/document with no text is still the user's prompt.
+        if any(isinstance(b, dict) and b.get("type") in ("image", "document") for b in content):
+            return True
+        content = "".join(b.get("text") or "" for b in content
+                          if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(content, str):
+        return False
+    text = content.lstrip()
+    while text.startswith(_REMINDER_OPEN):
+        end = text.find(_REMINDER_CLOSE)
+        if end < 0:
+            return False
+        text = text[end + len(_REMINDER_CLOSE):].lstrip()
+    return bool(text) and not text.startswith(_NOT_PROMPT_PREFIXES)
+
+
+def _utf8_len(text):
+    return len(text.encode("utf-8", errors="replace"))
+
+
+def tool_result_sizes(record):
+    """Yield (tool_use_id, bytes) for each tool_result block in a user record.
+
+    Bytes = UTF-8 length of the result as the transcript holds it: a string
+    content as-is; in a block list, each text block's text, and any other block
+    (image, document) as its compact JSON. Missing content is a genuine 0.
+    """
+    content = (record.get("message") or {}).get("content")
+    for b in content if isinstance(content, list) else []:
+        if not (isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id")):
+            continue
+        c = b.get("content")
+        if isinstance(c, str):
+            n = _utf8_len(c)
+        elif isinstance(c, list):
+            n = sum(_utf8_len(x.get("text") or "")
+                    if isinstance(x, dict) and x.get("type") == "text"
+                    else _utf8_len(json.dumps(x, ensure_ascii=False, separators=(",", ":")))
+                    for x in c)
+        else:
+            n = 0
+        yield b["tool_use_id"], n
 
 
 def _project_name_from_path(path):
@@ -705,10 +842,17 @@ def backfill_effort_once(conn, marker, pairs_fn, verbose=True):
     return filled
 
 
-def _parse_file(filepath, start_line=0, agents_out=None, info=None):
+def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=None):
     """Parse a JSONL file and return (session_metas, turns, line_count).
 
     ``info``, if a dict, collects per-message estimate inputs (see _note_message).
+
+    ``calls_out``, if a dict, collects tool_results rows keyed by tool_use id:
+    message_id/tool_name from every assistant record's tool_use blocks
+    (one message streams as several records, so not just the kept one), and
+    result_bytes from user tool_result blocks. Each turn's ``prompt_seq`` counts
+    is_user_prompt records from ``start_line`` on, so only a parse from line 0
+    has the true value (parse_jsonl_file patches incremental turns).
 
     ``agents_out``, if a dict is passed, is populated in place with subagent
     dispatch metadata keyed by agent_id (the caller upserts it into the ``agents``
@@ -730,6 +874,7 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None):
     turns_no_id = []    # turns without a message_id (kept as-is)
     session_meta = {}   # session_id -> dict
     line_count = 0
+    prompt_seq = 0
 
     try:
         with open(filepath, encoding="utf-8", errors="replace") as f:
@@ -828,6 +973,14 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None):
                     if cwd and meta["project_name"] == "unknown":
                         meta["project_name"] = project_name_from_cwd(cwd)
 
+                if rtype == "user":
+                    if is_user_prompt(record):
+                        prompt_seq += 1
+                    if calls_out is not None:
+                        for cid, n in tool_result_sizes(record):
+                            calls_out.setdefault(cid, {"call_id": cid, "session_id": session_id})[
+                                "result_bytes"] = n
+
                 if rtype == "assistant":
                     msg = record.get("message", {})
                     usage = msg.get("usage", {})
@@ -835,6 +988,12 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None):
                     message_id = msg.get("id", "")
                     if info is not None and message_id:
                         _note_message(info, message_id, msg, usage, record)
+                    if calls_out is not None:
+                        content = msg.get("content")
+                        for b in content if isinstance(content, list) else []:
+                            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id"):
+                                calls_out.setdefault(b["id"], {"call_id": b["id"], "session_id": session_id}).update(
+                                    message_id=message_id or None, tool_name=b.get("name"))
 
                     input_tokens = usage.get("input_tokens", 0) or 0
                     output_tokens = usage.get("output_tokens", 0) or 0
@@ -856,6 +1015,7 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None):
 
                     if model:
                         session_meta[session_id]["model"] = model
+                    sidechain = is_subagent_record(record, filepath)
 
                     turn = {
                         "session_id": session_id,
@@ -878,7 +1038,7 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None):
                         # is_sidechain carries upstream's full subagent detection
                         # (isSidechain flag OR agentId OR a /subagents/ transcript path),
                         # not just the bare flag — see is_subagent_record.
-                        "is_sidechain": 1 if is_subagent_record(record, filepath) else 0,
+                        "is_sidechain": 1 if sidechain else 0,
                         "is_compact_summary": 1 if record.get("isCompactSummary") else 0,
                         "agent_id": record_agent_id(record),
                         # Reasoning effort, written top-level on assistant records
@@ -890,6 +1050,9 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None):
                         "mcp_tool": record.get("attributionMcpTool") or "",
                         "plugin": record.get("attributionPlugin") or "",
                         "tool_calls": json.dumps(tool_calls) if tool_calls else None,
+                        # Subagent transcripts open with the dispatch prompt, not a
+                        # user's, so their turns carry no sequence.
+                        "prompt_seq": None if sidechain else prompt_seq,
                     }
 
                     # Dedup: last record per message_id wins (final usage tallies)
@@ -1073,7 +1236,7 @@ def _apply_estimates(filepath, turns, full_turns, info):
     turns.extend(extra)
 
 
-def parse_jsonl_file(filepath, start_line=0, agents_out=None):
+def parse_jsonl_file(filepath, start_line=0, agents_out=None, calls_out=None):
     """_parse_file plus the transcript-gap estimates (see _apply_estimates).
 
     Estimates need whole-message / whole-timeline context, so an incremental
@@ -1083,13 +1246,23 @@ def parse_jsonl_file(filepath, start_line=0, agents_out=None):
     """
     info = _new_info()
     if start_line == 0:
-        metas, turns, n = _parse_file(filepath, 0, agents_out, info)
+        metas, turns, n = _parse_file(filepath, 0, agents_out, info, calls_out)
         full = list(turns)
     else:
-        metas, turns, n = _parse_file(filepath, start_line, agents_out)
+        metas, turns, n = _parse_file(filepath, start_line, agents_out, None, calls_out)
         if n <= start_line or not (turns or is_subagent_record({}, filepath)):
             return metas, turns, n
         _, full, _ = _parse_file(filepath, 0, None, info)
+        # prompt_seq counts from line 1: take it from the whole-file parse.
+        seq = {t["message_id"]: t.get("prompt_seq") for t in full if t.get("message_id")}
+        for t in turns:
+            t["prompt_seq"] = seq.get(t.get("message_id"))
+        # Id-less turns can't be keyed: the incremental ones are the tail of the
+        # whole file's id-less turns, in order.
+        inc = [t for t in turns if not t.get("message_id")]
+        tail = [t for t in full if not t.get("message_id")][-len(inc):] if inc else []
+        for t, f in zip(inc, tail):
+            t["prompt_seq"] = f.get("prompt_seq")
     _apply_estimates(filepath, turns, full, info)
     return metas, turns, n
 
@@ -1250,9 +1423,9 @@ def insert_turns(conn, turns):
              tool_name, cwd, message_id, duration_ms, stop_reason,
              service_tier, inference_geo, is_sidechain, is_compact_summary,
              tool_calls, agent, reasoning_tokens, agent_id, effort, skill,
-             mcp_server, mcp_tool, plugin, speed, estimated)
+             mcp_server, mcp_tool, plugin, speed, estimated, prompt_seq)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?)
+                ?, ?, ?, ?, ?, ?)
         -- Claude Code writes a response's usage more than once while it streams;
         -- only the last record is final. A scan landing between them stores the
         -- partial tallies, and the next scan must correct the row rather than be
@@ -1271,7 +1444,8 @@ def insert_turns(conn, turns):
             inference_geo            = excluded.inference_geo,
             speed                    = excluded.speed,
             stop_reason              = excluded.stop_reason,
-            estimated                = excluded.estimated
+            estimated                = excluded.estimated,
+            prompt_seq               = COALESCE(excluded.prompt_seq, turns.prompt_seq)
         -- Precedence: a real (non-estimated) row always replaces an estimated one,
         -- every token field, and clears the flag even on equal counts. Between two
         -- real rows the larger output wins (the final tally). An estimate never
@@ -1303,9 +1477,69 @@ def insert_turns(conn, turns):
          t.get("reasoning_tokens", 0), t.get("agent_id"), t.get("effort") or "",
          t.get("skill") or "",
          t.get("mcp_server") or "", t.get("mcp_tool") or "", t.get("plugin") or "",
-         t.get("speed") or "", t.get("estimated", 0))
+         t.get("speed") or "", t.get("estimated", 0), t.get("prompt_seq"))
         for t in turns
     ])
+
+
+def upsert_tool_results(conn, rows):
+    """Write tool_results rows (see init_db). COALESCE so the tool_use side and
+    the tool_result side, parsed in either order or in different scans, merge.
+    Then each call takes the session of its stored turn: the deduped turn keeps
+    whichever session inserted it first, which a branch copy read earlier (the
+    one-time backfill walks files in name order) need not match."""
+    rows = list(rows)
+    conn.executemany("""
+        INSERT INTO tool_results (call_id, session_id, message_id, tool_name, result_bytes)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(call_id) DO UPDATE SET
+            -- Provisional: the UPDATE below re-homes the call to its turn's session.
+            session_id   = COALESCE(tool_results.session_id, excluded.session_id),
+            message_id   = COALESCE(excluded.message_id, tool_results.message_id),
+            tool_name    = COALESCE(excluded.tool_name, tool_results.tool_name),
+            result_bytes = COALESCE(excluded.result_bytes, tool_results.result_bytes)
+    """, [(r["call_id"], r.get("session_id"), r.get("message_id"), r.get("tool_name"),
+           r.get("result_bytes")) for r in rows])
+    conn.executemany("""
+        UPDATE tool_results SET session_id = (
+            SELECT t.session_id FROM turns t
+            WHERE t.message_id = tool_results.message_id
+              AND t.message_id IS NOT NULL AND t.message_id != '')
+        WHERE call_id = ? AND EXISTS (
+            SELECT 1 FROM turns t
+            WHERE t.message_id = tool_results.message_id
+              AND t.message_id IS NOT NULL AND t.message_id != '')
+    """, [(r["call_id"],) for r in rows])
+
+
+# Per-session total tool-result bytes, or NULL when not measurable: a Codex session
+# (sizes not ingested), any call whose result has not landed, or any turn with more
+# tool_calls than measured results (a session pruned before per-call ingestion; tool_calls only
+# lists the kept record's calls, hence the separate unresolved-row check). Size-based $ must skip NULL sessions rather than read them as 0. A
+# measured session with no tool calls is a real 0.
+SESSION_RESULT_BYTES_SQL = """
+    SELECT s.session_id,
+           CASE WHEN COALESCE(s.agent, 'claude') != 'claude' THEN NULL
+                WHEN EXISTS (
+                    SELECT 1 FROM turns t
+                    WHERE t.session_id = s.session_id AND t.tool_calls IS NOT NULL
+                      AND json_array_length(t.tool_calls) > (
+                          SELECT COUNT(*) FROM tool_results r
+                          WHERE r.message_id = t.message_id AND r.result_bytes IS NOT NULL))
+                THEN NULL
+                WHEN EXISTS (SELECT 1 FROM tool_results r
+                             WHERE r.session_id = s.session_id AND r.result_bytes IS NULL)
+                THEN NULL
+                ELSE (SELECT COALESCE(SUM(r.result_bytes), 0) FROM tool_results r
+                      WHERE r.session_id = s.session_id)
+           END AS result_bytes
+    FROM sessions s
+"""
+
+
+def session_result_bytes(conn):
+    """{session_id: bytes or None} - see SESSION_RESULT_BYTES_SQL."""
+    return {row[0]: row[1] for row in conn.execute(SESSION_RESULT_BYTES_SQL)}
 
 
 def reconcile_session_totals(conn):

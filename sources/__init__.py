@@ -7,11 +7,12 @@ A **Source** is anything exposing:
 
     name: str
     discover_files() -> Iterable[path]
-    parse_file(path, start_line=0) -> (session_metas, turns, line_count, agents)
+    parse_file(path, start_line=0) -> (session_metas, turns, line_count, agents[, tool_results])
 
 where ``turns`` are dicts in the canonical column shape and carry ``agent``, and
 ``agents`` is a list of subagent-dispatch dicts (empty for sources without a subagent
-concept, e.g. Codex) that ``scan_all`` upserts into the ``agents`` table. Every
+concept, e.g. Codex) that ``scan_all`` upserts into the ``agents`` table. The optional
+5th element is tool_results rows (Claude only; Codex sizes are not measured). Every
 source funnels into ONE writer + ONE aggregator: ``scan_all`` owns the source-agnostic
 machinery (incremental ``processed_files`` walk, ``INSERT OR IGNORE`` dedup, and the
 end-of-scan reconcile-from-turns), reusing the vendored ``scanner.py`` helpers so
@@ -102,7 +103,9 @@ def _scan_source(conn, source, verbose):
         except OSError as e:  # unreadable: report it, don't mark processed, keep scanning
             _file_error(source.name, filepath, e)
             continue
-        session_metas, turns, line_count, agents = source.parse_file(filepath, start_line=old_lines)
+        parsed = source.parse_file(filepath, start_line=old_lines)
+        session_metas, turns, line_count, agents = parsed[:4]
+        tool_results = parsed[4] if len(parsed) > 4 else ()
 
         if not is_new and line_count <= old_lines:
             # mtime changed but the file didn't grow — just refresh the stamp.
@@ -117,6 +120,7 @@ def _scan_source(conn, source, verbose):
             scanner.upsert_sessions(conn, sessions)
             scanner.insert_turns(conn, turns)
             scanner.upsert_agents(conn, agents)
+            scanner.upsert_tool_results(conn, tool_results)
             for s in sessions:
                 sessions_seen.add(s["session_id"])
             total_turns += len(turns)
@@ -187,6 +191,9 @@ def scan_all(db_path=DB_PATH, projects_dir=None, verbose=True, sources=None, ext
         # the same scan that clears the cache also re-reads the files.
         if hasattr(source, "backfill_advisor_turns"):
             source.backfill_advisor_turns(conn)
+        # prompt_seq + tool_results for pre-existing rows (Claude only).
+        if hasattr(source, "backfill_tool_results"):
+            source.backfill_tool_results(conn)
 
     stats = {}
     changed = False

@@ -47,6 +47,7 @@ knows its own model) then summed.
 | `mcp_tool` | TEXT | that MCP tool (`workitem`, `get_equity_quotes`, …), from `attributionMcpTool`; `''` otherwise |
 | `plugin` | TEXT | plugin the turn is attributed to, from `attributionPlugin`; `''` otherwise |
 | `estimated` | INTEGER | 1 = some token count on the row is an estimate (see below); default 0 |
+| `prompt_seq` | INTEGER | genuine user prompts seen so far in the session's main transcript (`scanner.is_user_prompt`; slash commands count, tool_result / isMeta / compaction summaries / task-notification, peer and desktop-app event records do not); 0 before the first prompt. **NULL** on subagent turns and on rows whose transcript was pruned before per-call ingestion (unknown, never 0). Advisor rows inherit the parent's. No prompt text is stored |
 
 **Estimated rows** (`scanner._apply_estimates`, constants at the top of `scanner.py`). Subagent transcripts under-record what Claude Code bills; each gap is estimated, whole file re-read on every (re)parse:
 
@@ -100,6 +101,26 @@ largest delta is a guess. That row is `estimated = 1` and has no side-model rows
 and a later blob that confirms the model replaces it. The cache holds only about 200 events per
 coordinator, so the totals are a lower bound: whatever was cached while scans
 ran.
+
+### `tool_results` — one row per tool call (Claude only)
+
+`(call_id PK, session_id, message_id, tool_name, result_bytes)`. `call_id` is the
+`tool_use` id; `message_id` joins to `turns.message_id` (collected from every
+streamed record of a message, so parallel calls are all there). `result_bytes` is
+the UTF-8 length of the `tool_result` content as the transcript holds it: a string
+as-is, in a block list each text block's text plus any other block's compact JSON.
+It is the observed figure; convert to tokens only where a detector needs it.
+
+Either side can land first (a result often arrives in the next scan), so writes are
+a COALESCE upsert, after which each call takes `session_id` from its stored turn, so a
+branch copy re-using the ids never moves a call to the copy. `result_bytes` is **NULL until the result is seen** — a real `0`
+means an empty result. Sessions whose transcripts were pruned before per-call ingestion have no
+rows at all and can never be backfilled; Codex sizes are **not measurable** (no rows,
+`sessions.agent = 'codex'`). `scanner.session_result_bytes(conn)` /
+`SESSION_RESULT_BYTES_SQL` gives each session's total, or NULL when any of its calls
+has no result yet, any of its turns has more `tool_calls` than measured results
+(pruned before per-call ingestion), or it is not a Claude session.
+Size-based $ must skip NULL sessions, never read them as 0.
 
 ### `processed_files` — incremental-scan bookkeeping
 
@@ -328,8 +349,16 @@ drifts.
 
 ## Evolving the schema
 
-- **Additive only.** New columns go through the `init_db` `ALTER TABLE … ADD COLUMN`
-  pattern with a default. Never break the ability to **drop the DB and rescan**.
+- **Additive only.** New columns go through `COLUMN_MIGRATIONS` in `scanner.py`
+  (applied by `init_db` as `ALTER TABLE … ADD COLUMN`), with a default unless NULL
+  must mean *unknown*. New tables and indexes are added to `CORE_TABLES` / `CORE_INDEXES` too. Never break the
+  ability to **drop the DB and rescan**.
+- **Backup first.** When `init_db` would create a table or index or add a column on an
+  existing DB, it first copies the DB to `<db>.bak-YYYYMMDD` via the sqlite backup
+  API (a same-day backup is kept, never overwritten; a failed backup stops the
+  migration). The DB is the only copy of sessions whose transcripts were pruned.
+  `scripts/falsify_tool_results.py` breaks this guard and the NULL-not-zero rule
+  and checks `tests/test_tool_results.py` goes red.
 - **The schema is the contract.** Ingestion writes it; the CLI, dashboard, and any
   external tool only read it. Keep that split.
 - **Satellite tables** join the core by `session_id` (e.g. `experiments`). They are

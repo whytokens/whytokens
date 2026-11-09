@@ -76,14 +76,44 @@ class ClaudeSource:
 
     def parse_file(self, filepath, start_line=0):
         agents = {}
+        calls = {}
         metas, turns, line_count = scanner.parse_jsonl_file(
-            filepath, start_line=start_line, agents_out=agents)
+            filepath, start_line=start_line, agents_out=agents, calls_out=calls)
         for t in turns:
             t["agent"] = NAME
         for m in metas:
             m["agent"] = NAME
-        # 4th element: subagent dispatch rows for scan_all to upsert (Claude-only).
-        return metas, turns, line_count, list(agents.values())
+        # 4th element: subagent dispatch rows for scan_all to upsert (Claude-only);
+        # 5th: tool_results rows (Claude-only).
+        return metas, turns, line_count, list(agents.values()), list(calls.values())
+
+    def backfill_tool_results(self, conn):
+        """One-time backfill: prompt_seq and tool_results for rows ingested
+        before either existed, read from transcripts that still exist.
+
+        One parse per transcript (with estimate rows, so they get a sequence too) feeds both. prompt_seq is an in-place UPDATE
+        of NULL rows only (the insert upsert never fires on an unchanged turn), and
+        tool_results is the same COALESCE upsert the walk uses. Sessions whose
+        transcripts are gone get neither and stay unknown, never 0.
+        """
+        marker = "tool_results_backfill_done_claude"
+        if scanner._meta_get(conn, marker) == "1":
+            return 0
+        if not any(Path(d).exists() for d in self._dirs()):
+            return 0  # no transcript dir: leave the marker unset and retry later
+        # Fresh DB: the walk that follows parses everything inline.
+        if conn.execute("SELECT 1 FROM turns WHERE COALESCE(agent, 'claude') = 'claude' "
+                        "LIMIT 1").fetchone():
+            sql = scanner.backfill_column_sql("prompt_seq")
+            for filepath in self.discover_files():
+                calls = {}
+                _, turns, _ = scanner.parse_jsonl_file(filepath, calls_out=calls)
+                conn.executemany(sql, [(t["prompt_seq"], t["message_id"]) for t in turns
+                                       if t.get("message_id") and t.get("prompt_seq") is not None])
+                scanner.upsert_tool_results(conn, calls.values())
+        scanner._meta_set(conn, marker, "1")
+        conn.commit()
+        return 1
 
     def sync_agents(self, conn):
         """Fill in ``agents.agent_type`` from each subagent's own files.
