@@ -94,8 +94,13 @@ def _gap(a, b):
         return None
 
 
-def report(db_path, session_id=None):
-    """Return thresholded, disjoint cost findings for one session or a database."""
+MIN_SHARE = 0.10  # Claude Code /usage flags behaviors at >=10% of spend; same default here
+
+
+def report(db_path, session_id=None, min_share=MIN_SHARE):
+    """Return thresholded, disjoint cost findings for one session or a database.
+
+    A cause is dropped when it is under min_share of its session's total $."""
     db_path = Path(db_path).resolve().as_posix()
     # quote: an unencoded '#' or '?' in the path would silently open a different database
     conn = sqlite3.connect(f"file:{quote(str(db_path), safe='/:')}?mode=ro", uri=True)
@@ -163,7 +168,9 @@ def report(db_path, session_id=None):
             gap = _gap(previous_turn["timestamp"], turn["timestamp"]) if previous_turn else None
             if creation and previous_main:
                 if gap and gap.total_seconds() >= 1800:
-                    _claim(claims, "idle_gap", turn, creation, (gap, creation), None)
+                    # same tokens as cache reads = what a warm (or compacted-and-warm) cache would have billed
+                    warm = pricing.calc_cost(turn["model"], 0, 0, creation, 0, turn["timestamp"]) * turn["mult"]
+                    _claim(claims, "idle_gap", turn, creation, (gap, creation, warm), None)
                 elif not compact and previous_main["repeated"]:
                     _claim(claims, "repeated_reads", turn, creation, (previous_main["repeated"], creation), "Read")
                 elif not compact and previous_main["has_tool"]:
@@ -180,7 +187,7 @@ def report(db_path, session_id=None):
                                       t["cache_read_tokens"] or 0, t["cache_creation_tokens"] or 0,
                                       t["timestamp"], t["cache_creation_1h_tokens"] or 0) * t["mult"]
                     for t in turns)
-        floor = max(.01, total * .05)
+        floor = max(.01, total * min_share)
         for cause, (usd, details, evidence) in claims.items():
             if usd < floor:
                 continue
@@ -202,8 +209,10 @@ def report(db_path, session_id=None):
                 detail, fix = (f"Sidechain turns wrote {sum(details):,} cache-create tokens for inherited preambles.",
                                "Give subagents narrower prompts and reuse fewer independent agents.")
             elif cause == "idle_gap":
-                minutes = max((g.total_seconds() / 60 for g, _ in details), default=0)
-                detail, fix = (f"{len(details)} idle gap{'' if len(details) == 1 else 's'} (longest {minutes:.0f} min) rewrote {sum(n for _, n in details):,} cache tokens.",
+                warm = sum(w for _, _, w in details)
+                minutes = max((g.total_seconds() / 60 for g, _, _ in details), default=0)
+                detail, fix = (f"{len(details)} idle gap{'' if len(details) == 1 else 's'} (longest {minutes:.0f} min) rewrote {sum(n for _, n, _ in details):,} cache tokens "
+                               f"for ${usd:.2f}; kept warm that context would have cost ${warm:.2f} (up to ${usd - warm:.2f} saved by compacting before the cache expired).",
                                ("Start a fresh session instead of resuming a stale one; re-onboard from the handoff file."
                                 if minutes > 240 else
                                 "Resume before the cache expires, or compact context before a long pause."))

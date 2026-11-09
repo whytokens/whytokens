@@ -696,6 +696,36 @@ def get_waste(db_path=None):
             "measurement": waste.measurement(db_path)}
 
 
+EXPORT_SCHEMA_VERSION = 1
+
+
+def get_export(db_path=None):
+    """Versioned JSON document: every session, the waste report and token totals.
+    Shape documented in docs/SCHEMA.md ("Export document"); bump EXPORT_SCHEMA_VERSION on any
+    breaking change to it."""
+    if db_path is None:
+        db_path = DB_PATH
+    if not Path(db_path).exists():
+        return {"error": "Database not found. Run: python cli.py scan"}
+    # one connection, one query: paging across connections can skip/duplicate rows mid-scan
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(f"{_SESSION_SELECT} ORDER BY s.last_timestamp DESC").fetchall()
+        by_model = _session_model_breakdowns(conn, [r["session_id"] for r in rows])
+    finally:
+        conn.close()
+    sessions = [_session_to_dict(r, by_model) for r in rows]
+    waste = get_waste(db_path)
+    keys = ("turns", "input", "output", "cache_read", "cache_creation")
+    return {
+        "schema_version": EXPORT_SCHEMA_VERSION,
+        "totals": {"sessions": len(sessions), **{k: sum(s[k] for s in sessions) for k in keys},
+                   "waste_usd": waste["total_usd"]},
+        "sessions": sessions,
+        "waste": waste,
+    }
+
+
 def get_session_breakdown(session_id, db_path=None):
     """Per-actor token split for one session: main thread vs each dispatched
     subagent type (and, where recorded, each skill).

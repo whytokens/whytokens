@@ -29,6 +29,7 @@ import json
 import shutil
 import sqlite3
 import tempfile
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -297,7 +298,29 @@ class TestWasteReport(_Scanned):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.waste = importlib.import_module("waste")  # ModuleNotFoundError = loud red
+        real = importlib.import_module("waste")  # ModuleNotFoundError = loud red
+        cls.real_waste = real
+        # fixtures are small: the detector tests run at the old 5% floor, the cutoff has its own tests
+        cls.waste = types.SimpleNamespace(
+            report=lambda db, session_id=None: real.report(db, session_id, min_share=.05))
+
+    def test_default_cutoff_is_ten_percent_and_configurable(self):
+        w, db = self.real_waste, self.db
+        self.assertEqual(w.MIN_SHARE, .10)  # fixtures straddle only 8.3%..11%, so pin the default itself
+        shares = [(sid, f["cause"], f["usd"] / f["session_usd"]) for sid in EXPECTED_TOP
+                  for f in w.report(db, sid, min_share=0)]
+        below = [x for x in shares if .05 <= x[2] < .10]
+        above = [x for x in shares if x[2] >= .10]
+        self.assertTrue(below and above, "fixtures must straddle the 10% line")
+        for sid in {x[0] for x in shares}:
+            kept = {f["cause"] for f in w.report(db, sid)}
+            self.assertEqual(kept, {c for s_, c, sh in shares if s_ == sid and sh >= .10}, sid)
+        sid, cause, share = below[0]  # 9%-ish: dropped by default, kept once the cutoff is lowered
+        self.assertNotIn(cause, {f["cause"] for f in w.report(db, sid)})
+        self.assertIn(cause, {f["cause"] for f in w.report(db, sid, min_share=share - .001)})
+        sid, cause, share = above[0]  # 11%-ish: kept by default, dropped once the cutoff is raised
+        self.assertIn(cause, {f["cause"] for f in w.report(db, sid)})
+        self.assertNotIn(cause, {f["cause"] for f in w.report(db, sid, min_share=share + .001)})
 
     def test_known_good_session_reports_nothing(self):
         self.assertEqual(self.waste.report(self.db, session_id="clean"), [])
@@ -384,6 +407,17 @@ class TestWasteReport(_Scanned):
             conn.close()
         self.assertEqual(self.waste.report(db, session_id="clean"), [])
         self.assertTrue(self.waste.report(db, session_id="resident"))
+
+    def test_idle_gap_prices_compacting_before_the_ttl(self):
+        # 61,600 tokens rebuilt at the write rate; kept warm they would have been cache reads
+        f = [f for f in self.waste.report(self.db, session_id="idle") if f["cause"] == "idle_gap"][0]
+        tokens = 60_000 + 4 * 400
+        paid = pricing.calc_cost(MODEL, 0, 0, 0, tokens, _ts(15))
+        warm = pricing.calc_cost(MODEL, 0, 0, tokens, 0, _ts(15))
+        self.assertAlmostEqual(f["usd"], paid)
+        self.assertIn(f"${paid - warm:.2f}", f["detail"])
+        self.assertIn(f"${paid:.2f}", f["detail"])
+        self.assertNotIn("$", f["fix"])  # fix is shared across a project/cause group in the UI
 
     def test_gap_filled_by_subagent_work_is_not_idle(self):
         causes = [f["cause"] for f in self.waste.report(self.db, session_id="busy_gap")]

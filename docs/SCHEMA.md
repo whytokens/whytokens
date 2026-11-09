@@ -290,6 +290,14 @@ server/tooling endpoint (skill + hook), and the dashboard has the scanned row.
 `static/modules/api.js` mirrors the rest as `fetchData / fetchSession /
 fetchSessionBreakdown / fetchSessions / fetchDaily / fetchPricing / postRescan`.
 
+## Export document (`whytokens export --json`)
+
+One JSON document on stdout, also `api.get_export()`. Top-level keys:
+`schema_version` (int, currently `1`; bumped on any breaking change, pinned by
+`tests/test_export.py`), `totals` (`sessions`, `turns`, `input`, `output`, `cache_read`,
+`cache_creation`, `waste_usd`), `sessions` (every session, same objects as `/api/sessions`)
+and `waste` (the `/api/waste` payload). Additive keys do not bump the version.
+
 ## Schema-drift armor (`schema.py` + `scan --doctor`)
 
 The transcript envelope is undocumented and drifts between Claude Code versions, so

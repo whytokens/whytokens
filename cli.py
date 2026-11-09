@@ -422,6 +422,15 @@ def cmd_waste(session_id=None):
         print(f"{finding['session_id']:<36} {finding['cause']:<20} ${finding['usd']:>8.4f}  {finding['detail']}  {finding['advice']}")
 
 
+def cmd_export(as_json=False):
+    """Versioned JSON of sessions, waste and totals (docs/SCHEMA.md "Export document")."""
+    if not as_json:
+        print("usage: whytokens export --json")
+        return
+    import api
+    print(json.dumps(api.get_export(DB_PATH), indent=2))
+
+
 def cmd_live(session_id=None, cwd=None, as_json=False):
     """Stats for a session read straight from its transcript — no DB, no scan.
 
@@ -485,6 +494,7 @@ Usage:
   whytokens today                        Show today's usage summary
   whytokens week                         Show last 7 days (per-day + by-model)
   whytokens stats                        Show all-time statistics
+  whytokens export --json                Versioned JSON: sessions, waste, totals
   whytokens live [--session ID] [--cwd PATH] [--json]
                                          Current session's stats straight from its
                                              transcript (no DB, no scan) - cost, context, tokens
@@ -501,6 +511,7 @@ COMMANDS = {
     "stats": cmd_stats,
     "live": cmd_live,
     "waste": cmd_waste,
+    "export": cmd_export,
     "dashboard": cmd_dashboard,
 }
 
@@ -540,6 +551,8 @@ def main():
             cmd_live(session_id=parse_named_arg(rest, "--session"),
                      cwd=parse_named_arg(rest, "--cwd"),
                      as_json="--json" in rest)
+        elif command == "export":
+            cmd_export(as_json="--json" in rest)
         elif command == "waste":
             cmd_waste(parse_named_arg(rest, "--session"))
         else:
