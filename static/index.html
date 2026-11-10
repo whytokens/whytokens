@@ -291,8 +291,16 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
     </div>
   </div>
   <div class="detail-stats" id="session-detail-stats"></div>
+  <div class="table-card hidden" id="session-bands-card">
+    <div class="section-title">Requests <span class="muted">(click one to filter the tables below)</span></div>
+    <div id="session-bands"></div>
+  </div>
+  <div class="table-card hidden" id="session-waterfall-card">
+    <div class="section-title">Cost waterfall <span class="muted">(session total &rarr; attributed waste by cause &rarr; unattributed, API list rate)</span></div>
+    <div id="session-waterfall"></div>
+  </div>
   <div class="table-card">
-    <div class="section-title">Tool Breakdown</div>
+    <div class="section-title" id="session-tool-title">Tool Breakdown</div>
     <table>
       <thead><tr>
         <th>Tool</th>
@@ -367,6 +375,10 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
     <div class="table-card">
       <div class="section-title">By cause <span class="muted">(click to filter the habits below)</span></div>
       <div id="waste-bars"></div>
+    </div>
+    <div class="table-card">
+      <div class="section-title">Cause &times; week <span class="muted">(click a cell to filter the habits below)</span></div>
+      <div id="waste-heatmap"></div>
     </div>
     <div class="table-card">
       <div class="section-title" id="waste-groups-title">Habits: project &times; cause</div>

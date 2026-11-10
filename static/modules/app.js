@@ -18,6 +18,7 @@ import {
 } from './pricing.js';
 import { VALID_TABS, resolveTab, applyTabVisibility, addExtRailItem, toggleRail, initRail } from './nav.js';
 import { store, TZ_KEY, alpha, fillTokens, initTheme, setThemePref } from './theme.js';
+import { weekOf, promptBands, turnsOfBand, sessionWaterfall, causeWeekMatrix } from './analytics.js';
 import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchStatus } from './api.js';
 
 // Chart.js is loaded as a classic UMD script before this module (see index.html),
@@ -971,6 +972,32 @@ async function setWasteCause(c) {
   // the bars were re-rendered: put keyboard focus back on the one just activated
   document.querySelector(`.waste-bar[data-cause="${CSS.escape(c)}"]`)?.focus();
 }
+// Same fetch rules as renderWasteTab (one request per data load, stale responses dropped), for other screens.
+async function loadWaste() {
+  if (wastePayload) return wastePayload;
+  const gen = wasteGen;
+  if (!wasteFetch || wasteFetch.gen !== gen) wasteFetch = { gen, promise: fetchWaste() };
+  const req = wasteFetch;
+  try { const p = await req.promise; if (gen !== wasteGen) return null; return (wastePayload = p); }
+  catch (e) { if (wasteFetch === req) wasteFetch = null; return null; }
+}
+let wasteWeek = null;      // heatmap-cell filter: only sessions whose last_date falls in this week
+async function setWasteCell(c, week) {
+  const clear = wasteCause === c && wasteWeek === week;
+  wasteCause = clear ? null : c; wasteWeek = clear ? null : week; wasteShowAll = false;
+  await renderWasteTab();
+}
+function clearWasteWeek() { wasteWeek = null; renderWasteTab(); }
+function wasteHeatmap(findings, sessions) {
+  const m = causeWeekMatrix(findings, sessions);
+  if (m.weeks.length < 1) return '<p class="muted">Nothing to show.</p>';
+  const cellBtn = (c, w, usd) => `<td><button class="hm-cell${wasteCause === c && wasteWeek === w ? ' active' : ''}" data-cause="${esc(c)}" data-week="${esc(w)}"` +
+    ` onclick="setWasteCell(this.dataset.cause, this.dataset.week)" title="${esc(CAUSE_LABEL[c] || c)}, week of ${esc(w)}: ${fmtCostBig(usd)}"` +
+    ` aria-label="${esc(CAUSE_LABEL[c] || c)}, week of ${esc(w)}: ${fmtCostBig(usd)}"><span class="hm-fill" style="opacity:${usd && m.max ? (0.12 + 0.88 * usd / m.max).toFixed(2) : 0}"></span></button></td>`;
+  return '<div class="hm-scroll"><table class="hm"><thead><tr><th></th>' + m.weeks.map(w => `<th title="Week of ${esc(w)}">${esc(w.slice(5))}</th>`).join('') + '</tr></thead><tbody>' +
+    m.rows.map(r => `<tr><th scope="row">${esc(CAUSE_LABEL[r.cause] || r.cause)}</th>` + r.cells.map((u, i) => cellBtn(r.cause, m.weeks[i], u)).join('') + '</tr>').join('') +
+    '</tbody></table></div><div class="muted">Attributed $ per cause and week (Monday start), darker = more. Shade is relative to the biggest cell.</div>';
+}
 function showAllWaste() { wasteShowAll = true; renderWasteTab(); }
 
 async function renderWasteTab() {
@@ -988,12 +1015,15 @@ async function renderWasteTab() {
   const w = wastePayload;
   if (!w) {  // never leave an earlier load's numbers on screen as if current
     el('waste-scope').textContent = 'Failed to load waste data.';
-    for (const id of ['waste-bars', 'waste-groups', 'waste-measure', 'waste-measure-line']) el(id).textContent = '';
+    for (const id of ['waste-bars', 'waste-heatmap', 'waste-groups', 'waste-measure', 'waste-measure-line']) el(id).textContent = '';
     return;
   }
   const label = c => CAUSE_LABEL[c] || c;
-  const v = groupWaste(w.findings, lastFilteredSessions, wasteCause);
-  wasteCause = v.cause;  // a cause that left the scope stops filtering
+  const weekSessions = wasteWeek ? lastFilteredSessions.filter(s => s.last_date && weekOf(s.last_date) === wasteWeek) : lastFilteredSessions;
+  const v = groupWaste(w.findings, weekSessions, wasteCause);
+  // a cause that left the scope stops filtering, except under a week filter: an empty cell stays empty
+  if (wasteWeek && wasteCause && !v.cause) v.groups = [];
+  else wasteCause = v.cause;
   const { start, end } = getRangeBounds(selectedRange);
 
   // Scope: what was searched, what was found, against what spend.
@@ -1029,6 +1059,10 @@ async function renderWasteTab() {
     // most causes are "attributed cause"; flag only the weaker tier on the bar itself
     `${c.tier === 'attributed cause' ? '' : ' · ' + esc(c.tier)}</span></span></button>`
   ).join('') || '<p class="muted">Nothing to show.</p>';
+
+  // Heatmap shows every week; the week filter only narrows the bars and habits.
+  el('waste-heatmap').innerHTML = wasteHeatmap(w.findings, lastFilteredSessions) +
+    (wasteWeek ? `<div>Week of ${esc(wasteWeek)} only <button class="filter-btn" onclick="clearWasteWeek()">Clear week</button></div>` : '');
 
   // Habits: (project, cause), biggest first; sessions inside, each opening its trace.
   const shown = wasteShowAll ? v.groups : v.groups.slice(0, WASTE_PAGE);
@@ -1781,7 +1815,7 @@ function renderSessionDetail(d) {
     ['Cache Writes', fmtCost(c.cache_creation)],
     ['Cold Restarts', cold.count ? `${cold.count} · ${fmt(cold.tokens)} tok · ${fmtCost(cold.cost)}` : '0'],
   ].map(([label, value]) => `<div class="detail-stat"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`).join('');
-  document.getElementById('session-detail-body').innerHTML = d.turns.map((t, i) => {
+  document.getElementById('session-detail-body').innerHTML = turnsOfBand(d.turns, traceBand).map(({ t, i }) => {
     const cost = rowCost(t, t.timestamp.slice(0, 10));
     return `<tr${traceHighlight.has(t.message_id) ? ' class="hl" aria-label="evidence call"' : ''}>
       <td class="muted">${esc(t.ts.replace('T', ' ').replace('Z', ''))}</td>
@@ -1805,8 +1839,50 @@ function renderSessionDetail(d) {
   document.getElementById('session-actors').textContent = d.actors.map(a =>
     `${a.actor}: ${fmt(a.turns)} turns` + (a.estimated_turns ? ` (${a.estimated_turns} estimated)` : '') +
     `, peak context ${fmt(a.peak_context)}`).join(' · ');
-  renderSessionToolBreakdown(d.turns);
+  renderSessionBands(d);
+  renderSessionToolBreakdown(turnsOfBand(d.turns, traceBand).map(x => x.t));
+  renderSessionWaterfall(d);
   renderSessionTimeline(d.turns);
+}
+
+// ── Trace: request bands and cost waterfall ──────────────────
+let traceBand = null;  // prompt_seq filtering the turn and tool tables, or null
+function setTraceBand(seq) {
+  traceBand = traceBand === seq ? null : seq;
+  if (selectedSessionDetail) renderSessionDetail(selectedSessionDetail);
+  document.querySelector(`.req-band[data-seq="${traceBand}"]`)?.focus();
+}
+function renderSessionBands(d) {
+  const bands = promptBands(d.turns, t => rowCost(t, t.timestamp.slice(0, 10)));
+  if (!bands.some(b => b.seq === traceBand)) traceBand = null;  // another session's band
+  document.getElementById('session-bands-card').classList.toggle('hidden', !bands.length);
+  document.getElementById('session-tool-title').textContent = 'Tool Breakdown' + (traceBand ? ' — request ' + traceBand : '');
+  const top = Math.max(...bands.map(b => b.cost), 0);
+  document.getElementById('session-bands').innerHTML = bands.map(b =>
+    `<button class="waste-bar req-band${traceBand === b.seq ? ' active' : ''}" data-seq="${b.seq}" onclick="setTraceBand(+this.dataset.seq)" aria-pressed="${traceBand === b.seq}">` +
+    `<span class="wb-label">Request ${b.seq}</span>` +
+    `<span class="wb-track"><span class="wb-fill" style="width:${top ? (100 * b.cost / top).toFixed(1) : 0}%"></span></span>` +
+    `<span class="wb-val">${b.calls} call${b.calls === 1 ? '' : 's'} → ${fmtCost(b.cost)}</span></button>`).join('');
+}
+// Waterfall of waste findings for the open session; needs /api/waste, so it fills in async.
+async function renderSessionWaterfall(d) {
+  const card = document.getElementById('session-waterfall-card');
+  card.classList.add('hidden');
+  const w = await loadWaste();
+  if (!w || selectedSessionDetail !== d) return;  // failed, or another session opened meanwhile
+  const wf = sessionWaterfall(w.findings, d.session.session_id,
+    sessionCostAtListRates({ model: d.session.model, by_model: d.turns }, (d.session.last || '').slice(0, 10)));
+  if (!wf) return;
+  const rows = [['Session total', 0, wf.total],
+    ...wf.steps.map((x, i, a) => [CAUSE_LABEL[x.cause] || x.cause, a.slice(0, i).reduce((s, y) => s + y.usd, 0), x.usd]),
+    ['Unattributed', wf.attributed, wf.unattributed]];
+  const span = Math.max(wf.total, wf.attributed) || 1;
+  document.getElementById('session-waterfall').innerHTML = rows.map(([label, from, usd]) =>
+    `<div class="waste-bar wf-row"><span class="wb-label">${esc(label)}</span>` +
+    `<span class="wb-track"><span class="wb-fill" style="margin-left:${(100 * from / span).toFixed(1)}%;width:${(100 * usd / span).toFixed(1)}%"></span></span>` +
+    `<span class="wb-val">${fmtCostBig(usd)}</span></div>`).join('') +
+    (wf.over ? '<p class="muted">Attributions overlap: they add up to more than the session total.</p>' : '');
+  card.classList.remove('hidden');
 }
 
 // Trace screen: the loaded session if any, otherwise the empty state.
@@ -2179,6 +2255,7 @@ async function openSessionDetail(sessionId, highlightIds = '') {
     const d = await fetchSession(sessionId);
     if (d.error) throw new Error(d.error);
     selectedSessionDetail = d;
+    traceBand = null;  // a band belongs to one session
     setTab('trace');  // panel visible first: the timeline canvas must not be built at 0x0
     window.scrollTo({ top: 0, behavior: 'smooth' });
   } catch(e) {
@@ -2602,7 +2679,7 @@ Object.assign(window, {
   moreModelRows, lessModelRows, moreSessionRows, lessSessionRows,
   moreProjectRows, lessProjectRows, moreBranchRows, lessBranchRows,
   onAutoRefreshToggle, toggleRail, setThemePref, setDefaultTZ, clearProjectChip,
-  setTimelineX, setTimelineLog, resetTimelineZoom, setWasteCause, showAllWaste,
+  setTimelineX, setTimelineLog, resetTimelineZoom, setWasteCause, setWasteCell, clearWasteWeek, setTraceBand, showAllWaste,
 });
 window.setTheme = setThemePref;
 

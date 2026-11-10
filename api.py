@@ -577,6 +577,7 @@ def get_session_detail(session_id, db_path=None):
             {turn_expr('tool_calls', 'NULL')},
             {turn_expr('estimated', '0')},
             {turn_expr('message_id', "''")},
+            {turn_expr('prompt_seq', 'NULL')},
             turns.agent_id as agent_id, agents.agent_type as agent_type,
             COALESCE(tool_name, '<none>') as tool_name,
             cwd,
@@ -641,6 +642,7 @@ def get_session_detail(session_id, db_path=None):
             "lane":           lane_of(r, actor),
             "agent_id":       r["agent_id"] or "",
             "message_id":     r["message_id"] or "",
+            "prompt_seq":     r["prompt_seq"],  # None = unknown (subagent turn or pruned transcript)
             "estimated":      bool(r["estimated"]),
             "context":        (r["input_tokens"] or 0) + (r["cache_read_tokens"] or 0) + (r["cache_creation_tokens"] or 0),
             "gap_s":          gap,

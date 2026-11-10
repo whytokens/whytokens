@@ -268,3 +268,14 @@ h1.page-title { font-size: 16px; font-weight: 600; margin-bottom: 14px; }
 }
 
 tr.hl td { background: color-mix(in srgb, var(--accent, #d97706) 22%, transparent); }
+
+/* request bands, waterfall, cause x week heatmap */
+.req-band { margin-bottom: 2px; }
+.wf-row { cursor: default; }
+.wf-row:hover { background: transparent; }
+.hm-scroll { overflow-x: auto; }
+.hm { border-collapse: separate; border-spacing: 2px; font-size: 11px; }
+.hm th { font-weight: 400; text-align: left; white-space: nowrap; padding: 0 4px; }
+.hm-cell { display: block; width: 22px; height: 22px; padding: 0; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); cursor: pointer; }
+.hm-cell.active { border-color: var(--accent); outline: 2px solid var(--accent); }
+.hm-fill { display: block; width: 100%; height: 100%; background: var(--accent); }
