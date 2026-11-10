@@ -19,6 +19,7 @@ import {
 import { VALID_TABS, resolveTab, applyTabVisibility, addExtRailItem, toggleRail, initRail } from './nav.js';
 import { store, TZ_KEY, alpha, fillTokens, initTheme, setThemePref } from './theme.js';
 import { weekOf, promptBands, turnsOfBand, sessionWaterfall, causeWeekMatrix } from './analytics.js';
+import { watchProvenance, provBadge, addSplit, orUnknown } from './provenance.js';
 import { verifySlot, fillVerifySlots, resetVerify } from './verify.js';
 import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchStatus } from './api.js';
 
@@ -712,6 +713,9 @@ function aggregate() {
     output:         byModel.reduce((s, m) => s + m.output, 0),
     cache_read:     byModel.reduce((s, m) => s + m.cache_read, 0),
     cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
+    // Codex reports no cache writes: all-Codex = unknown, mixed = the total covers Claude only
+    cache_creation_unknown: byModel.length > 0 && byModel.every(m => isEstimated(m.model)),
+    cache_creation_partial: byModel.some(m => isEstimated(m.model)),
     cost:           byModel.reduce((s, m) => s + m.cost, 0),
   };
   const costTotals = aggregateCostBreakdown(rangeFilteredSessions);
@@ -893,18 +897,18 @@ function groupWaste(findings, sessions, cause = null) {
   const spend = new Map(inScope.map(f => [f.session_id, f.session_usd]));
   const causes = new Map(), groups = new Map();
   for (const f of inScope) {
-    const c = causes.get(f.cause) || { cause: f.cause, tier: f.tier, usd: 0, sessions: 0 };
+    const c = causes.get(f.cause) || { cause: f.cause, tier: f.tier, usd: 0, sessions: 0, observed: 0, inferred: 0 };
     c.usd += f.usd; c.sessions++;
-    if (c.tier !== f.tier) c.tier = 'inferred';  // mixed sources: show the weaker tier
+    addSplit(c, f);  // a mixed cause keeps its observed and inferred halves apart
     causes.set(f.cause, c);
   }
   if (!causes.has(cause)) cause = null;
   for (const f of inScope) {
     if (cause && f.cause !== cause) continue;
     const s = byId.get(f.session_id), key = s.project + '\u0000' + f.cause;
-    const g = groups.get(key) || { project: s.project, cause: f.cause, tier: f.tier, fix: f.fix, usd: 0, spend: 0, sessions: [] };
+    const g = groups.get(key) || { project: s.project, cause: f.cause, tier: f.tier, fix: f.fix, usd: 0, spend: 0, observed: 0, inferred: 0, sessions: [] };
     g.usd += f.usd; g.spend += f.session_usd;
-    if (g.tier !== f.tier) g.tier = 'inferred';
+    addSplit(g, f);
     g.sessions.push({ id: f.session_id, title: s.topic || '', date: s.last_date, usd: f.usd,
                       session_usd: f.session_usd, detail: f.detail, evidence: f.evidence });
     groups.set(key, g);
@@ -1002,6 +1006,10 @@ function wasteHeatmap(findings, sessions) {
     m.rows.map(r => `<tr><th scope="row">${esc(CAUSE_LABEL[r.cause] || r.cause)}</th>` + r.cells.map((u, i) => cellBtn(r.cause, m.weeks[i], u)).join('') + '</tr>').join('') +
     '</tbody></table></div><div class="muted">Attributed $ per cause and week (Monday start), darker = more. Shade is relative to the biggest cell.</div>';
 }
+// Observed vs inferred $ of a cause/habit, as badges (tooltips from /api/provenance).
+const splitBadges = x => ['observed', 'inferred'].filter(k => x[k] > 0)
+  .map(k => `${provBadge(k)} ${fmtCostBig(x[k])}`).join(' ') || provBadge('observed');
+const causeSplit = x => ['observed', 'inferred'].filter(k => x[k] > 0).map(k => `${k} ${fmtCostBig(x[k])}`).join(', ');
 function showAllWaste() { wasteShowAll = true; renderWasteTab(); }
 
 async function renderWasteTab() {
@@ -1032,7 +1040,7 @@ async function renderWasteTab() {
 
   // Scope: what was searched, what was found, against what spend.
   el('waste-scope').innerHTML = v.affectedSessions
-    ? `<div class="waste-headline">${fmtCostBig(v.total)} attributed to waste</div>` +
+    ? `<div class="waste-headline" data-prov="local_estimate">${fmtCostBig(v.total)} attributed to waste</div>` +
       `<div class="muted">${fmtPct(v.affectedUsd ? v.total / v.affectedUsd : 0)} of the ${fmtCostBig(v.affectedUsd)} spent in the ` +
       `${v.affectedSessions} affected session${v.affectedSessions === 1 ? '' : 's'} · ${esc(RANGE_LABELS[selectedRange] || selectedRange)}` +
       `${start ? ' (' + esc(start) + (end ? ' to ' + esc(end) : ' to today') + ')' : ''} · current model and project filters</div>` +
@@ -1059,12 +1067,11 @@ async function renderWasteTab() {
   const top = v.causes.length ? v.causes[0].usd : 0;
   el('waste-bars').innerHTML = v.causes.map(c =>
     `<button class="waste-bar${wasteCause === c.cause ? ' active' : ''}" data-cause="${esc(c.cause)}" onclick="setWasteCause(this.dataset.cause)"` +
-    ` aria-pressed="${wasteCause === c.cause}" title="Evidence: ${esc(c.tier)}. Click to show only this cause below.">` +
+    ` aria-pressed="${wasteCause === c.cause}" title="Attribution: ${esc(causeSplit(c))}. Click to show only this cause below.">` +
     `<span class="wb-label">${esc(label(c.cause))}</span>` +
     `<span class="wb-track"><span class="wb-fill" style="width:${top ? (100 * c.usd / top).toFixed(1) : 0}%"></span></span>` +
     `<span class="wb-val">${fmtCostBig(c.usd)} <span class="muted">· ${fmtPct(c.share)} · ${c.sessions} session${c.sessions === 1 ? '' : 's'}` +
-    // most causes are "attributed cause"; flag only the weaker tier on the bar itself
-    `${c.tier === 'attributed cause' ? '' : ' · ' + esc(c.tier)}</span></span></button>`
+    ` · ${splitBadges(c)}</span></span></button>`
   ).join('') || '<p class="muted">Nothing to show.</p>';
 
   // Heatmap shows every week; the week filter only narrows the bars and habits.
@@ -1079,7 +1086,7 @@ async function renderWasteTab() {
     `<span class="wg-project">${esc(g.project)}</span><span>${esc(label(g.cause))}</span>` +
     `<span class="num">${fmtCostBig(g.usd)}</span>` +
     `<span class="muted num">${g.sessions.length} session${g.sessions.length === 1 ? '' : 's'} · ${fmtPct(g.spend ? g.usd / g.spend : 0)} of their spend</span>` +
-    `</summary><p class="wg-fix"><strong>Fix:</strong> ${esc(g.fix)} <span class="muted">(${esc(g.tier)})</span></p>` + verifySlot(g.project, g.cause) +
+    `</summary><p class="wg-fix"><strong>Fix:</strong> ${esc(g.fix)} <span class="muted">(${splitBadges(g)})</span></p>` + verifySlot(g.project, g.cause) +
     '<table><thead><tr><th>Last active</th><th>Session</th><th>Attributed</th><th>Of session</th><th>What happened</th></tr></thead><tbody>' +
     g.sessions.map(s => `<tr><td class="muted">${esc(s.date || '')}</td>` +
       `<td><button class="link-btn" data-session="${esc(s.id)}" onclick="openSessionDetail(this.dataset.session)" title="Open trace">` +
@@ -1169,15 +1176,17 @@ function renderStats(t) {
   const stats = [
     { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel },
     { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
-    { label: 'Input Tokens',   value: fmt(t.input),                sub: rangeLabel },
-    { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
-    { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
-    { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
-    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Sep 2026', color: C.green },
+    { label: 'Input Tokens',   prov: 'official', value: fmt(t.input),                sub: rangeLabel },
+    { label: 'Output Tokens',  prov: 'official', value: fmt(t.output),               sub: rangeLabel },
+    { label: 'Cache Read',     prov: 'official', value: fmt(t.cache_read),           sub: 'from prompt cache' },
+    { label: 'Cache Creation', prov: t.cache_creation_unknown ? 'unknown' : 'official',
+      value: orUnknown(t.cache_creation, t.cache_creation_unknown),
+      sub: t.cache_creation_partial && !t.cache_creation_unknown ? 'writes to prompt cache (Codex not counted)' : 'writes to prompt cache' },
+    { label: 'Est. Cost',      prov: 'local_estimate', value: fmtCostBig(t.cost),          sub: 'API pricing, Sep 2026', color: C.green },
   ];
   document.getElementById('stats-row').innerHTML = stats.map(s => `
     <div class="stat-card">
-      <div class="label">${s.label}</div>
+      <div class="label"${s.prov ? ` data-prov="${s.prov}"` : ''}>${s.label}</div>
       <div class="value" style="${s.color ? 'color:' + s.color : ''}">${esc(s.value)}</div>
       ${s.sub ? `<div class="sub">${esc(s.sub)}</div>` : ''}
     </div>
@@ -1476,7 +1485,7 @@ function renderSessionsTable(sessions) {
       <td class="num">${fmt(s.input)}</td>
       <td class="num">${fmt(s.output)}</td>
       <td class="num">${fmt(s.cache_read)}</td>
-      <td class="num">${fmt(s.cache_creation)}</td>
+      <td class="num"${isEstimated(s.model) ? ' title="Codex reports no cache-write tokens: unknown, not zero"' : ''}>${orUnknown(s.cache_creation, isEstimated(s.model))}</td>
       ${cell}
     </tr>`;
   }).join('');
@@ -1827,7 +1836,7 @@ function renderSessionDetail(d) {
     const cost = rowCost(t, t.timestamp.slice(0, 10));
     return `<tr${traceHighlight.has(t.message_id) ? ' class="hl" aria-label="evidence call"' : ''}>
       <td class="muted">${esc(t.ts.replace('T', ' ').replace('Z', ''))}</td>
-      <td title="${esc(t.actor)}">${esc(t.actor)}${t.estimated ? ' <span class="muted" title="token counts estimated">(est.)</span>' : ''}</td>
+      <td title="${esc(t.actor)}">${esc(t.actor)}${t.estimated ? ' ' + provBadge('local_estimate') : ''}</td>
       <td class="muted">${t.gap_s == null ? '' : fmtGap(t.gap_s)}</td>
       <td class="num">${fmt(t.context)}</td>
       <td class="wrap-any">${toolCellHTML(t, i)}</td>
@@ -1835,7 +1844,7 @@ function renderSessionDetail(d) {
       <td class="num">${fmt(t.input)}</td>
       <td class="num">${fmt(t.output)}</td>
       <td class="num">${fmt(t.cache_read)}</td>
-      <td class="num">${fmt(t.cache_creation)}</td>
+      <td class="num">${orUnknown(t.cache_creation, isEstimated(t.model))}</td>
       <td class="num">${fmt(t.cache_creation_5m || 0)}</td>
       <td class="num">${fmt(t.cache_creation_1h || 0)}</td>
       <td class="muted">${t.duration_ms ? (t.duration_ms / 1000).toFixed(1) + 's' : ''}</td>
@@ -2303,7 +2312,7 @@ function renderModelCostTable(byModel) {
       <td class="num">${fmt(m.input)}</td>
       <td class="num">${fmt(m.output)}</td>
       <td class="num">${fmt(m.cache_read)}</td>
-      <td class="num">${fmt(m.cache_creation)}</td>
+      <td class="num">${orUnknown(m.cache_creation, isEstimated(m.model))}</td>
       ${cell}
     </tr>`;
   }).join('');
@@ -2691,6 +2700,7 @@ async function init() {
     console.error('Failed to load pricing from /api/pricing', e);
   }
   loadPricing();
+  watchProvenance();
   initTheme(() => renderTab(activeTab));  // palette changed: refill tokens + redraw the live screen
   initRail();
   syncDefaultTZButtons();

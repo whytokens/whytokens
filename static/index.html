@@ -87,11 +87,11 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         <thead><tr>
           <th>Model</th>
           <th class="sortable" onclick="setModelSort('turns')">Turns <span class="sort-icon" id="msort-turns"></span></th>
-          <th class="sortable" onclick="setModelSort('input')">Input <span class="sort-icon" id="msort-input"></span></th>
-          <th class="sortable" onclick="setModelSort('output')">Output <span class="sort-icon" id="msort-output"></span></th>
-          <th class="sortable" onclick="setModelSort('cache_read')">Cache Read <span class="sort-icon" id="msort-cache_read"></span></th>
-          <th class="sortable" onclick="setModelSort('cache_creation')">Cache Creation <span class="sort-icon" id="msort-cache_creation"></span></th>
-          <th class="sortable" onclick="setModelSort('cost')">Est. Cost <span class="sort-icon" id="msort-cost"></span></th>
+          <th data-prov="official" class="sortable" onclick="setModelSort('input')">Input <span class="sort-icon" id="msort-input"></span></th>
+          <th data-prov="official" class="sortable" onclick="setModelSort('output')">Output <span class="sort-icon" id="msort-output"></span></th>
+          <th data-prov="official" class="sortable" onclick="setModelSort('cache_read')">Cache Read <span class="sort-icon" id="msort-cache_read"></span></th>
+          <th data-prov="official" class="sortable" onclick="setModelSort('cache_creation')">Cache Creation <span class="sort-icon" id="msort-cache_creation"></span></th>
+          <th data-prov="local_estimate" class="sortable" onclick="setModelSort('cost')">Est. Cost <span class="sort-icon" id="msort-cost"></span></th>
         </tr></thead>
         <tbody id="model-cost-body"></tbody>
       </table>
@@ -103,11 +103,11 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         <thead><tr>
           <th>Effort</th>
           <th>Turns</th>
-          <th>Input</th>
-          <th>Output</th>
-          <th>Cache Read</th>
-          <th>Cache Creation</th>
-          <th>Est. Cost</th>
+          <th data-prov="official">Input</th>
+          <th data-prov="official">Output</th>
+          <th data-prov="official">Cache Read</th>
+          <th data-prov="official">Cache Creation</th>
+          <th data-prov="local_estimate">Est. Cost</th>
         </tr></thead>
         <tbody id="effort-cost-body"></tbody>
       </table>
@@ -116,13 +116,13 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
       <summary>Cost Breakdown</summary>
       <table>
         <thead><tr>
-          <th>Input</th>
-          <th>Output</th>
-          <th>Cache Read</th>
-          <th>Cache Creation</th>
-          <th>Total</th>
-          <th>Est. Cache Savings</th>
-          <th>Cache Share</th>
+          <th data-prov="local_estimate">Input</th>
+          <th data-prov="local_estimate">Output</th>
+          <th data-prov="local_estimate">Cache Read</th>
+          <th data-prov="local_estimate">Cache Creation</th>
+          <th data-prov="local_estimate">Total</th>
+          <th data-prov="local_estimate">Est. Cache Savings</th>
+          <th data-prov="local_estimate">Cache Share</th>
         </tr></thead>
         <tbody id="cost-breakdown-body"></tbody>
       </table>
@@ -136,9 +136,9 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <th>Project</th>
           <th class="sortable" onclick="setProjectSort('sessions')">Sessions <span class="sort-icon" id="psort-sessions"></span></th>
           <th class="sortable" onclick="setProjectSort('turns')">Turns <span class="sort-icon" id="psort-turns"></span></th>
-          <th class="sortable" onclick="setProjectSort('input')">Input <span class="sort-icon" id="psort-input"></span></th>
-          <th class="sortable" onclick="setProjectSort('output')">Output <span class="sort-icon" id="psort-output"></span></th>
-          <th class="sortable" onclick="setProjectSort('cost')">Est. Cost <span class="sort-icon" id="psort-cost"></span></th>
+          <th data-prov="official" class="sortable" onclick="setProjectSort('input')">Input <span class="sort-icon" id="psort-input"></span></th>
+          <th data-prov="official" class="sortable" onclick="setProjectSort('output')">Output <span class="sort-icon" id="psort-output"></span></th>
+          <th data-prov="local_estimate" class="sortable" onclick="setProjectSort('cost')">Est. Cost <span class="sort-icon" id="psort-cost"></span></th>
         </tr></thead>
         <tbody id="project-cost-body"></tbody>
       </table>
@@ -152,9 +152,9 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <th>Branch</th>
           <th class="sortable" onclick="setProjectBranchSort('sessions')">Sessions <span class="sort-icon" id="pbsort-sessions"></span></th>
           <th class="sortable" onclick="setProjectBranchSort('turns')">Turns <span class="sort-icon" id="pbsort-turns"></span></th>
-          <th class="sortable" onclick="setProjectBranchSort('input')">Input <span class="sort-icon" id="pbsort-input"></span></th>
-          <th class="sortable" onclick="setProjectBranchSort('output')">Output <span class="sort-icon" id="pbsort-output"></span></th>
-          <th class="sortable" onclick="setProjectBranchSort('cost')">Est. Cost <span class="sort-icon" id="pbsort-cost"></span></th>
+          <th data-prov="official" class="sortable" onclick="setProjectBranchSort('input')">Input <span class="sort-icon" id="pbsort-input"></span></th>
+          <th data-prov="official" class="sortable" onclick="setProjectBranchSort('output')">Output <span class="sort-icon" id="pbsort-output"></span></th>
+          <th data-prov="local_estimate" class="sortable" onclick="setProjectBranchSort('cost')">Est. Cost <span class="sort-icon" id="pbsort-cost"></span></th>
         </tr></thead>
         <tbody id="project-branch-cost-body"></tbody>
       </table>
@@ -169,11 +169,11 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         <thead><tr>
           <th>Tool</th>
           <th>Turns</th>
-          <th>Input</th>
-          <th>Output</th>
-          <th>Cache Read</th>
-          <th>Cache Creation</th>
-          <th>Est. Cost</th>
+          <th data-prov="official">Input</th>
+          <th data-prov="official">Output</th>
+          <th data-prov="official">Cache Read</th>
+          <th data-prov="official">Cache Creation</th>
+          <th data-prov="local_estimate">Est. Cost</th>
         </tr></thead>
         <tbody id="tool-cost-body"></tbody>
       </table>
@@ -185,11 +185,11 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         <thead><tr>
           <th>MCP server</th>
           <th>Turns</th>
-          <th>Input</th>
-          <th>Output</th>
-          <th>Cache Read</th>
-          <th>Cache Creation</th>
-          <th>Est. Cost</th>
+          <th data-prov="official">Input</th>
+          <th data-prov="official">Output</th>
+          <th data-prov="official">Cache Read</th>
+          <th data-prov="official">Cache Creation</th>
+          <th data-prov="local_estimate">Est. Cost</th>
         </tr></thead>
         <tbody id="mcp-cost-body"></tbody>
       </table>
@@ -208,7 +208,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <th>Agent Type</th>
           <th>Session</th>
           <th>Project</th>
-          <th>Tokens</th>
+          <th data-prov="official">Tokens</th>
           <th>Duration</th>
           <th>Tool Uses</th>
         </tr></thead>
@@ -250,11 +250,11 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <th class="sortable" onclick="setSessionSort('duration_min')">Duration <span class="sort-icon" id="sort-icon-duration_min"></span></th>
           <th>Model</th>
           <th class="sortable" onclick="setSessionSort('turns')">Turns <span class="sort-icon" id="sort-icon-turns"></span></th>
-          <th class="sortable" onclick="setSessionSort('input')">Input <span class="sort-icon" id="sort-icon-input"></span></th>
-          <th class="sortable" onclick="setSessionSort('output')">Output <span class="sort-icon" id="sort-icon-output"></span></th>
-          <th class="sortable" onclick="setSessionSort('cache_read')">Cache Read <span class="sort-icon" id="sort-icon-cache_read"></span></th>
-          <th class="sortable" onclick="setSessionSort('cache_creation')">Cache Creation <span class="sort-icon" id="sort-icon-cache_creation"></span></th>
-          <th class="sortable" onclick="setSessionSort('cost')">Est. Cost <span class="sort-icon" id="sort-icon-cost"></span></th>
+          <th data-prov="official" class="sortable" onclick="setSessionSort('input')">Input <span class="sort-icon" id="sort-icon-input"></span></th>
+          <th data-prov="official" class="sortable" onclick="setSessionSort('output')">Output <span class="sort-icon" id="sort-icon-output"></span></th>
+          <th data-prov="official" class="sortable" onclick="setSessionSort('cache_read')">Cache Read <span class="sort-icon" id="sort-icon-cache_read"></span></th>
+          <th data-prov="official" class="sortable" onclick="setSessionSort('cache_creation')">Cache Creation <span class="sort-icon" id="sort-icon-cache_creation"></span></th>
+          <th data-prov="local_estimate" class="sortable" onclick="setSessionSort('cost')">Est. Cost <span class="sort-icon" id="sort-icon-cost"></span></th>
         </tr></thead>
         <tbody id="sessions-body"></tbody>
       </table>
@@ -266,11 +266,11 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         <thead><tr>
           <th>Session</th>
           <th>Project</th>
-          <th>Cost</th>
-          <th>Cost / Min</th>
-          <th>Tokens / Min</th>
-          <th>Output / Turn</th>
-          <th>Cache Share</th>
+          <th data-prov="local_estimate">Cost</th>
+          <th data-prov="local_estimate">Cost / Min</th>
+          <th data-prov="official">Tokens / Min</th>
+          <th data-prov="official">Output / Turn</th>
+          <th data-prov="official">Cache Share</th>
         </tr></thead>
         <tbody id="session-signals-body"></tbody>
       </table>
@@ -305,12 +305,12 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
       <thead><tr>
         <th>Tool</th>
         <th>Turns</th>
-        <th>Input</th>
-        <th>Output</th>
-        <th>Cache Read</th>
-        <th>Cache Creation</th>
-        <th>Est. Cost</th>
-        <th>Cost Share</th>
+        <th data-prov="official">Input</th>
+        <th data-prov="official">Output</th>
+        <th data-prov="official">Cache Read</th>
+        <th data-prov="official">Cache Creation</th>
+        <th data-prov="local_estimate">Est. Cost</th>
+        <th data-prov="local_estimate">Cost Share</th>
       </tr></thead>
       <tbody id="session-tool-breakdown-body"></tbody>
     </table>
@@ -346,16 +346,16 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         <th>Context</th>
         <th>Tool</th>
         <th>Model</th>
-        <th>Input</th>
-        <th>Output</th>
-        <th>Cache Read</th>
-        <th>Cache Creation</th>
+        <th data-prov="official">Input</th>
+        <th data-prov="official">Output</th>
+        <th data-prov="official">Cache Read</th>
+        <th data-prov="official">Cache Creation</th>
         <th>Cache 5m</th>
         <th>Cache 1h</th>
         <th>Duration</th>
         <th>Stop</th>
         <th>Tier</th>
-        <th>Est. Cost</th>
+        <th data-prov="local_estimate">Est. Cost</th>
       </tr></thead>
       <tbody id="session-detail-body"></tbody>
     </table>

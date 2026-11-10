@@ -124,13 +124,20 @@ class ClaudeSource:
             return 0
         if not any(Path(d).exists() for d in self._dirs()):
             return 0
+        complete = True
         if conn.execute("SELECT 1 FROM turns WHERE COALESCE(agent, 'claude') = 'claude' "
                         "LIMIT 1").fetchone():
             for filepath in self.discover_files():
+                try:  # parse_jsonl_file swallows read errors; an unreadable file must keep the backfill retryable
+                    open(filepath, "rb").close()
+                except OSError:
+                    complete = False
+                    continue
                 calls = {}
                 scanner.parse_jsonl_file(filepath, calls_out=calls)
                 scanner.upsert_tool_results(conn, [c for c in calls.values() if c.get("loaded_tools")])
-        scanner._meta_set(conn, marker, "1")
+        if complete:  # COALESCE upsert is idempotent, so a retry is safe
+            scanner._meta_set(conn, marker, "1")
         conn.commit()
         return 1
 

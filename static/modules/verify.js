@@ -5,6 +5,11 @@ import { esc, fmtCostBig } from './format.js';
 let fixesPromise = null;
 export function resetVerify() { fixesPromise = null; }
 
+/** The record-a-fix hint with this habit's real project and cause filled in. */
+export function recordHint(project, cause) {
+  return `whytokens fix record --project '${project.replace(/'/g, "''")}' --cause ${cause} --note "what you changed"`;
+}
+
 export function verifySlot(project, cause) {
   return `<div class="wg-verify muted" data-vproject="${esc(project)}" data-vcause="${esc(cause)}"></div>`;
 }
@@ -28,6 +33,6 @@ export async function fillVerifySlots(root) {
   for (const slot of slots) {
     const mine = results.filter(r => r.fix.project === slot.dataset.vproject && r.fix.cause === slot.dataset.vcause);
     slot.innerHTML = mine.length ? mine.map(describe).join('')
-      : '<p>No fix recorded. After changing this habit: <code>whytokens fix record --project … --cause … --note …</code></p>';
+      : `<p>No fix recorded. After changing this habit: <code>${esc(recordHint(slot.dataset.vproject, slot.dataset.vcause))}</code></p>`;
   }
 }

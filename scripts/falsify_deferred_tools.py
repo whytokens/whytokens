@@ -26,7 +26,11 @@ MUTANTS = [
     # doctor: duplicates grouped by launch spec, plugin config read
     ("mcp_config.py", "if len(set(g)) > 1]", "if len(set(g)) > 5]"),
     ("mcp_config.py", "sorted(set(g)) for g", "g for g"),
-    ("waste.py", "min((k for k in compact_at if k > i + 1), default=len(lt))", "len(lt)"),
+    ("waste.py", "stop = min((k for k in compact_at if k > i), default=len(lt))", "stop = len(lt)"),
+    # combined review: compaction on the very next turn, later turns counted one by one, retryable backfill
+    ("waste.py", "stop = min((k for k in compact_at if k > i), default=len(lt))", "stop = min((k for k in compact_at if k > i + 1), default=len(lt))"),
+    ("waste.py", 'if (u["cache_read_tokens"] or 0) and u["message_id"] not in claimed)', "if True)"),
+    ("sources/claude.py", "if complete:  # COALESCE", "if True:  # COALESCE"),
     ("mcp_config.py", '"**/.mcp.json"', '"nothing/.mcp.json"'),
 ]
 TESTS = ["tests.test_deferred_tools", "tests.test_mcp_config"]

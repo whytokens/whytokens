@@ -24,6 +24,7 @@ Routes:
   GET  /api/live?session_id|cwd -> get_live_session()  (transcript-direct, no DB)
   GET  /api/waste              -> waste findings, rollup, measurement status (API list rate)
   GET  /api/fixes              -> recorded fixes with before/after verification
+  GET  /api/provenance         -> provenance labels + tooltips (provenance.LABELS)
   GET  /api/pricing            -> the single-source pricing table (pricing.PRICING)
   GET  /icon.svg               -> resources/icon.svg (header icon)
   POST /api/rescan             -> incremental sources.scan_all() (non-destructive)
@@ -43,6 +44,7 @@ from urllib.parse import parse_qs, urlparse
 import config
 import extensions
 import pricing
+import provenance
 import scanner
 import scanrun
 from config import DB_PATH, DEFAULT_PORT
@@ -707,11 +709,13 @@ def get_waste(db_path=None):
     findings = waste.report(db_path)
     rollup = {}
     for f in findings:
-        r = rollup.setdefault(f["cause"], {"cause": f["cause"], "tier": f["tier"], "usd": 0.0, "sessions": 0})
+        r = rollup.setdefault(f["cause"], {"cause": f["cause"], "tier": f["tier"], "usd": 0.0, "sessions": 0,
+                                           "observed_usd": 0.0, "inferred_usd": 0.0})
         r["usd"] += f["usd"]
         r["sessions"] += 1
+        r[f["attribution"] + "_usd"] += f["usd"]  # a mixed cause keeps both halves
         if r["tier"] != f["tier"]:
-            r["tier"] = "inferred"  # mixed sources: show the weaker tier
+            r["tier"] = "inferred"  # mixed sources: the weaker tier, kept for old readers
     return {"basis": waste.BASIS, "findings": findings, "total_usd": sum(f["usd"] for f in findings),
             "rollup": sorted(rollup.values(), key=lambda r: r["usd"], reverse=True),
             "measurement": waste.measurement(db_path)}
@@ -1264,6 +1268,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/fixes":
             self._send_json(get_fixes())
+
+        elif path == "/api/provenance":
+            self._send_json(provenance.LABELS)  # label vocabulary + tooltips
 
         elif path == "/api/pricing":
             # The single source of truth for the price table, served so the

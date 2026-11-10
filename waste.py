@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pricing
+import provenance
 from scanner import ADVISOR_ID_PREFIX, AGENT_SUMMARY_ID_PREFIX
 
 
@@ -125,18 +126,22 @@ def _rebuild_reason(turn, prev):
     opening prefix, never as a rebuild here."""
     creation, read = turn["cache_creation_tokens"] or 0, turn["cache_read_tokens"] or 0
     prefix = prev["prefix"]
-    if not creation or read * 2 >= prefix:
+    if not creation:
         return None
     gap = _gap(prev["timestamp"], turn["timestamp"])
+    # Partial expiry: the prefix was cached at the 1h tier, so the 1h part survives (read > 0) while the
+    # 5m part expired; the rewrite is that 5m part. Checked before the majority cutoff, since the surviving
+    # 1h part is usually most of the prefix. A full miss (read == 0) is still a changed prefix, and
+    # read >= prefix means nothing expired (plain growth).
+    # ponytail: 'a 1h write is still in the prefix' is tracked as a flag, not per-token tier sizes.
+    if 0 < read < prefix and gap is not None and gap.total_seconds() >= 300 and prev.get("h1", prev["ttl"] > 300):
+        return "expected", f"idle {gap.total_seconds() / 60:.0f} min, past the 5 min TTL of the 5m-tier part (1h-tier part still cached)"
+    if read * 2 >= prefix:
+        return None
     if gap is not None and gap.total_seconds() >= prev["ttl"]:  # the cached prefix's tier, not the rewrite's
         return "expected", f"idle {gap.total_seconds() / 60:.0f} min, past the {prev['ttl'] // 60} min cache TTL"
     if turn["is_compact_summary"] or prev["compact"]:
         return "expected", "context compaction"
-    # Partial expiry: the prefix was cached at the 1h tier, so the 1h part survives (read > 0) while the
-    # 5m part expired; the rewrite is that 5m part. A full miss (read == 0) is still a changed prefix.
-    # ponytail: 'a 1h write is still in the prefix' is tracked as a flag, not per-token tier sizes.
-    if read and gap is not None and gap.total_seconds() >= 300 and prev.get("h1", prev["ttl"] > 300):
-        return "expected", f"idle {gap.total_seconds() / 60:.0f} min, past the 5 min TTL of the 5m-tier part (1h-tier part still cached)"
     if turn["model"] != prev["model"]:
         return "expected", f"model switch ({prev['model']} to {turn['model']})"
     return "unexpected", (f"read {read:,} of {prefix:,} cached tokens inside the TTL with no compaction or model switch: "
@@ -219,8 +224,11 @@ def _deferred_tool_load(turns, loads, claims):
             if not waste or i + 1 >= len(lt):
                 continue
             nxt = lt[i + 1]
-            # the schemas leave context at the next compaction, so the charge stops there
-            remaining = min((k for k in compact_at if k > i + 1), default=len(lt)) - i - 2
+            # the schemas leave context at the next compaction (even one on the very next turn), so the
+            # charge stops there; each later turn counts only if it read the cache and no other cause claimed it
+            stop = min((k for k in compact_at if k > i), default=len(lt))
+            remaining = sum(1 for u in lt[i + 2:stop]
+                            if (u["cache_read_tokens"] or 0) and u["message_id"] not in claimed)
             delta = max(0, (nxt["cache_creation_tokens"] or 0) - median)
             if not delta or not remaining or nxt["id"] in used or nxt["message_id"] in claimed:
                 continue
@@ -416,6 +424,6 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
             tier = "inferred" if inferred else TIERS[cause]
             top = sorted(evidence, key=lambda e: e["usd"], reverse=True)[:5]
             findings.append({"cause": cause, "session_id": sid, "usd": usd, "detail": detail, "fix": fix,
-                             "tier": tier, "advice": f"{tier.capitalize()}: {fix}",
+                             "tier": tier, "attribution": provenance.attribution(tier), "advice": f"{tier.capitalize()}: {fix}",
                              "evidence": top, "session_usd": total})
     return sorted(findings, key=lambda finding: finding["usd"], reverse=True)

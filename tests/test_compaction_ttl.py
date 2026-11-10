@@ -130,6 +130,24 @@ class TestPartialExpiry(Base):
         self.assertIn("cache_miss_rebuild", causes)
 
 
+class TestPartialExpiryMajorityCached(unittest.TestCase):
+    """Combined review: a surviving 1h part that is most of the prefix used to hit the majority cutoff first."""
+    def _reason(self, read, prefix, gap_s=600):
+        prev = {"prefix": prefix, "timestamp": _ts(0), "ttl": 3600, "h1": True, "compact": 0, "model": MODEL}
+        turn = {"cache_creation_tokens": 4_000, "cache_read_tokens": read, "is_compact_summary": 0,
+                "timestamp": _ts(0, gap_s), "model": MODEL}
+        return waste._rebuild_reason(turn, prev)
+
+    def test_16k_1h_survives_4k_5m_expired_is_expected(self):
+        self.assertEqual(self._reason(16_000, 20_000)[0], "expected")
+
+    def test_plain_growth_after_a_pause_is_not_a_rebuild(self):
+        self.assertIsNone(self._reason(20_000, 20_000))
+
+    def test_inside_5_min_majority_read_is_not_a_rebuild(self):
+        self.assertIsNone(self._reason(16_000, 20_000, gap_s=120))
+
+
 class TestBackfillEdges(unittest.TestCase):
     def _run(self, lines, unreadable=False):
         tmp = Path(tempfile.mkdtemp())

@@ -17,11 +17,14 @@ ROOT = Path(__file__).resolve().parent.parent
 MUTANTS = [
     ("scanner.py", "pending_compact[session_id] = None", "pass"),
     ("sources/claude.py", "WHERE message_id = ? AND is_compact_summary = 0", "WHERE message_id = ? AND 0"),
-    ("waste.py", "if read and gap is not None and gap.total_seconds() >= 300", "if False and gap is not None and gap.total_seconds() >= 300"),
+    ("waste.py", "if 0 < read < prefix and gap is not None", "if False and gap is not None"),
+    # combined review: partial expiry checked before the majority cutoff, and only when something was lost
+    ("waste.py", "if 0 < read < prefix and gap is not None", "if 0 < read < prefix and read * 2 < prefix and gap is not None"),
+    ("waste.py", "if 0 < read < prefix and gap is not None", "if read and gap is not None"),
     ("waste.py", "gap.total_seconds() >= prev[\"ttl\"]:", "gap.total_seconds() > prev[\"ttl\"]:"),
     ("static/modules/pricing.js", "t.gap_s >= (t.cache_creation_1h", "t.gap_s > (t.cache_creation_1h"),
     ("scanner.py", "if t.get(\"message_id\") in compact:", "if False:"),
-    ("sources/claude.py", "if complete:", "if True:"),
+    ("sources/claude.py", "if complete:  # an unreadable file", "if True:  # an unreadable file"),
     ("sources/claude.py", "if not any(usage.get(k) or 0", "if False and not any(usage.get(k) or 0"),
     ("waste.py", "gap.total_seconds() >= previous_main[\"ttl\"]", "gap.total_seconds() >= 1800"),
 ]

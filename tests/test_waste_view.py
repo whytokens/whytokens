@@ -13,8 +13,9 @@ _HTML = (_STATIC / "index.html").read_text(encoding="utf-8")
 HARNESS = """
 %(SRC)s
 const esc = s => String(s), fmtPct = v => (v * 100).toFixed(1) + '%%', fmtCostBig = c => '$' + c.toFixed(2);
+const addSplit = (acc, f) => { acc[f.attribution] += f.usd; };  // provenance.js (tested in test_provenance)
 const eq = (got, want, what) => { if (got !== want) throw new Error(what + ': got ' + got + ', want ' + want); };
-const f = (sid, cause, usd, session_usd) => ({ session_id: sid, cause, usd, session_usd, tier: 'attributed cause',
+const f = (sid, cause, usd, session_usd) => ({ session_id: sid, cause, usd, session_usd, tier: 'attributed cause', attribution: cause === 'resident_output' && sid === 's1' ? 'inferred' : 'observed',
                                                detail: cause + ' in ' + sid, fix: 'fix ' + cause, evidence: [] });
 // listed out of order on purpose: the view must sort, not inherit the API's order
 const findings = [
@@ -35,6 +36,10 @@ eq(v.affectedSessions, 3, 'affected sessions');
 // cause bars, biggest first
 eq(v.causes.map(c => c.cause + ':' + c.usd + ':' + c.sessions).join(), 'idle_gap:10:3,resident_output:1:1', 'causes');
 eq(v.causes.map(c => c.share.toFixed(4)).join(), (10 / 11).toFixed(4) + ',' + (1 / 11).toFixed(4), 'cause shares');
+// a mixed-source cause keeps observed and inferred dollars apart
+const ro = groupWaste([f('s1', 'resident_output', 1, 10), {...f('s2', 'resident_output', 4, 4), attribution: 'inferred'}], sessions);
+eq(ro.causes[0].observed + '/' + ro.causes[0].inferred, '0/5', 'split');
+eq(v.causes[0].observed + '/' + v.causes[0].inferred, '10/0', 'observed cause');
 // habits: (project, cause), biggest first, sessions biggest first, titles joined
 eq(v.groups.map(g => g.project + '/' + g.cause + ':' + g.usd).join(),
    'zeta/idle_gap:5,alpha/idle_gap:5,zeta/resident_output:1', 'groups (tie: more sessions first, not by name)');

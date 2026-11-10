@@ -793,7 +793,7 @@ class TestStaticAssets(unittest.TestCase):
         self.assertIn("setSessionSort('cache_read')", INDEX_HTML)
         self.assertIn("setSessionSort('cache_creation')", INDEX_HTML)
         self.assertIn("${fmt(s.cache_read)}", APP_JS)
-        self.assertIn("${fmt(s.cache_creation)}", APP_JS)
+        self.assertIn("orUnknown(s.cache_creation", APP_JS)
 
     def test_has_drilldown_and_metric_tables(self):
         self.assertIn('id="session-detail-view"', INDEX_HTML)

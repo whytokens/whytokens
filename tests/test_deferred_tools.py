@@ -79,6 +79,30 @@ FIXTURES = {
 }
 
 
+def _patched(sid, patch):
+    """A "kw"-shaped lane with some records rewritten: patch(index, record) edits in place."""
+    lines = _lane(sid, FIVE, [FIVE[0]])
+    for i, line in enumerate(lines):
+        rec = json.loads(line)
+        patch(i, rec)
+        lines[i] = json.dumps(rec)
+    return lines
+
+
+def _compact_next(i, rec):  # lines[4] is the schema-write turn right after the ToolSearch result
+    if i == 4:
+        rec["isCompactSummary"] = True
+
+
+def _two_rewrites(i, rec):  # two later quiet turns become full rewrites (no cache read, claimed elsewhere)
+    if i in (6, 7):
+        rec["message"]["usage"].update(cache_read_input_tokens=0, cache_creation_input_tokens=90_000)
+
+
+FIXTURES["kwc0"] = _patched("kwc0", _compact_next)
+FIXTURES["kwrw"] = _patched("kwrw", _two_rewrites)
+
+
 class TestDeferredToolLoad(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -123,6 +147,15 @@ class TestDeferredToolLoad(unittest.TestCase):
     def test_charge_stops_at_compaction(self):
         self.assertEqual(self._find("kw")["evidence"][0]["tokens"], 4 * self._find("kwc")["evidence"][0]["tokens"])
 
+    def test_compaction_on_the_next_turn_charges_nothing(self):
+        # combined review: `k > i + 1` skipped a compaction on the very next turn
+        self.assertIsNone(self._find("kwc0"))
+
+    def test_later_turns_without_a_cache_read_are_not_charged(self):
+        # combined review: 8 quiet turns after the schema write in "kw"; two become rewrites in "kwrw"
+        kw, rw = self._find("kw")["evidence"][0]["tokens"], self._find("kwrw")["evidence"][0]["tokens"]
+        self.assertEqual(rw * 8, kw * 6)
+
     def test_overlap_is_judged_per_lane(self):
         self.assertIsNone(self._find("subsx"))
 
@@ -143,3 +176,28 @@ class TestDeferredToolLoad(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeferredBackfillRetry(unittest.TestCase):
+    """Combined review: an unreadable transcript must leave the backfill marker unset, so it retries."""
+    def test_unreadable_transcript_leaves_the_marker_unset(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        proj = tmp / "projects" / "home-dev-acme-app"
+        proj.mkdir(parents=True)
+        (proj / "b.jsonl").write_text("\n".join(_lane("b", FIVE, [FIVE[0]])) + "\n", encoding="utf-8")
+        src = ClaudeSource(projects_dirs=[str(proj.parent)])
+        db = str(tmp / "usage.db")
+        scan_all(db_path=db, verbose=False, sources=[src])
+        c = sqlite3.connect(db)
+        self.addCleanup(c.close)
+        c.execute("DELETE FROM schema_meta WHERE key = 'deferred_loads_backfill_done_claude'")
+        c.commit()
+        src.discover_files = lambda: [str(proj / "missing.jsonl")]
+        src.backfill_deferred_loads(c)
+        self.assertIsNone(c.execute(
+            "SELECT 1 FROM schema_meta WHERE key = 'deferred_loads_backfill_done_claude'").fetchone())
+        del src.discover_files
+        src.backfill_deferred_loads(c)
+        self.assertIsNotNone(c.execute(
+            "SELECT 1 FROM schema_meta WHERE key = 'deferred_loads_backfill_done_claude'").fetchone())
