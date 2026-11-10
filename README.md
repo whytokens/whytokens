@@ -6,7 +6,7 @@ whytokens reads the transcript logs those tools already write on your machine, s
 per-turn token counts in a local SQLite database, and shows them in a browser dashboard
 and a few CLI summaries. It also points at avoidable spend: repeated file reads, tool
 output that stays in context, subagent preambles, idle gaps that expire the prompt cache,
-and uncached input.
+prompt-cache rebuilds, deferred-tool loads, and uncached input.
 
 ![Overview, light](docs/screenshots/overview-light.png)
 
@@ -32,12 +32,12 @@ Requires Python 3.9 or newer. No third-party dependencies.
 
 ```sh
 # one-off, no install
-uvx --from git+https://github.com/whytokens/whytokens@v0.2.1 whytokens dashboard
+uvx --from git+https://github.com/whytokens/whytokens@v0.2.2 whytokens dashboard
 
 # or install the command
-pipx install git+https://github.com/whytokens/whytokens@v0.2.1
+pipx install git+https://github.com/whytokens/whytokens@v0.2.2
 # or, with uv
-uv tool install git+https://github.com/whytokens/whytokens@v0.2.1
+uv tool install git+https://github.com/whytokens/whytokens@v0.2.2
 whytokens dashboard
 
 # or from a clone
@@ -55,7 +55,7 @@ python cli.py dashboard       # python3 on macOS/Linux
 | Overview | Totals, daily token usage with estimated cost, hourly distribution, projects, tools |
 | Sessions | Filterable session table with cost, model, tokens; expensive-session signals; CSV export |
 | Trace | One session turn by turn |
-| Waste | Spend attributed to avoidable causes, per session, with a fix for each |
+| Waste | Spend attributed to avoidable causes by cause, week and project, with a fix for each and observed/inferred badges |
 | Sources | Which log locations were found and how many sessions came from each |
 | Settings | Editable price table, timezone, theme |
 
@@ -74,7 +74,7 @@ Each command below can be run as `whytokens <command>` or `python cli.py <comman
 | Command | Does |
 |---|---|
 | `scan [--projects-dir PATH]` | Parse logs into the database (incremental) |
-| `scan --doctor` / `doctor` | Report schema drift in the logs; writes nothing |
+| `scan --doctor` / `doctor` | Report schema drift in the logs, configured MCP servers, and models billed at another model's rates; writes nothing |
 | `today` | Today's usage by model |
 | `week` | Last 7 days, per day and by model |
 | `stats` | All-time statistics |
@@ -111,9 +111,11 @@ serves are in [docs/SCHEMA.md](docs/SCHEMA.md).
 
 ## Limits
 
-- Estimates only. Prices are list prices in a table you can edit in Settings; unknown
-  models show `n/a`.
+- Estimates only. Prices are list prices in a table you can edit in Settings. A model
+  without its own row borrows a family row's rates (`doctor` and Settings list which);
+  unknown models show `n/a`.
 - Waste figures are lower bounds attributed to a cause, not savings you are guaranteed.
+  A cause under 10% of a session's spend is not reported.
 - You see what the logs contain. History a tool has already pruned is gone.
 - Log formats are not a stable API. `scan --doctor` reports fields or versions the
   parser has not seen.

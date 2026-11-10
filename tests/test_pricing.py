@@ -1,5 +1,8 @@
 """Tests for pricing.py - the single source of truth for the price table."""
 
+import json
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -144,8 +147,8 @@ class TestHaiku55Pricing(unittest.TestCase):
     def test_js_mirrors_the_fallback(self):
         js = (Path(__file__).resolve().parent.parent
               / "static" / "modules" / "pricing.js").read_text(encoding="utf-8")
-        self.assertLess(js.index("includes('haiku-5-5')) return 'claude-haiku-5-5'"),
-                        js.index("includes('haiku'))  return"))
+        self.assertLess(js.index("has(m, 'haiku-5-5')) return 'claude-haiku-5-5'"),
+                        js.index("has(m, 'haiku'))  return"))
 
 
 class TestGpt6SolLunaPricing(unittest.TestCase):
@@ -244,13 +247,43 @@ class TestFable52Pricing(unittest.TestCase):
         # Rate card: fast mode $16 / $80 against $8 / $40.
         self.assertEqual(pricing.price_mult("fast", None, "claude-fable-5-2"), 2.0)
 
-    def test_js_mirrors_the_52_fallback(self):
-        js = (Path(__file__).resolve().parent.parent
-              / "static" / "modules" / "pricing.js").read_text(encoding="utf-8")
-        self.assertIn("m.includes('fable-5-2') || m.includes('mythos-5-2')", js)
-        self.assertLess(js.index("'claude-fable-5-2'"), js.index("'claude-fable-5-1'"))
-        # Python's generic fallback covers mythos too; JS must not price it $0.
-        self.assertIn("m.includes('fable') || m.includes('mythos')", js)
+    # Dated 5.0 snapshots: the date's leading "2" must not read as version 5.2.
+    DATED_50 = ("claude-fable-5-20260610", "us.anthropic.claude-fable-5-20260610-v1:0",
+                "anthropic/claude-mythos-5-20260610", "fable-5-20260610")
+
+    def test_dated_50_ids_are_not_52(self):
+        for model in self.DATED_50:
+            self.assertEqual(pricing.match(model)[0], "claude-fable-5", model)
+            self.assertEqual(pricing.get_pricing(model)["cache_read"], 1.00, model)
+
+    IDS = DATED_50 + (
+        "claude-fable-5", "claude-fable-5-1", "claude-fable-5-1-20260901", "claude-fable-5-2",
+        "claude-fable-5-2-20261109", "anthropic/claude-fable-5-2", "us.anthropic.claude-mythos-5-2-v1:0",
+        "vertex/claude-mythos-5-1", "claude-mythos-5", "claude-opus-5-5", "claude-opus-5-50",
+        "new-opus-5", "claude-haiku-5-5", "claude-sonnet-5", "gpt-5.4-mini", "gpt-6-luna-x",
+        "qwen3.6-40b-claude-46-opus", "glm-4.6", "claude-fable-5-2²")
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_js_resolves_every_id_like_python(self):
+        """Runs pricing.js resolveKey under node; source-string checks cannot catch a dead branch."""
+        js = (Path(__file__).resolve().parent.parent / "static" / "modules" / "pricing.js").as_uri()
+        script = (f"const P = await import({json.dumps(js)});"
+                  "const d = JSON.parse(require('fs').readFileSync(0, 'utf8'));"
+                  "P.applyDefaultPricing(d.pricing);"
+                  "console.log(JSON.stringify(d.ids.map(m => [P.resolveKey(m), P.getPricing(m)])));")
+        out = subprocess.run(["node", "--input-type=commonjs", "-e", f"(async () => {{{script}}})()"],
+                             input=json.dumps({"pricing": pricing.PRICING, "ids": self.IDS}),
+                             capture_output=True, text=True, check=True).stdout
+        got = dict(zip(self.IDS, json.loads(out)))
+        fields = ("input", "output", "cache_read", "cache_write", "cache_write_1h")
+        for model in self.IDS:
+            self.assertEqual(got[model][0], pricing.match(model)[0], model)
+            py, js_rates = pricing.get_pricing(model), got[model][1]
+            self.assertEqual(js_rates and {f: js_rates.get(f) for f in fields},
+                             py and {f: py.get(f) for f in fields}, model)
+        for model in self.DATED_50:
+            self.assertEqual(got[model][0], "claude-fable-5", model)
+        self.assertEqual(got["us.anthropic.claude-mythos-5-2-v1:0"][0], "claude-fable-5-2")
 
 
 class TestFable51Pricing(unittest.TestCase):
@@ -439,8 +472,8 @@ class TestOpus55Pricing(unittest.TestCase):
     def test_js_mirrors_the_fallback(self):
         js = (Path(__file__).resolve().parent.parent
               / "static" / "modules" / "pricing.js").read_text(encoding="utf-8")
-        self.assertLess(js.index("includes('opus-5-5')) return"),
-                        js.index("includes('opus-'))  return"))
+        self.assertLess(js.index("has(m, 'opus-5-5')) return"),
+                        js.index("has(m, 'opus-'))  return"))
 
 
 class TestFallbackSignal(unittest.TestCase):

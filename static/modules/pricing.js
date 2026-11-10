@@ -142,25 +142,36 @@ export function isEstimated(model) {
 
 // Resolve model -> DEFAULT_PRICING key (exact, then first-wins prefix, then
 // keyword fallback). Mirrors pricing.get_pricing()'s key resolution.
-function resolveKey(model) {
+// A word ending in a digit must not end mid-number: "fable-5-2" inside
+// "fable-5-20260610" is a 5.0 id plus a date, not 5.2. Mirrors pricing._splits_number.
+const splitsNumber = (word, s, at) =>
+  /\d$/.test(word) && /\d/.test(s.charAt(at + word.length));
+function has(s, word) {
+  for (let at = s.indexOf(word); at !== -1; at = s.indexOf(word, at + 1)) {
+    if (!splitsNumber(word, s, at)) return true;
+  }
+  return false;
+}
+
+export function resolveKey(model) {
   if (!model) return null;
   if (DEFAULT_PRICING[model]) return model;
   for (const key of Object.keys(DEFAULT_PRICING)) {
-    if (model.startsWith(key)) return key;
+    if (model.startsWith(key) && !splitsNumber(key, model, 0)) return key;
   }
   const m = model.toLowerCase();
-  if (m.includes('fable-5-2') || m.includes('mythos-5-2')) return 'claude-fable-5-2'; // 20% under 5.1
+  if (has(m, 'fable-5-2') || has(m, 'mythos-5-2')) return 'claude-fable-5-2'; // 20% under 5.1
   // 5.1 first: its cache-read rate is 0.025x input, not 0.1x (see pricing.py).
-  if (m.includes('fable-5-1') || m.includes('mythos-5-1')) return 'claude-fable-5-1';
-  if (m.includes('fable') || m.includes('mythos')) return 'claude-fable-5';
-  if (m.includes('opus-5-5')) return 'claude-opus-5-5'; // 0.05x cache reads, not 4.8's 0.1x
-  if (m.includes('opus-'))  return 'claude-opus-4-8'; // "opus-" only: a model merely ending in "opus" is a local build, not billed
-  if (m.includes('sonnet')) return 'claude-sonnet-4-6';
-  if (m.includes('haiku-5-5')) return 'claude-haiku-5-5'; // 10x cheaper than 4.5
-  if (m.includes('haiku'))  return 'claude-haiku-4-5';
-  if (m.includes('codex'))  return 'gpt-5.3-codex';
-  if (m.includes('gpt-5'))  return m.includes('mini') ? 'gpt-5.4-mini' : 'gpt-5.4';
-  if (m.includes('gpt-6'))  return 'gpt-6-astra'; // unknown gpt-6 variant: top tier, not $0
+  if (has(m, 'fable-5-1') || has(m, 'mythos-5-1')) return 'claude-fable-5-1';
+  if (has(m, 'fable') || has(m, 'mythos')) return 'claude-fable-5';
+  if (has(m, 'opus-5-5')) return 'claude-opus-5-5'; // 0.05x cache reads, not 4.8's 0.1x
+  if (has(m, 'opus-'))  return 'claude-opus-4-8'; // "opus-" only: a model merely ending in "opus" is a local build, not billed
+  if (has(m, 'sonnet')) return 'claude-sonnet-4-6';
+  if (has(m, 'haiku-5-5')) return 'claude-haiku-5-5'; // 10x cheaper than 4.5
+  if (has(m, 'haiku'))  return 'claude-haiku-4-5';
+  if (has(m, 'codex'))  return 'gpt-5.3-codex';
+  if (has(m, 'gpt-5'))  return m.includes('mini') ? 'gpt-5.4-mini' : 'gpt-5.4';
+  if (has(m, 'gpt-6'))  return 'gpt-6-astra'; // unknown gpt-6 variant: top tier, not $0
   return null;
 }
 

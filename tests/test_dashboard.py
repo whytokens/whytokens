@@ -781,10 +781,10 @@ class TestStaticAssets(unittest.TestCase):
     def test_has_substring_matching(self):
         """Verify getPricing falls back to substring match for unknown models.
         "opus-" (not bare "opus") so local builds ending in "opus" stay unbilled."""
-        self.assertIn("m.includes('fable')", PRICING_JS)
-        self.assertIn("m.includes('opus-')", PRICING_JS)
-        self.assertIn("m.includes('sonnet')", PRICING_JS)
-        self.assertIn("m.includes('haiku')", PRICING_JS)
+        self.assertIn("has(m, 'fable')", PRICING_JS)
+        self.assertIn("has(m, 'opus-')", PRICING_JS)
+        self.assertIn("has(m, 'sonnet')", PRICING_JS)
+        self.assertIn("has(m, 'haiku')", PRICING_JS)
 
     def test_unknown_models_return_null(self):
         """Verify getPricing returns null for non-Anthropic models."""

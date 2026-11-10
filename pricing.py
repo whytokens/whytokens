@@ -166,16 +166,37 @@ def match(model):
     if model in PRICING:
         return model, "exact"
     for key in PRICING:
-        if model.startswith(key):
+        if model.startswith(key) and not _splits_number(key, model, 0):
             return key, "exact" if _DATED.fullmatch(model[len(key):]) else "prefix"
     # Substring fallback: match model family by keyword. Deliberately narrow —
     # non-priced providers (gpt-4o, glm-*, local models like qwen*) must stay
     # unmatched so they cost $0 rather than being mispriced.
     m = model.lower()
     for words, key in _KEYWORDS:
-        if any(w in m for w in words):
+        if any(_contains(m, w) for w in words):
             return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "keyword"
     return None, None
+
+
+def _splits_number(word, s, at):
+    """True when `word` (found in s at index `at`) ends mid-number: "fable-5-2" inside
+    "fable-5-20260610" is a 5.0 id plus a date, not version 5.2."""
+    end = at + len(word)
+    return _ascii_digit(word[-1:]) and _ascii_digit(s[end:end + 1])  # ASCII only, like JS \d
+
+
+def _ascii_digit(c):
+    return c.isascii() and c.isdigit()
+
+
+def _contains(s, word):
+    """`word` occurs in s somewhere it does not end mid-number (see _splits_number)."""
+    at = s.find(word)
+    while at != -1:
+        if not _splits_number(word, s, at):
+            return True
+        at = s.find(word, at + 1)
+    return False
 
 
 # First hit wins, so a narrower keyword sits above its family's catch-all.

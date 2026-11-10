@@ -1,7 +1,8 @@
 """Guard the guard: break, one at a time in a temp copy of the repo, the price resolver's
 match order and its "how was this id priced" answer, the list of fallback-priced models
 (DB helper and API), the fast-mode speed switch as an expected cache rebuild, and the UTC
-"Last N days" step. Each mutant must turn its tests red.
+"Last N days" step, the version-number boundary in both resolvers, and the JS
+keyword fallbacks. Each mutant must turn its tests red.
 
     python scripts/falsify_pricing.py
 """
@@ -22,7 +23,7 @@ MUTANTS = [
     # a dated snapshot of a listed model reported as a guess
     ("pricing.py", 'return key, "exact" if _DATED.fullmatch(model[len(key):]) else "prefix"', 'return key, "prefix"', PRICING),
     # prefix scan no longer first-wins in table order (a 5.2 id falls to the 5.0 row)
-    ("pricing.py", "    for key in PRICING:\n        if model.startswith(key):", "    for key in reversed(list(PRICING)):\n        if model.startswith(key):", PRICING),
+    ("pricing.py", "    for key in PRICING:\n        if model.startswith(key) and", "    for key in reversed(list(PRICING)):\n        if model.startswith(key) and", PRICING),
     ("pricing.py", '    (("fable-5-2", "mythos-5-2"), "claude-fable-5-2"),\n', "", PRICING),
     ("pricing.py", 'return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "keyword"', 'return key, "keyword"', PRICING),
     ("pricing.py", 'return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "keyword"', 'return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "exact"', PRICING),
@@ -44,6 +45,17 @@ MUTANTS = [
     # UTC display: stepping back in local days, or one day too many
     ("static/modules/app.js", "if (displayTZ === 'utc') d.setUTCDate(", "if (false) d.setUTCDate(", RANGE),
     ("static/modules/app.js", "d.setUTCDate(d.getUTCDate() - (days - 1));", "d.setUTCDate(d.getUTCDate() - days);", RANGE),
+    # version boundary: a dated 5.0 id ("claude-fable-5-20260610") read as 5.2, prefix or keyword
+    ("pricing.py", "if model.startswith(key) and not _splits_number(key, model, 0):", "if model.startswith(key):", PRICING),
+    ("pricing.py", "if any(_contains(m, w) for w in words):", "if any(w in m for w in words):", PRICING),
+    ("pricing.py", "    return _ascii_digit(word[-1:]) and _ascii_digit(s[end:end + 1])", "    return False", PRICING),
+    ("pricing.py", "    return c.isascii() and c.isdigit()", "    return c.isdigit()", PRICING),  # Unicode digit: Python and JS disagree
+    ("static/modules/pricing.js", "if (model.startsWith(key) && !splitsNumber(key, model, 0)) return key;", "if (model.startsWith(key)) return key;", PRICING),
+    ("static/modules/pricing.js", "if (!splitsNumber(word, s, at)) return true;", "return true;", PRICING),
+    # the JS 5.2 / 5.1 fallbacks dead (Codex 11-10: source-string tests stayed green)
+    ("static/modules/pricing.js", "if (has(m, 'fable-5-2') || has(m, 'mythos-5-2'))", "if (false && (has(m, 'fable-5-2') || has(m, 'mythos-5-2')))", PRICING),
+    ("static/modules/pricing.js", "if (has(m, 'fable-5-1') || has(m, 'mythos-5-1'))", "if (false)", PRICING),
+    ("static/modules/pricing.js", "if (has(m, 'fable') || has(m, 'mythos'))", "if (has(m, 'fable'))", PRICING),
 ]
 
 
