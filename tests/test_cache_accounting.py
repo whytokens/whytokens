@@ -35,6 +35,12 @@ console.log(JSON.stringify({
   savings: P.calcCostBreakdown(d.model, 0, 0, 1e6, 1e6, d.day, 1e6).cache_savings,
   savings5m: P.calcCostBreakdown(d.model, 0, 0, 0, 1e6, d.day, 0).cache_savings,
   cold: P.coldRestarts(turns),
+  rows: P.toolBreakdown(turns.map((x, i) => ({ ...x, tool: i === 0 ? 'ToolSearch' : i === 1 ? null : 'Read' }))),
+  uncachedFirst: P.toolBreakdown([
+    { actor: 'main', gap_s: null, tool: null, model: d.model, timestamp: d.day, input: 5000, output: 0, cache_read: 0, cache_creation: 0, cache_creation_1h: 0 },
+    { actor: 'main', gap_s: 1, tool: 'Read', model: d.model, timestamp: d.day, input: 0, output: 0, cache_read: 0, cache_creation: 10000, cache_creation_1h: 0 },
+  ]).map(x => [x.tool, x.cache_creation]),
+  whole: turns.reduce((a, x) => a + P.rowCost(x, d.day), 0),
 }));
 """
 
@@ -66,6 +72,33 @@ class TestCacheAccounting(unittest.TestCase):
         self.assertEqual(r["cold"]["tokens"], 182000)
         want = (177000 * p["cache_write_1h"] + 5000 * p["cache_write"]) / 1e6
         self.assertAlmostEqual(r["cold"]["cost"], want, places=6)
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_tool_table_has_cold_and_opening_rows(self):
+        p = pricing.get_pricing(MODEL, DAY)
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(_JS, Path(tmp) / "pricing.mjs")
+            (Path(tmp) / "payload.json").write_text(json.dumps(
+                {"pricing": pricing.PRICING, "model": MODEL, "day": DAY}))
+            out = subprocess.run(["node", "--input-type=module", "-e", SCRIPT], cwd=tmp,
+                                 capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        r = json.loads(out.stdout)
+        rows = {x["tool"]: x for x in r["rows"]}
+        # turn 1 (ToolSearch) = opening prefix; turn 2 (<none>) = cold restart; turn 4 (Read, 5m write, gap 400s) = cold
+        self.assertEqual(rows["opening prefix"]["cache_creation"], 100000)
+        self.assertAlmostEqual(rows["opening prefix"]["cost"], 100000 * p["cache_write_1h"] / 1e6, places=6)
+        self.assertEqual(rows["cold restart"]["cache_creation"], 182000)
+        self.assertEqual(rows["cold restart"]["turns"], 2)
+        # the tool rows no longer carry those writes
+        self.assertEqual(rows["ToolSearch"]["cache_creation"], 0)
+        self.assertAlmostEqual(rows["ToolSearch"]["cost"], 0, places=9)
+        self.assertEqual(rows["<none>"]["cache_creation"], 0)
+        self.assertEqual(rows["Read"]["cache_creation"], 5000 + 50000)  # warm 5k + subagent 50k stay
+        self.assertAlmostEqual(sum(x["cost"] for x in r["rows"]), r["whole"], places=6)
+        # the first write counts as the opening prefix even when turn 1 wrote no cache
+        self.assertIn(["opening prefix", 10000], r["uncachedFirst"])
+        self.assertIn(["Read", 0], r["uncachedFirst"])
 
 
 if __name__ == "__main__":

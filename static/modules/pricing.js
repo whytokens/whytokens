@@ -276,19 +276,62 @@ export function cacheShare(r) {
 }
 
 /**
- * Cold restarts: main-thread turns that rewrote the prefix after idling past the cache TTL
- * (1h when the rewrite was written at the 1h tier, else 5m). `turns` are session-detail turns
- * (gap_s is per actor, so a subagent turn never hides a main-thread gap).
+ * Why each turn wrote the prefix (parallel to `turns`; null = no attributable rewrite).
+ * 'opening': the first main-thread turn that wrote cache. 'cold': a later main-thread write
+ * after idling past the cache TTL (1h when written at the 1h tier, else 5m). `turns` are
+ * session-detail turns (gap_s is per actor, so a subagent turn never hides a main-thread gap).
+ * waste.py `_ttl` mirrors the TTL rule.
+ */
+export function rewriteKinds(turns) {
+  let opened = false;
+  return turns.map(t => {
+    if (t.actor !== 'main' || !t.cache_creation) return null;
+    if (!opened) { opened = true; return 'opening'; }
+    return t.gap_s != null && t.gap_s > (t.cache_creation_1h > 0 ? 3600 : 300) ? 'cold' : null;
+  });
+}
+
+/**
+ * Cold restarts: main-thread turns that rewrote the prefix after idling past the cache TTL.
  * @returns {{count: number, tokens: number, cost: number}}
  */
 export function coldRestarts(turns) {
   const out = { count: 0, tokens: 0, cost: 0 };
-  for (const t of turns) {
-    if (t.actor !== 'main' || t.gap_s == null || !t.cache_creation) continue;
-    if (t.gap_s <= (t.cache_creation_1h > 0 ? 3600 : 300)) continue;
+  const kinds = rewriteKinds(turns);
+  turns.forEach((t, i) => {
+    if (kinds[i] !== 'cold') return;
     out.count++;
     out.tokens += t.cache_creation;
     out.cost += rowCostBreakdown(t, (t.timestamp || '').slice(0, 10)).cache_creation;
-  }
+  });
   return out;
+}
+
+/**
+ * Drilldown tool table rows. A cold-restart or opening-prefix write is charged to its own
+ * row, not to the turn's tool (or '<none>'): tool rows keep only their own cost.
+ * Rows sum to the same total as pricing every turn whole.
+ */
+export function toolBreakdown(turns) {
+  const rows = {};
+  const row = tool => rows[tool] ||= { tool, turns: 0, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 };
+  const kinds = rewriteKinds(turns);
+  for (const [i, t] of turns.entries()) {
+    const b = rowCostBreakdown(t, (t.timestamp || '').slice(0, 10));
+    const kind = kinds[i];
+    const r = row(t.tool || '<none>');
+    r.turns++;
+    r.input += t.input || 0;
+    r.output += t.output || 0;
+    r.cache_read += t.cache_read || 0;
+    if (!kind) r.cache_creation += t.cache_creation || 0;
+    r.cost += kind ? b.total - b.cache_creation : b.total;
+    if (kind) {
+      const k = row(kind === 'cold' ? 'cold restart' : 'opening prefix');
+      k.turns++;
+      k.cache_creation += t.cache_creation;
+      k.cost += b.cache_creation;
+    }
+  }
+  return Object.values(rows).sort((a, b) => b.cost - a.cost);
 }

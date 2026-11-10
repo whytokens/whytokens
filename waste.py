@@ -16,12 +16,13 @@ import pricing
 from scanner import ADVISOR_ID_PREFIX, AGENT_SUMMARY_ID_PREFIX
 
 
-CAUSES = ("resident_output", "repeated_reads", "subagent_preamble", "idle_gap", "uncached_input")
+CAUSES = ("resident_output", "repeated_reads", "subagent_preamble", "idle_gap", "uncached_input",
+          "cache_miss_rebuild")
 # Evidence tiers (plan decision 4). Nothing here is measured before/after, so no cause may
 # claim "demonstrated saving" until v1.1.
 TIERS = {"resident_output": "attributed cause", "repeated_reads": "attributed cause",
          "subagent_preamble": "attributed cause", "idle_gap": "attributed cause",
-         "uncached_input": "observation"}
+         "uncached_input": "observation", "cache_miss_rebuild": "attributed cause"}
 # One pricing basis for findings and totals: pricing.calc_cost at API list rate.
 BASIS = {"pricing": "API list rate",
          "label": "attributed, lower bound, at API list rate; not savings"}
@@ -29,6 +30,10 @@ BASIS = {"pricing": "API list rate",
 _MEASURED = {"claude"}
 _WHY = {"codex": "Codex reports cached input but no cache-write tokens, tool-call file paths or "
                  "sidechain turns, so this detector has no signal"}
+# Causes inferred (not observed) for a source: Codex has no cache-write, so resident_output is read
+# from per-request input growth (input + cache_read) after a tool call.
+_INFERRED = {"codex": {"resident_output": "inferred from per-request input growth after a tool call "
+                                          "(Codex reports no cache-write tokens); not observed"}}
 _WHY_DEFAULT = "no detector is validated for this source"
 def _synthetic(row):
     """Scanner-minted estimate rows. An advisor row under a parent with no message.id is
@@ -45,9 +50,10 @@ def measurement(db_path):
         sources = sorted({r[0] or "claude" for r in conn.execute("SELECT DISTINCT agent FROM turns")})
     finally:
         conn.close()
-    cell = lambda src: ({"status": "measured", "reason": ""} if src in _MEASURED else
-                        {"status": "not measurable", "reason": _WHY.get(src, _WHY_DEFAULT)})
-    return {"sources": sources, "causes": {c: {s: cell(s) for s in sources} for c in CAUSES}}
+    cell = lambda src, cause: ({"status": "measured", "reason": ""} if src in _MEASURED else
+                               {"status": "inferred", "reason": _INFERRED[src][cause]} if cause in _INFERRED.get(src, ()) else
+                               {"status": "not measurable", "reason": _WHY.get(src, _WHY_DEFAULT)})
+    return {"sources": sources, "causes": {c: {s: cell(s, c) for s in sources} for c in CAUSES}}
 
 
 def _calls(row):
@@ -87,6 +93,18 @@ def _claim(claims, cause, turn, tokens, detail, tool, inp=False):
                               "message_id": turn["message_id"], "agent_id": turn["agent_id"]})
 
 
+def _codex_resident(claims, turn, state):
+    """Codex resident_output: context growth (input + cache_read) over the previous request, when
+    that request called a tool. Charged at the fresh-input rate, capped at the turn's fresh input."""
+    ctx = (turn["input_tokens"] or 0) + (turn["cache_read_tokens"] or 0)
+    grown = min(ctx - state["ctx"], turn["input_tokens"] or 0) if state["tool"] else 0
+    if grown > 0:
+        _claim(claims, "resident_output", turn, grown, (state["tool_name"] or "tool", grown),
+               state["tool_name"], inp=True)
+    state.update(ctx=ctx, tool=bool(_calls(turn) or turn["tool_name"]) and not turn["is_compact_summary"],
+                 tool_name=turn["tool_name"])
+
+
 def _gap(a, b):
     try:
         return datetime.fromisoformat(b.replace("Z", "+00:00")) - datetime.fromisoformat(a.replace("Z", "+00:00"))
@@ -94,13 +112,39 @@ def _gap(a, b):
         return None
 
 
+def _ttl(turn):
+    """Cache TTL in seconds for the tier this turn wrote at (static/modules/pricing.js rewriteKinds mirrors it)."""
+    return 3600 if (turn["cache_creation_1h_tokens"] or 0) > 0 else 300
+
+
+def _rebuild_reason(turn, prev):
+    """cache_miss_rebuild (Claude main chain only): a turn that rewrote most of the prefix its
+    predecessor had cached. Returns None (not a rebuild), ("expected", why) or ("unexpected", likely cause).
+    Expected: gap >= TTL, compaction, model switch. /clear starts a new session id, so it shows as an
+    opening prefix, never as a rebuild here."""
+    creation, read = turn["cache_creation_tokens"] or 0, turn["cache_read_tokens"] or 0
+    prefix = prev["prefix"]
+    if not creation or read * 2 >= prefix:
+        return None
+    gap = _gap(prev["timestamp"], turn["timestamp"])
+    if gap is not None and gap.total_seconds() >= prev["ttl"]:  # the cached prefix's tier, not the rewrite's
+        return "expected", f"idle {gap.total_seconds() / 60:.0f} min, past the {prev['ttl'] // 60} min cache TTL"
+    if turn["is_compact_summary"] or prev["compact"]:
+        return "expected", "context compaction"
+    if turn["model"] != prev["model"]:
+        return "expected", f"model switch ({prev['model']} to {turn['model']})"
+    return "unexpected", (f"read {read:,} of {prefix:,} cached tokens inside the TTL with no compaction or model switch: "
+                          "the prompt prefix changed (system prompt, tool set or settings edit)")
+
+
 MIN_SHARE = 0.10  # Claude Code /usage flags behaviors at >=10% of spend; same default here
 
 
-def report(db_path, session_id=None, min_share=MIN_SHARE):
+def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None):
     """Return thresholded, disjoint cost findings for one session or a database.
 
-    A cause is dropped when it is under min_share of its session's total $."""
+    A cause is dropped when it is under min_share of its session's total $.
+    If ``rebuilds`` is a list, expected cache rebuilds (reported, not waste) are appended to it."""
     db_path = Path(db_path).resolve().as_posix()
     # quote: an unencoded '#' or '?' in the path would silently open a different database
     conn = sqlite3.connect(f"file:{quote(str(db_path), safe='/:')}?mode=ro", uri=True)
@@ -121,7 +165,7 @@ def report(db_path, session_id=None, min_share=MIN_SHARE):
 
     sessions = {}
     for row in rows:
-        if (row["agent"] or "claude") not in _MEASURED:
+        if (row["agent"] or "claude") not in _MEASURED and "resident_output" not in _INFERRED.get(row["agent"], ()):
             continue  # unmeasurable sources attribute nothing; measurement() says so
         sessions.setdefault(row["session_id"], []).append(row)
     findings = []
@@ -129,7 +173,12 @@ def report(db_path, session_id=None, min_share=MIN_SHARE):
         claims = {cause: [0.0, [], []] for cause in CAUSES}
         seen_paths, previous_main, previous_turn = set(), None, None
         lanes = {}  # per-subagent state: each agent's cache prefix is its own
+        cclaims = {cause: [0.0, [], []] for cause in CAUSES}  # inferred-source claims, kept apart
+        cx = {"ctx": 0, "tool": False, "tool_name": None}
         for turn in turns:
+            if turn["agent"] in _INFERRED:  # per turn: a resumed session id can mix sources
+                _codex_resident(cclaims, turn, cx)
+                continue
             creation = turn["cache_creation_tokens"] or 0
             if _synthetic(turn):
                 # Scanner-minted estimates (advisor iterations, AgentSummary forks): their
@@ -171,6 +220,12 @@ def report(db_path, session_id=None, min_share=MIN_SHARE):
                     # same tokens as cache reads = what a warm (or compacted-and-warm) cache would have billed
                     warm = pricing.calc_cost(turn["model"], 0, 0, creation, 0, turn["timestamp"]) * turn["mult"]
                     _claim(claims, "idle_gap", turn, creation, (gap, creation, warm), None)
+                elif (why := _rebuild_reason(turn, previous_main)):
+                    if why[0] == "unexpected":
+                        _claim(claims, "cache_miss_rebuild", turn, creation, why[1], None)
+                    elif rebuilds is not None:
+                        rebuilds.append({"session_id": sid, "at": turn["timestamp"], "tokens": creation,
+                                         "usd": _cost(turn, creation=creation), "reason": why[1]})
                 elif not compact and previous_main["repeated"]:
                     _claim(claims, "repeated_reads", turn, creation, (previous_main["repeated"], creation), "Read")
                 elif not compact and previous_main["has_tool"]:
@@ -179,7 +234,9 @@ def report(db_path, session_id=None, min_share=MIN_SHARE):
             if ((turn["agent"] or "claude") == "claude" and not (turn["cache_read_tokens"] or 0)
                     and not creation and (turn["input_tokens"] or 0)):
                 _claim(claims, "uncached_input", turn, turn["input_tokens"], turn["input_tokens"], None, inp=True)
-            previous_main = {"timestamp": turn["timestamp"], "has_tool": has_tool,
+            previous_main = {"timestamp": turn["timestamp"], "has_tool": has_tool, "model": turn["model"],
+                             "compact": compact,
+                             "ttl": _ttl(turn) if creation else (previous_main or {}).get("ttl", 300), "prefix": (turn["cache_read_tokens"] or 0) + creation,
                              "repeated": repeated, "tool_name": turn["tool_name"]}
             previous_turn = turn
 
@@ -188,7 +245,8 @@ def report(db_path, session_id=None, min_share=MIN_SHARE):
                                       t["timestamp"], t["cache_creation_1h_tokens"] or 0) * t["mult"]
                     for t in turns)
         floor = max(.01, total * min_share)
-        for cause, (usd, details, evidence) in claims.items():
+        for cause, (usd, details, evidence), inferred in ([(c, v, False) for c, v in claims.items()] +
+                                                          [(c, v, True) for c, v in cclaims.items()]):
             if usd < floor:
                 continue
             if cause == "resident_output":
@@ -197,7 +255,7 @@ def report(db_path, session_id=None, min_share=MIN_SHARE):
                 names = ", ".join(f"{name} ({tokens:,})" for tokens, name in ranked[:3])
                 if len(ranked) > 3:
                     names += f" (+{len(ranked) - 3} more)"
-                detail, fix = (f"{names} caused {sum(n for _, n in details):,} cache-write tokens of context growth.",
+                detail, fix = (f"{names} caused {sum(n for _, n in details):,} {'input' if inferred else 'cache-write'} tokens of context growth.",
                                "Trim or summarize tool output before it returns to the conversation.")
             elif cause == "repeated_reads":
                 # basenames only: findings are shown and shared, full paths carry usernames
@@ -216,11 +274,16 @@ def report(db_path, session_id=None, min_share=MIN_SHARE):
                                ("Start a fresh session instead of resuming a stale one; re-onboard from the handoff file."
                                 if minutes > 240 else
                                 "Resume before the cache expires, or compact context before a long pause."))
+            elif cause == "cache_miss_rebuild":
+                detail, fix = (f"{len(details)} unexpected cache miss{'' if len(details) == 1 else 'es'} rewrote "
+                               f"{sum(e['tokens'] for e in evidence):,} cache tokens; likely cause: {details[0]}.",
+                               "Keep the system prompt, tool set and settings stable within a session.")
             else:
                 detail, fix = (f"{sum(details):,} input tokens were billed without a cache read or write.",
                                "Keep repeated prompt material in a cacheable prefix.")
+            tier = "inferred" if inferred else TIERS[cause]
             top = sorted(evidence, key=lambda e: e["usd"], reverse=True)[:5]
             findings.append({"cause": cause, "session_id": sid, "usd": usd, "detail": detail, "fix": fix,
-                             "tier": TIERS[cause], "advice": f"{TIERS[cause].capitalize()}: {fix}",
+                             "tier": tier, "advice": f"{tier.capitalize()}: {fix}",
                              "evidence": top, "session_usd": total})
     return sorted(findings, key=lambda finding: finding["usd"], reverse=True)

@@ -15,14 +15,20 @@ ROOT = Path(__file__).resolve().parent.parent
 MUTANTS = [
     ("waste.py", '_MEASURED = {"claude"}', '_MEASURED = {"claude", "codex"}'),
     ("waste.py", '"uncached_input": "observation"', '"uncached_input": "demonstrated saving"'),
-    ("waste.py", 'f"{TIERS[cause].capitalize()}: {fix}"', "fix"),
+    ("waste.py", 'f"{tier.capitalize()}: {fix}"', "fix"),
     ("waste.py", '"evidence": top,', '"evidence": [],'),
     ("waste.py", '"session_usd": total', '"session_usd": 0.0'),
-    ("waste.py", "floor = max(.01, total * .05)", "floor = 0.0"),
+    ("waste.py", "floor = max(.01, total * min_share)", "floor = 0.0"),
     ("waste.py", '"label": "attributed, lower bound, at API list rate; not savings"', '"label": "savings"'),
     ("waste.py", '"reason": _WHY.get(src, _WHY_DEFAULT)}', '"reason": ""}'),
     ("waste.py", 'sorted({r[0] or "claude" for r in', 'sorted({"claude" for r in'),
-    ("waste.py", 'if (row["agent"] or "claude") not in _MEASURED:', 'if False:'),
+    ("waste.py", 'if (row["agent"] or "claude") not in _MEASURED and', 'if False and'),
+    # Codex resident_output (inferred)
+    ("waste.py", 'if turn["agent"] in _INFERRED:', 'if turns[0]["agent"] in _INFERRED:'),
+    ("waste.py", 'if state["tool"] else 0', "if True else 0"),
+    ("waste.py", "min(ctx - state[\"ctx\"], turn[\"input_tokens\"] or 0)", "ctx"),
+    ("waste.py", '"tier": tier,', '"tier": TIERS[cause],'),
+    ("waste.py", '{"status": "inferred", "reason"', '{"status": "not measurable", "reason"'),
     ("static/modules/format.js", ".replace(/\"/g, '&quot;')", ""),
     ("api.py", 'r["sessions"] += 1', 'r["sessions"] += 2'),
     ("api.py", '"total_usd": sum(f["usd"] for f in findings)', '"total_usd": 0.0'),
@@ -57,7 +63,7 @@ MUTANTS = [
     ("static/modules/app.js", "document.querySelectorAll('.range-btn[data-range]').forEach(btn =>\n    btn.classList",
      "document.querySelectorAll('.range-btn').forEach(btn =>\n    btn.classList"),
 ]
-TESTS = ["tests.test_waste", "tests.test_waste_tab", "tests.test_waste_view"]
+TESTS = ["tests.test_waste", "tests.test_waste_tab", "tests.test_waste_view", "tests.test_waste_codex"]
 
 
 def run(tree):

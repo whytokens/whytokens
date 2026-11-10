@@ -693,6 +693,8 @@ def get_waste(db_path=None):
         r = rollup.setdefault(f["cause"], {"cause": f["cause"], "tier": f["tier"], "usd": 0.0, "sessions": 0})
         r["usd"] += f["usd"]
         r["sessions"] += 1
+        if r["tier"] != f["tier"]:
+            r["tier"] = "inferred"  # mixed sources: show the weaker tier
     return {"basis": waste.BASIS, "findings": findings, "total_usd": sum(f["usd"] for f in findings),
             "rollup": sorted(rollup.values(), key=lambda r: r["usd"], reverse=True),
             "measurement": waste.measurement(db_path)}

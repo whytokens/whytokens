@@ -63,7 +63,7 @@ class TestMeasurement(_Scanned):
         self.assertEqual(m["sources"], ["claude", "codex"])
         for cause in CAUSES:
             cell = m["causes"][cause]["codex"]
-            self.assertEqual(cell["status"], "not measurable", cause)
+            self.assertEqual(cell["status"], "inferred" if cause == "resident_output" else "not measurable", cause)
             self.assertTrue(cell["reason"].strip(), cause)
             self.assertEqual(m["causes"][cause]["claude"]["status"], "measured")
 

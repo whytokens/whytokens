@@ -14,7 +14,7 @@ import {
   loadPricing, setOverride, clearOverrides,
   isBillable, isEstimated, getPricing, calcCost, rowCost, rowCostBreakdown,
   sessionCost, sessionCostBreakdown, sessionCostAtListRates,
-  cacheShare, coldRestarts,
+  cacheShare, coldRestarts, toolBreakdown,
 } from './pricing.js';
 import { VALID_TABS, resolveTab, applyTabVisibility, addExtRailItem, toggleRail, initRail } from './nav.js';
 import { store, TZ_KEY, alpha, fillTokens, initTheme, setThemePref } from './theme.js';
@@ -865,7 +865,7 @@ function renderToolSection() {
 const CAUSE_LABEL = {
   resident_output: 'Tool output kept in context', repeated_reads: 'Repeated file reads',
   subagent_preamble: 'Subagent preambles', idle_gap: 'Idle gaps (cache expiry)',
-  uncached_input: 'Uncached input',
+  uncached_input: 'Uncached input', cache_miss_rebuild: 'Unexpected cache misses',
 };
 // Finding drawer: what happened, the fix, the evidence calls as a mini-trace, then the full
 // trace with those calls highlighted. Evidence message_ids ride along on the button.
@@ -893,6 +893,7 @@ function groupWaste(findings, sessions, cause = null) {
   for (const f of inScope) {
     const c = causes.get(f.cause) || { cause: f.cause, tier: f.tier, usd: 0, sessions: 0 };
     c.usd += f.usd; c.sessions++;
+    if (c.tier !== f.tier) c.tier = 'inferred';  // mixed sources: show the weaker tier
     causes.set(f.cause, c);
   }
   if (!causes.has(cause)) cause = null;
@@ -901,6 +902,7 @@ function groupWaste(findings, sessions, cause = null) {
     const s = byId.get(f.session_id), key = s.project + '\u0000' + f.cause;
     const g = groups.get(key) || { project: s.project, cause: f.cause, tier: f.tier, fix: f.fix, usd: 0, spend: 0, sessions: [] };
     g.usd += f.usd; g.spend += f.session_usd;
+    if (g.tier !== f.tier) g.tier = 'inferred';
     g.sessions.push({ id: f.session_id, title: s.topic || '', date: s.last_date, usd: f.usd,
                       session_usd: f.session_usd, detail: f.detail, evidence: f.evidence });
     groups.set(key, g);
@@ -1041,9 +1043,12 @@ async function renderWasteTab() {
   const measured = m.sources.filter(s => causesM.every(c => m.causes[c][s].status === 'measured'));
   const not = m.sources.filter(s => !measured.includes(s));
   el('waste-measure-line').textContent = 'Measured for: ' + (measured.join(', ') || 'none') +
-    (not.length ? ' · Not measurable: ' + not.join(', ') + ' (why?)' : '');
+    (not.length ? ' · Not fully measurable: ' + not.join(', ') + ' (why?)' : '');
   el('waste-measure').innerHTML = not.length ? '<tbody>' + not.map(s => {
-    const reasons = [...new Set(causesM.map(c => m.causes[c][s]).filter(x => x.status !== 'measured').map(x => x.reason))];
+    const reasons = [...new Set(causesM.filter(c => m.causes[c][s].status !== 'measured').map(c => {
+      const x = m.causes[c][s];
+      return x.status === 'inferred' ? label(c) + ': inferred (' + x.reason + ')' : x.reason;
+    }))];
     return `<tr><td>${esc(s)}</td><td class="muted">${reasons.map(esc).join('<br>')}</td></tr>`;
   }).join('') + '</tbody>' : '';
   el('waste-measure-wrap').classList.toggle('plain', !not.length);  // coverage stays visible; no reasons to expand
@@ -1899,19 +1904,7 @@ function fmtGap(sec) {
 function fmtWall(sec) { return fmtGap(sec); }
 
 function renderSessionToolBreakdown(turns) {
-  const byTool = {};
-  for (const t of turns) {
-    const tool = t.tool || '<none>';
-    if (!byTool[tool]) byTool[tool] = { tool, turns: 0, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 };
-    const row = byTool[tool];
-    row.turns++;
-    row.input += t.input || 0;
-    row.output += t.output || 0;
-    row.cache_read += t.cache_read || 0;
-    row.cache_creation += t.cache_creation || 0;
-    row.cost += rowCost(t, t.timestamp.slice(0, 10));
-  }
-  const rows = Object.values(byTool).sort((a, b) => b.cost - a.cost);
+  const rows = toolBreakdown(turns);
   const totalCost = rows.reduce((sum, r) => sum + r.cost, 0);
   document.getElementById('session-tool-breakdown-body').innerHTML = rows.map(r => {
     return `<tr>

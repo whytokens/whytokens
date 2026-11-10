@@ -39,7 +39,8 @@ from scanner import scan
 
 MODEL = "claude-sonnet-4-6"
 T0 = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
-CAUSES = ("resident_output", "repeated_reads", "subagent_preamble", "idle_gap", "uncached_input")
+CAUSES = ("resident_output", "repeated_reads", "subagent_preamble", "idle_gap", "uncached_input",
+          "cache_miss_rebuild")
 KEYS = {"cause", "session_id", "usd", "detail", "fix", "tier", "advice", "evidence", "session_usd"}
 
 
