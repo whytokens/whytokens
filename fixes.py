@@ -31,7 +31,11 @@ def record_fix(conn, project, cause, note, when=None, file_path=None):
     if cause not in waste.CAUSES:
         raise ValueError(f"unknown cause {cause!r}; one of {', '.join(waste.CAUSES)}")
     when = when or date.today().isoformat()
-    when = date.fromisoformat(when).isoformat()  # reject malformed, store canonical (compared as text)
+    # Reject malformed, store canonical (compared as text). date.fromisoformat reads the
+    # compact form (20260901) only from Python 3.11; we support 3.9, so expand it first.
+    if len(when) == 8 and when.isascii() and when.isdigit():
+        when = f"{when[:4]}-{when[4:6]}-{when[6:]}"
+    when = date.fromisoformat(when).isoformat()
     if not conn.execute("SELECT 1 FROM sessions WHERE project_name = ? LIMIT 1", (project,)).fetchone():
         raise ValueError(f"unknown project {project!r}")
     cur = conn.execute(
