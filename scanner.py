@@ -153,7 +153,7 @@ COLUMN_MIGRATIONS = {
 }
 
 CORE_TABLES = ("sessions", "turns", "processed_files", "schema_meta", "agents",
-               "tool_results")
+               "tool_results", "fixes")
 CORE_INDEXES = ("idx_turns_session", "idx_turns_timestamp", "idx_sessions_first",
                 "idx_agents_type", "idx_tool_results_message", "idx_tool_results_session",
                 "idx_turns_agent_id", "idx_turns_message_id")
@@ -289,6 +289,17 @@ def init_db(conn):
             message_id   TEXT,
             tool_name    TEXT,
             result_bytes INTEGER
+        );
+
+        -- Recorded waste fixes (`whytokens fix record`); `verify` compares before/after.
+        CREATE TABLE IF NOT EXISTS fixes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            fix_date    TEXT NOT NULL,
+            project     TEXT NOT NULL,
+            cause       TEXT NOT NULL,
+            note        TEXT,
+            file_hash   TEXT,
+            recorded_at TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);

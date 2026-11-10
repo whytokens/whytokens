@@ -140,7 +140,7 @@ def _rebuild_reason(turn, prev):
 MIN_SHARE = 0.10  # Claude Code /usage flags behaviors at >=10% of spend; same default here
 
 
-def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None):
+def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd=.01):
     """Return thresholded, disjoint cost findings for one session or a database.
 
     A cause is dropped when it is under min_share of its session's total $.
@@ -244,10 +244,10 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None):
                                       t["cache_read_tokens"] or 0, t["cache_creation_tokens"] or 0,
                                       t["timestamp"], t["cache_creation_1h_tokens"] or 0) * t["mult"]
                     for t in turns)
-        floor = max(.01, total * min_share)
+        floor = max(min_usd, total * min_share)
         for cause, (usd, details, evidence), inferred in ([(c, v, False) for c, v in claims.items()] +
                                                           [(c, v, True) for c, v in cclaims.items()]):
-            if usd < floor:
+            if not evidence or usd < floor:  # min_usd=0 (verify) must still skip causes that never fired
                 continue
             if cause == "resident_output":
                 ranked = sorted(((sum(n for other, n in details if other == name), name)

@@ -19,6 +19,7 @@ import {
 import { VALID_TABS, resolveTab, applyTabVisibility, addExtRailItem, toggleRail, initRail } from './nav.js';
 import { store, TZ_KEY, alpha, fillTokens, initTheme, setThemePref } from './theme.js';
 import { weekOf, promptBands, turnsOfBand, sessionWaterfall, causeWeekMatrix } from './analytics.js';
+import { verifySlot, fillVerifySlots, resetVerify } from './verify.js';
 import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchStatus } from './api.js';
 
 // Chart.js is loaded as a classic UMD script before this module (see index.html),
@@ -1006,7 +1007,7 @@ async function renderWasteTab() {
   const el = id => document.getElementById(id);
   if (!wastePayload) {
     const gen = wasteGen;
-    if (!wasteFetch || wasteFetch.gen !== gen) wasteFetch = { gen, promise: fetchWaste() };
+    if (!wasteFetch || wasteFetch.gen !== gen) { resetVerify(); wasteFetch = { gen, promise: fetchWaste() }; }
     let payload = null;
     const req = wasteFetch;
     // a failed request is forgotten so the next render retries, unless a newer one replaced it
@@ -1077,7 +1078,7 @@ async function renderWasteTab() {
     `<span class="wg-project">${esc(g.project)}</span><span>${esc(label(g.cause))}</span>` +
     `<span class="num">${fmtCostBig(g.usd)}</span>` +
     `<span class="muted num">${g.sessions.length} session${g.sessions.length === 1 ? '' : 's'} · ${fmtPct(g.spend ? g.usd / g.spend : 0)} of their spend</span>` +
-    `</summary><p class="wg-fix"><strong>Fix:</strong> ${esc(g.fix)} <span class="muted">(${esc(g.tier)})</span></p>` +
+    `</summary><p class="wg-fix"><strong>Fix:</strong> ${esc(g.fix)} <span class="muted">(${esc(g.tier)})</span></p>` + verifySlot(g.project, g.cause) +
     '<table><thead><tr><th>Last active</th><th>Session</th><th>Attributed</th><th>Of session</th><th>What happened</th></tr></thead><tbody>' +
     g.sessions.map(s => `<tr><td class="muted">${esc(s.date || '')}</td>` +
       `<td><button class="link-btn" data-session="${esc(s.id)}" onclick="openSessionDetail(this.dataset.session)" title="Open trace">` +
@@ -1088,6 +1089,7 @@ async function renderWasteTab() {
   ).join('') + (shown.length < v.groups.length
     ? `<button class="filter-btn" onclick="showAllWaste()">Show all ${v.groups.length} habits</button>` : '')
     || '<p class="muted">No material waste found.</p>';
+  fillVerifySlots(el('waste-groups'));
 }
 
 // ── Tabs ────────────────────────────────────────────────────────────────────

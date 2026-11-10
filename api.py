@@ -23,6 +23,7 @@ Routes:
   GET  <extension routes>      -> consulted after the core routes above
   GET  /api/live?session_id|cwd -> get_live_session()  (transcript-direct, no DB)
   GET  /api/waste              -> waste findings, rollup, measurement status (API list rate)
+  GET  /api/fixes              -> recorded fixes with before/after verification
   GET  /api/pricing            -> the single-source pricing table (pricing.PRICING)
   GET  /icon.svg               -> resources/icon.svg (header icon)
   POST /api/rescan             -> incremental sources.scan_all() (non-destructive)
@@ -678,6 +679,22 @@ def get_session_detail(session_id, db_path=None):
     return result
 
 
+def get_fixes(db_path=None):
+    """Recorded fixes with their before/after verification (Waste tab verify slot)."""
+    import fixes
+    db_path = db_path or DB_PATH
+    if not Path(db_path).exists():
+        return {"results": []}
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:  # no fixes table until init_db has run on this DB: list is empty, never an error
+        listed = fixes.list_fixes(conn) if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'fixes'").fetchone() else []
+    finally:
+        conn.close()
+    return {"results": [fixes.verify(db_path, f) for f in listed]}
+
+
 def get_waste(db_path=None):
     """Waste tab payload: findings, per-cause rollup, measurement status, one pricing basis."""
     import waste
@@ -1244,6 +1261,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/waste":
             self._send_json(get_waste())
+
+        elif path == "/api/fixes":
+            self._send_json(get_fixes())
 
         elif path == "/api/pricing":
             # The single source of truth for the price table, served so the

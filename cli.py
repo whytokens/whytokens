@@ -499,9 +499,67 @@ Usage:
                                          Current session's stats straight from its
                                              transcript (no DB, no scan) - cost, context, tokens
   whytokens waste [--session ID]         Attribute material session spend to avoidable causes
+  whytokens fix record --project P --cause C --note TEXT [--date YYYY-MM-DD] [--file PATH]
+                                         Record a waste fix (--file stores a hash of the CLAUDE.md/config changed)
+  whytokens fix list                     List recorded fixes
+  whytokens verify [FIX_ID]              Attributed share of spend for the fix's (project, cause),
+                                             after vs before; needs 10 sessions each side
+  whytokens pricing check [--offline]    Review diff of the shipped price table vs LiteLLM (OpenRouter
+                                             cross-check). Network call only here; --offline uses the cache
   whytokens dashboard [--projects-dir PATH] [--host HOST] [--unsafe-host] [--port PORT] [--no-browser]
                                              Scan + start dashboard (opens a browser unless --no-browser)
 """
+
+def cmd_fix(rest):
+    import fixes
+    sub = rest[0] if rest else ""
+    conn = require_db()
+    try:
+        if sub == "record":
+            need = [parse_named_arg(rest, f"--{k}") for k in ("project", "cause", "note")]
+            if not all(need):
+                print("usage: whytokens fix record --project P --cause C --note TEXT [--date YYYY-MM-DD] [--file PATH]")
+                sys.exit(2)
+            try:
+                fid = fixes.record_fix(conn, *need, when=parse_named_arg(rest, "--date"),
+                                       file_path=parse_named_arg(rest, "--file"))
+            except (ValueError, OSError) as e:
+                print(f"error: {e}")
+                sys.exit(2)
+            print(f"recorded fix #{fid}; run `whytokens verify {fid}` once enough sessions follow it")
+        elif sub == "list":
+            for f in fixes.list_fixes(conn):
+                print(f"#{f['id']} {f['fix_date']} {f['project']} / {f['cause']}: {f['note']}")
+        else:
+            print("usage: whytokens fix record|list ...")
+            sys.exit(2)
+    finally:
+        conn.close()
+
+
+def cmd_pricing(rest):
+    import pricing_check
+    if rest[:1] != ["check"]:
+        print("usage: whytokens pricing check [--offline]")
+        sys.exit(2)
+    lines, ok = pricing_check.check(offline="--offline" in rest)
+    print("\n".join(lines))
+    sys.exit(0 if ok else 1)
+
+
+def cmd_verify(fix_id=None):
+    import fixes
+    conn = require_db()
+    try:
+        todo = [f for f in fixes.list_fixes(conn) if fix_id in (None, str(f["id"]))]
+    finally:
+        conn.close()
+    if not todo:
+        print("No recorded fixes. Record one with `whytokens fix record`.")
+        return
+    for f in todo:
+        print(fixes.format_result(fixes.verify(DB_PATH, f)))
+
 
 COMMANDS = {
     "scan": cmd_scan,
@@ -511,6 +569,9 @@ COMMANDS = {
     "stats": cmd_stats,
     "live": cmd_live,
     "waste": cmd_waste,
+    "fix": cmd_fix,
+    "verify": cmd_verify,
+    "pricing": cmd_pricing,
     "export": cmd_export,
     "dashboard": cmd_dashboard,
 }
@@ -555,6 +616,12 @@ def main():
             cmd_export(as_json="--json" in rest)
         elif command == "waste":
             cmd_waste(parse_named_arg(rest, "--session"))
+        elif command == "fix":
+            cmd_fix(rest)
+        elif command == "pricing":
+            cmd_pricing(rest)
+        elif command == "verify":
+            cmd_verify(rest[0] if rest else None)
         else:
             COMMANDS[command]()
 

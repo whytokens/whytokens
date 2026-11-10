@@ -43,6 +43,13 @@ Scanning and analysis make no outbound connections (tested by patching `socket` 
 anything else. Requests need a loopback `Host`, a same-origin `Origin` when one is sent, and
 POSTs need the per-run token embedded in the served page.
 
+The one exception is `whytokens pricing check`, which you run by hand and which nothing else
+invokes. It sends plain GET requests, with no payload and no identifiers beyond a `whytokens`
+User-Agent, to two hosts: `raw.githubusercontent.com` (LiteLLM's price JSON, the source) and
+`openrouter.ai` (the public model list, a cross-check). Responses are cached in
+`~/.whytokens/pricing-cache/`; `--offline` reads only that cache. The result is a diff for you
+to review. It never changes the shipped price table.
+
 ## Deleting your data
 
 Delete the database file (`~/.whytokens/whytokens.db` plus its `-wal`/`-shm` files).

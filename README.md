@@ -17,7 +17,8 @@ and uncached input.
 - On macOS, Xcode's Claude agent transcripts: `~/Library/Developer/Xcode/CodingAssistant/ClaudeAgentConfig/projects/` (when present)
 
 Nothing else, unless you opt in (see [docs/DATA_POLICY.md](docs/DATA_POLICY.md)). There is
-no telemetry. Scanning and analysis make no outbound connections. The dashboard listens on
+no telemetry. Scanning and analysis make no outbound connections. The only network call is the manual
+`whytokens pricing check` (hosts: `raw.githubusercontent.com`, `openrouter.ai`). The dashboard listens on
 loopback only. The data policy lists exactly what is stored (token counts, timestamps,
 model names, project and branch names, session titles, tool names; not prompts, file
 contents or shell commands) and how to delete it.
@@ -31,12 +32,12 @@ Requires Python 3.9 or newer. No third-party dependencies.
 
 ```sh
 # one-off, no install
-uvx --from git+https://github.com/whytokens/whytokens@v0.1.0 whytokens dashboard
+uvx --from git+https://github.com/whytokens/whytokens@v0.2.0 whytokens dashboard
 
 # or install the command
-pipx install git+https://github.com/whytokens/whytokens@v0.1.0
+pipx install git+https://github.com/whytokens/whytokens@v0.2.0
 # or, with uv
-uv tool install git+https://github.com/whytokens/whytokens@v0.1.0
+uv tool install git+https://github.com/whytokens/whytokens@v0.2.0
 whytokens dashboard
 
 # or from a clone
@@ -79,6 +80,9 @@ Each command below can be run as `whytokens <command>` or `python cli.py <comman
 | `stats` | All-time statistics |
 | `live [--session ID] [--cwd PATH] [--json]` | Current session's cost, context and tokens straight from its transcript, no database |
 | `waste [--session ID]` | Avoidable-spend findings with a concrete fix each |
+| `fix record --project P --cause C --note TEXT [--date D] [--file PATH]`, `fix list` | Record a waste fix you made (optionally hashing the CLAUDE.md or config file you changed) |
+| `verify [FIX_ID]` | Attributed share of spend for the fix's project and cause, after versus before, with dollars. Needs 10 sessions on each side or it prints "insufficient data". Quality is not measured |
+| `pricing check [--offline]` | Review diff of the shipped price table against LiteLLM (OpenRouter cross-check). Never applied automatically; `--offline` uses the cache |
 | `dashboard [--projects-dir PATH] [--host HOST] [--port PORT] [--no-browser] [--unsafe-host]` | Scan, then serve the dashboard |
 
 `--projects-dir` overrides only the Claude location. Binding to anything other than
