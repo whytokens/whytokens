@@ -137,6 +137,9 @@ TURN_MIGRATIONS = {
 
 COLUMN_MIGRATIONS = {
     "turns": TURN_MIGRATIONS,
+    # ToolSearch results. loaded_tools = JSON list of the tool names whose schemas the
+    # result loaded (never the query text); NULL = not a ToolSearch result / transcript gone.
+    "tool_results": {"loaded_tools": "TEXT", "total_deferred_tools": "INTEGER"},
     "sessions": {
         "agent": "TEXT DEFAULT 'claude'",
         # Session topic (from custom-title / ai-title records). The one-time
@@ -411,6 +414,26 @@ def tool_result_sizes(record):
         else:
             n = 0
         yield b["tool_use_id"], n
+
+
+def deferred_loads(record):
+    """Yield (tool_use_id, loaded tool names, total_deferred_tools or None) for each ToolSearch
+    result in a user record. Names come from the ``tool_reference`` entries of the
+    tool_result content; the query text is never read. ``total_deferred_tools`` rides on the
+    record's ``toolUseResult``, which is unambiguous only when the record holds one result."""
+    content = (record.get("message") or {}).get("content")
+    blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"
+              and b.get("tool_use_id")] if isinstance(content, list) else []
+    tur = record.get("toolUseResult")
+    total = tur.get("total_deferred_tools") if isinstance(tur, dict) and len(blocks) == 1 else None
+    if isinstance(total, bool) or not isinstance(total, int):
+        total = None
+    for b in blocks:
+        c = b.get("content")
+        names = [x["tool_name"] for x in c if isinstance(x, dict) and x.get("type") == "tool_reference"
+                 and isinstance(x.get("tool_name"), str)] if isinstance(c, list) else []
+        if names:
+            yield b["tool_use_id"], list(dict.fromkeys(names)), total
 
 
 def _project_name_from_path(path):
@@ -886,6 +909,9 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=No
     session_meta = {}   # session_id -> dict
     line_count = 0
     prompt_seq = 0
+    # Claude Code flags a compaction on the USER record (isCompactSummary); the assistant
+    # turn answering it is the one that rebuilds the cache, so carry the flag forward.
+    pending_compact = {}  # session_id -> message_id of the turn that answered it (None until seen)
 
     try:
         with open(filepath, encoding="utf-8", errors="replace") as f:
@@ -987,10 +1013,17 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=No
                 if rtype == "user":
                     if is_user_prompt(record):
                         prompt_seq += 1
+                    if record.get("isCompactSummary"):
+                        pending_compact[session_id] = None
                     if calls_out is not None:
                         for cid, n in tool_result_sizes(record):
                             calls_out.setdefault(cid, {"call_id": cid, "session_id": session_id})[
                                 "result_bytes"] = n
+                        for cid, names, total in deferred_loads(record):
+                            row = calls_out.setdefault(cid, {"call_id": cid, "session_id": session_id})
+                            row["loaded_tools"] = list(dict.fromkeys(row.get("loaded_tools", []) + names))
+                            if total is not None:
+                                row["total_deferred_tools"] = total
 
                 if rtype == "assistant":
                     msg = record.get("message", {})
@@ -1027,6 +1060,12 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=No
                     if model:
                         session_meta[session_id]["model"] = model
                     sidechain = is_subagent_record(record, filepath)
+                    if session_id in pending_compact:
+                        # first message after the summary owns the flag (streamed records repeat its id)
+                        if pending_compact[session_id] in (None, message_id):
+                            pending_compact[session_id] = message_id
+                        else:
+                            del pending_compact[session_id]
 
                     turn = {
                         "session_id": session_id,
@@ -1050,7 +1089,7 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=No
                         # (isSidechain flag OR agentId OR a /subagents/ transcript path),
                         # not just the bare flag — see is_subagent_record.
                         "is_sidechain": 1 if sidechain else 0,
-                        "is_compact_summary": 1 if record.get("isCompactSummary") else 0,
+                        "is_compact_summary": 1 if record.get("isCompactSummary") or session_id in pending_compact else 0,
                         "agent_id": record_agent_id(record),
                         # Reasoning effort, written top-level on assistant records
                         # from Claude Code 2.1.215 (absent before → '').
@@ -1268,12 +1307,18 @@ def parse_jsonl_file(filepath, start_line=0, agents_out=None, calls_out=None):
         seq = {t["message_id"]: t.get("prompt_seq") for t in full if t.get("message_id")}
         for t in turns:
             t["prompt_seq"] = seq.get(t.get("message_id"))
+        # Same for the compaction flag: the summary record may sit before start_line.
+        compact = {t["message_id"] for t in full if t.get("message_id") and t.get("is_compact_summary")}
+        for t in turns:
+            if t.get("message_id") in compact:
+                t["is_compact_summary"] = 1
         # Id-less turns can't be keyed: the incremental ones are the tail of the
         # whole file's id-less turns, in order.
         inc = [t for t in turns if not t.get("message_id")]
         tail = [t for t in full if not t.get("message_id")][-len(inc):] if inc else []
         for t, f in zip(inc, tail):
             t["prompt_seq"] = f.get("prompt_seq")
+            t["is_compact_summary"] = t.get("is_compact_summary") or f.get("is_compact_summary", 0)
     _apply_estimates(filepath, turns, full, info)
     return metas, turns, n
 
@@ -1501,16 +1546,20 @@ def upsert_tool_results(conn, rows):
     one-time backfill walks files in name order) need not match."""
     rows = list(rows)
     conn.executemany("""
-        INSERT INTO tool_results (call_id, session_id, message_id, tool_name, result_bytes)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO tool_results (call_id, session_id, message_id, tool_name, result_bytes,
+                                  loaded_tools, total_deferred_tools)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(call_id) DO UPDATE SET
             -- Provisional: the UPDATE below re-homes the call to its turn's session.
             session_id   = COALESCE(tool_results.session_id, excluded.session_id),
             message_id   = COALESCE(excluded.message_id, tool_results.message_id),
             tool_name    = COALESCE(excluded.tool_name, tool_results.tool_name),
-            result_bytes = COALESCE(excluded.result_bytes, tool_results.result_bytes)
+            result_bytes = COALESCE(excluded.result_bytes, tool_results.result_bytes),
+            loaded_tools = COALESCE(excluded.loaded_tools, tool_results.loaded_tools),
+            total_deferred_tools = COALESCE(excluded.total_deferred_tools, tool_results.total_deferred_tools)
     """, [(r["call_id"], r.get("session_id"), r.get("message_id"), r.get("tool_name"),
-           r.get("result_bytes")) for r in rows])
+           r.get("result_bytes"), json.dumps(r["loaded_tools"]) if r.get("loaded_tools") else None,
+           r.get("total_deferred_tools")) for r in rows])
     conn.executemany("""
         UPDATE tool_results SET session_id = (
             SELECT t.session_id FROM turns t

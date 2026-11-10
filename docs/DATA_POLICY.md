@@ -15,6 +15,10 @@ What whytokens stores, where, and how to delete it. Code: `policy.py`.
 | `subagent_type` | Task, Agent | agent type |
 | `skill` | Skill | skill name |
 
+`tool_results.loaded_tools` keeps, for each ToolSearch result, the identifiers of the deferred
+tools whose schemas it loaded (the same class as the tool name above) and `total_deferred_tools`.
+The ToolSearch query text is **not** stored; `policy.py` `_KEEP` deliberately has no ToolSearch entry.
+
 MCP tool inputs, search patterns, prompts, file contents and shell commands are **not** stored.
 Token counts, timestamps, model names, project and branch names, and session titles are
 stored (see `SCHEMA.md`).

@@ -25,7 +25,7 @@ FIXTURES = {
     "warm": _session("warm", [(m, 20_000 + 400 * i, 400, {}) for i, m in enumerate((3, 6, 9, 12))]),
     # full miss 3 min after the last turn, same model, no compaction: the prefix changed
     "miss": _session("miss", [(3, 20_000, 400, {}), (6, 0, 20_400, {}), (9, 20_800, 400, {})]),
-    # miss after only 10 min: past the 5m TTL, expected (and under idle_gap's 30 min)
+    # miss after 10 min: past the 5m TTL, so idle_gap owns it, not a second claim
     "ttl": _session("ttl", [(3, 20_000, 400, {}), (13, 0, 20_400, {}), (16, 20_800, 400, {})]),
     "compact": _session("compact", [(3, 20_000, 400, {"compact": True}), (6, 0, 20_400, {})]),
     "switch": _session("switch", [(3, 20_000, 400, {}), (6, 0, 20_400, {"model": OTHER})]),
@@ -68,7 +68,7 @@ class TestCacheMissRebuild(unittest.TestCase):
         self.assertEqual(rebuilds, [])
 
     def test_expected_rebuilds_are_reported_not_waste(self):
-        for sid, why in (("ttl", "TTL"), ("compact", "compaction"), ("switch", "model switch")):
+        for sid, why in (("compact", "compaction"), ("switch", "model switch")):
             with self.subTest(sid):
                 causes, rebuilds = self._run(sid)
                 self.assertNotIn("cache_miss_rebuild", causes)
@@ -76,6 +76,12 @@ class TestCacheMissRebuild(unittest.TestCase):
                 self.assertIn(why, rebuilds[0]["reason"])
                 self.assertEqual(rebuilds[0]["tokens"], 20_400)
                 self.assertGreater(rebuilds[0]["usd"], 0)
+
+    def test_gap_past_the_ttl_is_idle_gap_not_a_rebuild(self):
+        causes, rebuilds = self._run("ttl")
+        self.assertIn("idle_gap", causes)
+        self.assertNotIn("cache_miss_rebuild", causes)
+        self.assertEqual(rebuilds, [])
 
     def test_idle_gap_owns_long_gaps_one_claim_per_turn(self):
         causes, rebuilds = self._run("idle")

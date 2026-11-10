@@ -116,6 +116,10 @@ def cmd_doctor(projects_dir=None):
     print()
     print(schema.format_codex_doctor_report(codex_report))
 
+    import mcp_config  # configured MCP servers + duplicate installs (static, nothing launched)
+    print()
+    print(mcp_config.format_report(mcp_config.configured_servers(Path.home(), Path.cwd())))
+
     # Non-zero exit if EITHER source drifted, so CI / scripts can gate on it.
     if not (schema.report_is_clean(claude_report)
             and schema.codex_report_is_clean(codex_report)):

@@ -867,6 +867,7 @@ const CAUSE_LABEL = {
   resident_output: 'Tool output kept in context', repeated_reads: 'Repeated file reads',
   subagent_preamble: 'Subagent preambles', idle_gap: 'Idle gaps (cache expiry)',
   uncached_input: 'Uncached input', cache_miss_rebuild: 'Unexpected cache misses',
+  deferred_tool_load: 'Deferred tool schemas kept in context',
 };
 // Finding drawer: what happened, the fix, the evidence calls as a mini-trace, then the full
 // trace with those calls highlighted. Evidence message_ids ride along on the button.
@@ -1466,7 +1467,7 @@ function renderSessionsTable(sessions) {
       : `<td class="session-topic muted">Untitled</td>`;
     return `<tr class="session-row" data-session-row="${esc(s.full_session_id)}" data-session-day="${esc(s.last_date || '')}">
       <td class="muted" style="font-family:monospace;white-space:nowrap"><button class="row-toggle" type="button" aria-expanded="false" data-breakdown="${esc(s.full_session_id)}" title="Who spent this session: main thread vs each subagent">&#9656;</button><button class="link-btn" data-session="${esc(s.full_session_id)}" onclick="openSessionDetail(this.dataset.session)">${esc(s.session_id)}&hellip;</button></td>
-      <td>${esc(s.project)}</td>
+      <td title="${esc(s.project)}">${esc(s.project)}</td>
       ${titleCell}
       <td class="muted">${esc(fmtLocalDateTime(s.last_ts, displayTZ) || s.last)}</td>
       <td class="muted">${esc(s.duration_min)}m</td>
@@ -1619,7 +1620,7 @@ function renderToolCostTable(rows, bodyId = 'tool-cost-body') {
   body.innerHTML = rows.map(t => {
     const costCell = t.cost ? `<td class="cost">${fmtCost(t.cost)}</td>` : `<td class="cost-na">n/a</td>`;
     return `<tr>
-      <td>${esc(t.tool)}</td>
+      <td title="${esc(t.tool)}">${esc(t.tool)}</td>
       <td class="num">${fmt(t.turns)}</td>
       <td class="num">${fmt(t.input)}</td>
       <td class="num">${fmt(t.output)}</td>
@@ -1638,7 +1639,7 @@ function renderEffortCostTable(rows) {
   body.innerHTML = rows.map(e => {
     const costCell = e.cost ? `<td class="cost">${fmtCost(e.cost)}</td>` : `<td class="cost-na">n/a</td>`;
     return `<tr>
-      <td>${esc(e.effort)}</td>
+      <td title="${esc(e.effort)}">${esc(e.effort)}</td>
       <td class="num">${fmt(e.turns)}</td>
       <td class="num">${fmt(e.input)}</td>
       <td class="num">${fmt(e.output)}</td>
@@ -1701,7 +1702,7 @@ function renderSubagentDispatchTable(rows) {
     return `<tr>
       <td><span class="model-tag">${esc(d.agent_type)}</span></td>
       ${sessionCell}
-      <td>${esc(d.project)}</td>
+      <td title="${esc(d.project)}">${esc(d.project)}</td>
       <td class="num">${fmt(d.total_tokens)}</td>
       <td class="num">${esc(fmtWall((d.total_duration_ms || 0) / 1000))}</td>
       <td class="num">${fmt(d.tool_use_count)}</td>
@@ -1713,7 +1714,7 @@ function renderSessionSignalsTable(rows) {
   document.getElementById('session-signals-body').innerHTML = rows.map(s => {
     return `<tr>
       <td class="muted" style="font-family:monospace"><button class="link-btn" data-session="${esc(s.full_session_id)}" onclick="openSessionDetail(this.dataset.session)">${esc(s.session_id)}&hellip;</button></td>
-      <td>${esc(s.project)}</td>
+      <td title="${esc(s.project)}">${esc(s.project)}</td>
       <td class="cost">${fmtCost(s.cost)}</td>
       <td class="cost">${fmtCost(s.cost_per_min)}</td>
       <td class="num">${fmt(s.tokens_per_min)}</td>
@@ -1826,10 +1827,10 @@ function renderSessionDetail(d) {
     const cost = rowCost(t, t.timestamp.slice(0, 10));
     return `<tr${traceHighlight.has(t.message_id) ? ' class="hl" aria-label="evidence call"' : ''}>
       <td class="muted">${esc(t.ts.replace('T', ' ').replace('Z', ''))}</td>
-      <td>${esc(t.actor)}${t.estimated ? ' <span class="muted" title="token counts estimated">(est.)</span>' : ''}</td>
+      <td title="${esc(t.actor)}">${esc(t.actor)}${t.estimated ? ' <span class="muted" title="token counts estimated">(est.)</span>' : ''}</td>
       <td class="muted">${t.gap_s == null ? '' : fmtGap(t.gap_s)}</td>
       <td class="num">${fmt(t.context)}</td>
-      <td>${toolCellHTML(t, i)}</td>
+      <td class="wrap-any">${toolCellHTML(t, i)}</td>
       <td><span class="model-tag">${esc(t.model)}</span></td>
       <td class="num">${fmt(t.input)}</td>
       <td class="num">${fmt(t.output)}</td>
@@ -1910,7 +1911,7 @@ function renderSessionToolBreakdown(turns) {
   const totalCost = rows.reduce((sum, r) => sum + r.cost, 0);
   document.getElementById('session-tool-breakdown-body').innerHTML = rows.map(r => {
     return `<tr>
-      <td>${esc(r.tool)}</td>
+      <td title="${esc(r.tool)}">${esc(r.tool)}</td>
       <td class="num">${fmt(r.turns)}</td>
       <td class="num">${fmt(r.input)}</td>
       <td class="num">${fmt(r.output)}</td>
@@ -2433,7 +2434,7 @@ function renderProjectBranchCostTable(rows) {
   const shown = sorted.slice(0, branchLimit);
   document.getElementById('project-branch-cost-body').innerHTML = shown.map(pb => {
     return `<tr>
-      <td>${esc(pb.project)}</td>
+      <td title="${esc(pb.project)}">${esc(pb.project)}</td>
       <td class="muted" style="font-family:monospace">${esc(pb.branch || '—')}</td>
       <td class="num">${pb.sessions}</td>
       <td class="num">${fmt(pb.turns)}</td>

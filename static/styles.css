@@ -135,21 +135,23 @@ details.collapsible > summary .export-btn { margin-left: auto; }
 .peak-swatch { width: 10px; height: 10px; background: var(--red); border-radius: 2px; display: inline-block; }
 
 table { width: 100%; border-collapse: collapse; }
-th { text-align: left; padding: 8px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { text-align: left; padding: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-bottom: 1px solid var(--border); }
 th.sortable { cursor: pointer; user-select: none; }
 th.sortable:focus-visible { outline-offset: -2px; }
 th.sortable:hover { color: var(--text); }
 .sort-icon { font-size: 9px; opacity: 0.8; }
-td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+td { padding: 10px 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
+td[title], td.wrap-any { overflow-wrap: anywhere; } /* long ids, paths, tool names: break anywhere so tables fit */
+td.num, td.cost, td.cost-na, td.cost-est { white-space: nowrap; overflow-wrap: normal; }
 tr:last-child td { border-bottom: none; }
 tr:hover td { background: var(--raised); }
-.model-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; background: var(--tag-bg); color: var(--blue); }
+.model-tag { display: inline-block; white-space: nowrap; padding: 2px 7px; border-radius: 4px; font-size: 11px; background: var(--tag-bg); color: var(--blue); }
 .cost { color: var(--green); font-family: monospace; }
 .cost-na { color: var(--muted); font-family: monospace; font-size: 11px; }
 .cost-est { color: var(--accent); cursor: help; } /* plan-included Codex/GPT: labeled API-equivalent estimate */
 .num { font-family: monospace; }
 .muted { color: var(--muted); }
-.session-topic { min-width: 160px; white-space: normal; }
+.session-topic { min-width: 100px; white-space: normal; }
 .section-title { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
 .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .section-header .section-title { margin-bottom: 0; }

@@ -19,6 +19,8 @@ _KEEP = {
     "MultiEdit": ("file_path",), "NotebookEdit": ("notebook_path",),
     "Task": ("subagent_type",), "Agent": ("subagent_type",), "Skill": ("skill",),
 }
+# ToolSearch is deliberately absent. Its query text is not kept; the loaded tool names live
+# in tool_results.loaded_tools (identifiers, see docs/DATA_POLICY.md), not in tool_calls.
 _COMMAND_TOOLS = ("Bash", "exec", "shell", "apply_patch")
 _MAX_STR = 500
 

@@ -115,6 +115,25 @@ class ClaudeSource:
         conn.commit()
         return 1
 
+    def backfill_deferred_loads(self, conn):
+        """One-time backfill: ToolSearch ``loaded_tools`` for tool_results rows
+        ingested before the column existed, from transcripts still on disk. Same COALESCE
+        upsert as the walk; pruned sessions keep NULL (unknown), never an empty list."""
+        marker = "deferred_loads_backfill_done_claude"
+        if scanner._meta_get(conn, marker) == "1":
+            return 0
+        if not any(Path(d).exists() for d in self._dirs()):
+            return 0
+        if conn.execute("SELECT 1 FROM turns WHERE COALESCE(agent, 'claude') = 'claude' "
+                        "LIMIT 1").fetchone():
+            for filepath in self.discover_files():
+                calls = {}
+                scanner.parse_jsonl_file(filepath, calls_out=calls)
+                scanner.upsert_tool_results(conn, [c for c in calls.values() if c.get("loaded_tools")])
+        scanner._meta_set(conn, marker, "1")
+        conn.commit()
+        return 1
+
     def sync_agents(self, conn):
         """Fill in ``agents.agent_type`` from each subagent's own files.
 
@@ -343,6 +362,59 @@ class ClaudeSource:
 
         return scanner.backfill_column_once(
             conn, "speed_backfill_done_claude", "speed", pairs, label="speed")
+
+    def backfill_compact(self, conn):
+        """One-time turns.is_compact_summary backfill: Claude Code flags a compaction on
+        the USER record, so rows ingested before the scanner carried it forward are 0 on the
+        turn that rebuilt the cache. The insert upsert never rewrites a settled row, so this
+        UPDATEs by message_id. Same carry rule as parse_jsonl_file: the first assistant message
+        after the flagged user record, per session."""
+        marker = "compact_backfill_done_claude"
+        if scanner._meta_get(conn, marker) == "1":
+            return 0
+        if not any(Path(d).exists() for d in self._dirs()):
+            return 0  # no transcript dir: leave the marker unset and retry later
+        ids, complete = [], True
+        for filepath in self.discover_files():
+            pending = {}
+            try:
+                with open(filepath, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if not pending and '"isCompactSummary"' not in line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        sid = record.get("sessionId")
+                        if record.get("type") == "user" and record.get("isCompactSummary"):
+                            pending[sid] = None
+                        elif record.get("type") == "assistant" and sid in pending:
+                            message = record.get("message") or {}
+                            usage = message.get("usage") or {}
+                            if not any(usage.get(k) or 0 for k in (  # the scanner skips zero-usage records
+                                    "input_tokens", "output_tokens", "cache_read_input_tokens",
+                                    "cache_creation_input_tokens")):
+                                continue
+                            mid = message.get("id")
+                            if pending[sid] in (None, mid):
+                                pending[sid] = mid
+                                ids.append(mid)
+                            else:
+                                del pending[sid]
+            except Exception as e:
+                print(f"  Warning: error reading {filepath}: {e}")
+                complete = False
+        before = conn.total_changes
+        conn.executemany("UPDATE turns SET is_compact_summary = 1 WHERE message_id = ? AND is_compact_summary = 0",
+                         ((m,) for m in ids if m))
+        filled = conn.total_changes - before
+        if complete:  # an unreadable file would stay uncorrected forever; the UPDATE is idempotent, so retry
+            scanner._meta_set(conn, marker, "1")
+        conn.commit()
+        if filled:
+            print(f"Backfilled compaction flag for {filled} existing turn(s).")
+        return filled
 
     MCP_COLUMNS = (("mcp_server", "attributionMcpServer"),
                    ("mcp_tool", "attributionMcpTool"),

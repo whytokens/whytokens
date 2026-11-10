@@ -17,12 +17,13 @@ from scanner import ADVISOR_ID_PREFIX, AGENT_SUMMARY_ID_PREFIX
 
 
 CAUSES = ("resident_output", "repeated_reads", "subagent_preamble", "idle_gap", "uncached_input",
-          "cache_miss_rebuild")
+          "cache_miss_rebuild", "deferred_tool_load")
 # Evidence tiers (plan decision 4). Nothing here is measured before/after, so no cause may
 # claim "demonstrated saving" until v1.1.
 TIERS = {"resident_output": "attributed cause", "repeated_reads": "attributed cause",
          "subagent_preamble": "attributed cause", "idle_gap": "attributed cause",
-         "uncached_input": "observation", "cache_miss_rebuild": "attributed cause"}
+         "uncached_input": "observation", "cache_miss_rebuild": "attributed cause",
+         "deferred_tool_load": "inferred"}
 # One pricing basis for findings and totals: pricing.calc_cost at API list rate.
 BASIS = {"pricing": "API list rate",
          "label": "attributed, lower bound, at API list rate; not savings"}
@@ -120,7 +121,7 @@ def _ttl(turn):
 def _rebuild_reason(turn, prev):
     """cache_miss_rebuild (Claude main chain only): a turn that rewrote most of the prefix its
     predecessor had cached. Returns None (not a rebuild), ("expected", why) or ("unexpected", likely cause).
-    Expected: gap >= TTL, compaction, model switch. /clear starts a new session id, so it shows as an
+    Expected: gap >= TTL, partial 5m-tier expiry, compaction, model switch. /clear starts a new session id, so it shows as an
     opening prefix, never as a rebuild here."""
     creation, read = turn["cache_creation_tokens"] or 0, turn["cache_read_tokens"] or 0
     prefix = prev["prefix"]
@@ -131,10 +132,111 @@ def _rebuild_reason(turn, prev):
         return "expected", f"idle {gap.total_seconds() / 60:.0f} min, past the {prev['ttl'] // 60} min cache TTL"
     if turn["is_compact_summary"] or prev["compact"]:
         return "expected", "context compaction"
+    # Partial expiry: the prefix was cached at the 1h tier, so the 1h part survives (read > 0) while the
+    # 5m part expired; the rewrite is that 5m part. A full miss (read == 0) is still a changed prefix.
+    # ponytail: 'a 1h write is still in the prefix' is tracked as a flag, not per-token tier sizes.
+    if read and gap is not None and gap.total_seconds() >= 300 and prev.get("h1", prev["ttl"] > 300):
+        return "expected", f"idle {gap.total_seconds() / 60:.0f} min, past the 5 min TTL of the 5m-tier part (1h-tier part still cached)"
     if turn["model"] != prev["model"]:
         return "expected", f"model switch ({prev['model']} to {turn['model']})"
     return "unexpected", (f"read {read:,} of {prefix:,} cached tokens inside the TTL with no compaction or model switch: "
                           "the prompt prefix changed (system prompt, tool set or settings edit)")
+
+
+def _mcp_parts(name):
+    m = re.match(r"mcp__(.+?)__(.+)$", name)
+    return m.groups() if m else (None, name)
+
+
+def _same_install(a, b):
+    """Two MCP prefixes that are one server installed twice (plugin_<plugin>_<server> vs <server>)."""
+    return a != b and (a.endswith("_" + b) or b.endswith("_" + a))
+
+
+def _overlaps(events):
+    """Session-wide: names that duplicate a tool an earlier-loaded server already provided (same
+    suffix under two MCP prefixes), plus the (first, later) server pairs.
+    ponytail: one shared suffix is enough, so a generic name (search, list) can false-positive; the
+    10% share floor keeps those from surfacing. Tighten to a Jaccard threshold if it misfires."""
+    first = {}  # suffix -> first server that loaded it
+    dup, pairs = set(), set()
+    for names in events:
+        for name in names:
+            server, suffix = _mcp_parts(name)
+            if server is None:
+                continue
+            if suffix not in first:
+                first[suffix] = server
+            elif first[suffix] != server:
+                dup.add(name)
+                pairs.add((first[suffix], server))
+    return dup, pairs
+
+
+def _deferred_tool_load(turns, loads, claims):
+    """ToolSearch schemas stay resident and are re-read every later turn. Per lane (main
+    thread or one subagent), a load is waste for the names never called afterwards, reloaded while
+    still in context (no compaction between), or duplicating another MCP server's tool. Priced as the
+    next turn's cache-write above the lane's median write (inferred proxy) x the lane's later turns at
+    the cache-read rate, for the wasted share of that load. Those later turns' reads are claimed by no
+    other cause; turns idle_gap / cache_miss_rebuild claimed are skipped; one claim per next-turn."""
+    lanes = {}
+    for t in turns:
+        if _synthetic(t) or (t["is_sidechain"] and not t["agent_id"]):
+            continue
+        lanes.setdefault(t["agent_id"] if t["is_sidechain"] else None, []).append(t)
+    if not any(t["message_id"] in loads for lt in lanes.values() for t in lt):
+        return
+    pairs = set()
+    claimed = {e["message_id"] for c in ("idle_gap", "cache_miss_rebuild") for e in claims[c][2]}
+    used, loaders = set(), {}
+    for lane, lt in lanes.items():
+        last_call, compact_at = {}, [-1]
+        for j, t in enumerate(lt):
+            if t["is_compact_summary"]:
+                compact_at.append(j)
+            for call in _calls(t):
+                if isinstance(call, dict) and call.get("name"):
+                    last_call[call["name"]] = j
+        writes = sorted(t["cache_creation_tokens"] for t in lt if t["cache_creation_tokens"])
+        median = writes[len(writes) // 2] if writes else 0
+        # Overlap is judged inside one lane: two subagents each using a different server is not a duplicate.
+        dup_names, lane_pairs = _overlaps([loads[t["message_id"]] for t in lt if t["message_id"] in loads])
+        pairs |= lane_pairs
+        seen = {}  # name -> index of its latest load in this lane
+        for i, t in enumerate(lt):
+            names = loads.get(t["message_id"])
+            if not names:
+                continue
+            unused = [n for n in names if last_call.get(n, -1) <= i]
+            reloaded = [n for n in names if n in seen and not any(seen[n] < k <= i for k in compact_at)]
+            overlap = [n for n in names if n in dup_names]
+            for n in names:
+                seen[n] = i
+                if lane is not None:
+                    loaders.setdefault(n, set()).add(lane)
+            waste = set(unused) | set(reloaded) | set(overlap)
+            if not waste or i + 1 >= len(lt):
+                continue
+            nxt = lt[i + 1]
+            # the schemas leave context at the next compaction, so the charge stops there
+            remaining = min((k for k in compact_at if k > i + 1), default=len(lt)) - i - 2
+            delta = max(0, (nxt["cache_creation_tokens"] or 0) - median)
+            if not delta or not remaining or nxt["id"] in used or nxt["message_id"] in claimed:
+                continue
+            used.add(nxt["id"])
+            tokens = int(delta * len(waste) / len(names) * remaining)
+            usd = pricing.calc_cost(nxt["model"], 0, 0, tokens, 0, nxt["timestamp"]) * nxt["mult"]
+            claims["deferred_tool_load"][0] += usd
+            claims["deferred_tool_load"][1].append(
+                {"loaded": len(names), "unused": unused, "reloaded": reloaded, "overlap": overlap})
+            claims["deferred_tool_load"][2].append(
+                {"at": nxt["timestamp"], "tokens": tokens, "usd": usd, "tool": "ToolSearch",
+                 "message_id": t["message_id"], "agent_id": t["agent_id"]})
+    if claims["deferred_tool_load"][1]:
+        # Observation, not extra waste: each subagent lane already paid for its own copy above.
+        claims["deferred_tool_load"][1].append(
+            {"pairs": sorted(pairs), "shared": sorted(n for n, ls in loaders.items() if len(ls) > 1)})
 
 
 MIN_SHARE = 0.10  # Claude Code /usage flags behaviors at >=10% of spend; same default here
@@ -160,6 +262,14 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                          **{c: c if c in cols else "NULL" for c in ("message_id", "agent_id")})
         rows = conn.execute(sql + (" WHERE session_id=?" if session_id else "") +
                             " ORDER BY session_id, timestamp, id", (session_id,) if session_id else ()).fetchall()
+        loads = {}  # message_id -> tool names a ToolSearch result loaded
+        if "loaded_tools" in {r[1] for r in conn.execute("PRAGMA table_info(tool_results)")}:
+            for mid, names in conn.execute("SELECT message_id, loaded_tools FROM tool_results "
+                                           "WHERE loaded_tools IS NOT NULL AND message_id IS NOT NULL"):
+                try:
+                    loads[mid] = list(dict.fromkeys(loads.get(mid, []) + json.loads(names)))
+                except (TypeError, ValueError):
+                    pass
     finally:
         conn.close()
 
@@ -216,7 +326,7 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
             has_tool, repeated = _tool_info(turn, seen_paths) if not compact else (False, [])
             gap = _gap(previous_turn["timestamp"], turn["timestamp"]) if previous_turn else None
             if creation and previous_main:
-                if gap and gap.total_seconds() >= 1800:
+                if gap and gap.total_seconds() >= previous_main["ttl"]:  # TTL of the tier the prefix was cached at
                     # same tokens as cache reads = what a warm (or compacted-and-warm) cache would have billed
                     warm = pricing.calc_cost(turn["model"], 0, 0, creation, 0, turn["timestamp"]) * turn["mult"]
                     _claim(claims, "idle_gap", turn, creation, (gap, creation, warm), None)
@@ -234,12 +344,17 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
             if ((turn["agent"] or "claude") == "claude" and not (turn["cache_read_tokens"] or 0)
                     and not creation and (turn["input_tokens"] or 0)):
                 _claim(claims, "uncached_input", turn, turn["input_tokens"], turn["input_tokens"], None, inp=True)
+            # A 1h write stays in the prefix while it is read back (a full rewrite resets the tier).
+            h1 = (turn["cache_creation_1h_tokens"] or 0) > 0 or bool(
+                (turn["cache_read_tokens"] or 0) and (previous_main or {}).get("h1"))
             previous_main = {"timestamp": turn["timestamp"], "has_tool": has_tool, "model": turn["model"],
                              "compact": compact,
-                             "ttl": _ttl(turn) if creation else (previous_main or {}).get("ttl", 300), "prefix": (turn["cache_read_tokens"] or 0) + creation,
+                             "h1": h1,
+                             "ttl": 3600 if h1 else 300, "prefix": (turn["cache_read_tokens"] or 0) + creation,
                              "repeated": repeated, "tool_name": turn["tool_name"]}
             previous_turn = turn
 
+        _deferred_tool_load(turns, loads, claims)
         total = sum(pricing.calc_cost(t["model"], t["input_tokens"] or 0, t["output_tokens"] or 0,
                                       t["cache_read_tokens"] or 0, t["cache_creation_tokens"] or 0,
                                       t["timestamp"], t["cache_creation_1h_tokens"] or 0) * t["mult"]
@@ -278,6 +393,23 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                 detail, fix = (f"{len(details)} unexpected cache miss{'' if len(details) == 1 else 'es'} rewrote "
                                f"{sum(e['tokens'] for e in evidence):,} cache tokens; likely cause: {details[0]}.",
                                "Keep the system prompt, tool set and settings stable within a session.")
+            elif cause == "deferred_tool_load":
+                events, extra = details[:-1], details[-1]
+                unused = sorted({n for d in events for n in d["unused"]})
+                reloaded = sorted({n for d in events for n in d["reloaded"]})
+                overlap = sorted({n for d in events for n in d["overlap"]})
+                parts = [f"{len(unused)} of {sum(d['loaded'] for d in events)} loaded deferred tool schemas were never called afterwards"
+                         if unused else "", f"{len(reloaded)} loaded again while still in context" if reloaded else "",
+                         f"{len(overlap)} duplicate another MCP server's tool" if overlap else ""]
+                detail = "; ".join(p for p in parts if p) + f" ({', '.join((overlap or reloaded or unused)[:3])})."
+                if extra["shared"]:
+                    detail += f" Observation: {len(extra['shared'])} tool(s) were loaded independently by several subagents."
+                if overlap and extra["pairs"]:
+                    a, b = extra["pairs"][0]
+                    fix = (f"Deduplicate the MCP install (plugin vs user config): {a} / {b}." if _same_install(a, b) else
+                           f"Remove one of the overlapping servers {a} / {b}.")
+                else:
+                    fix = "Use select:<name> instead of keyword search."
             else:
                 detail, fix = (f"{sum(details):,} input tokens were billed without a cache read or write.",
                                "Keep repeated prompt material in a cacheable prefix.")

@@ -14,7 +14,7 @@ Causes (all derivable from ``turns``; ctx(turn) = input + cache_read + cache_cre
   subagent_preamble  the FIRST cache_creation of each subagent (agent_id; a cold read
                      starts a lane when agent_id is NULL). Later sidechain writes follow
                      the resident_output / repeated_reads rules within that agent.
-  idle_gap           cache re-creation on the first turn after a >= 30-minute gap.
+  idle_gap           cache re-creation on the first turn after a gap >= the prefix's cache TTL (5m, or 1h at the 1h tier).
   uncached_input     input_tokens billed at full price that a cache would have served.
 
 Method (a verifier is not done until it has been seen to fail): one known-good
@@ -147,7 +147,7 @@ def _busy_gap_session():
     lines.append(_rec(sid, 1, _ts(0), read=0, create=ctx, tools=[("Agent", {"prompt": "long sweep"})]))
     for k, m in enumerate((5, 15, 25, 35)):
         lines.append(_rec(sid, 2 + k, _ts(m), read=8_000 if k else 0, create=300 if k else 8_000, side=True))
-    lines.append(_rec(sid, 6, _ts(40), read=0, create=ctx + 1_000))
+    lines.append(_rec(sid, 6, _ts(39), read=0, create=ctx + 1_000))  # 4 min after the last sidechain turn: under the 5m TTL
     lines.append(_rec(sid, 7, _ts(43), read=ctx + 1_000, create=400))
     return lines
 

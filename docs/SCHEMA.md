@@ -37,7 +37,7 @@ knows its own model) then summed.
 | `service_tier` | TEXT | from `usage.service_tier` |
 | `inference_geo` | TEXT | from `usage.inference_geo` |
 | `is_sidechain` | INTEGER | 1 if a subagent turn |
-| `is_compact_summary` | INTEGER | 1 if a compaction summary turn |
+| `is_compact_summary` | INTEGER | 1 on the turn that answers a compaction summary (Claude Code flags the USER record; the scanner carries it to the next assistant message) |
 | `agent` | TEXT | source coding agent: `claude` (default), `codex`, or `coordinator` (partial; see below) |
 | `reasoning_tokens` | INTEGER | informational; reasoning is already inside `output_tokens` and never billed separately (Codex) |
 | `agent_id` | TEXT | dispatched-subagent id (matches `agents.agent_id`); NULL on main-chain turns |
@@ -121,6 +121,14 @@ rows at all and can never be backfilled; Codex sizes are **not measurable** (no 
 has no result yet, any of its turns has more `tool_calls` than measured results
 (pruned before per-call ingestion), or it is not a Claude session.
 Size-based $ must skip NULL sessions, never read them as 0.
+
+ToolSearch ingestion adds two additive columns for ToolSearch results: `loaded_tools` (JSON list of the tool names
+whose schemas the result loaded, from its `tool_reference` content entries; never the query text) and
+`total_deferred_tools` (INTEGER, from `toolUseResult`, when the record holds one result). The result
+appears twice in the transcript (with and without `toolUseResult`); rows are keyed by `call_id`, so the
+names are deduped by tool_use id. NULL = not a ToolSearch result or its transcript is gone (unknown,
+never an empty list). `ClaudeSource.backfill_deferred_loads` fills old rows from transcripts still on
+disk, once. Consumed by the `deferred_tool_load` waste cause (`waste.py`; Claude only, per `agent_id` lane).
 
 ### `processed_files` — incremental-scan bookkeeping
 

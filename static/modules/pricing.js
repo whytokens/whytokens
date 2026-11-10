@@ -287,7 +287,7 @@ export function rewriteKinds(turns) {
   return turns.map(t => {
     if (t.actor !== 'main' || !t.cache_creation) return null;
     if (!opened) { opened = true; return 'opening'; }
-    return t.gap_s != null && t.gap_s > (t.cache_creation_1h > 0 ? 3600 : 300) ? 'cold' : null;
+    return t.gap_s != null && t.gap_s >= (t.cache_creation_1h > 0 ? 3600 : 300) ? 'cold' : null;
   });
 }
 

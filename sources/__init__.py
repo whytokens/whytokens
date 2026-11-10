@@ -184,6 +184,8 @@ def scan_all(db_path=DB_PATH, projects_dir=None, verbose=True, sources=None, ext
             source.backfill_mcp(conn)
         if hasattr(source, "backfill_speed"):
             source.backfill_speed(conn)
+        if hasattr(source, "backfill_compact"):
+            source.backfill_compact(conn)
         if hasattr(source, "backfill_details"):
             source.backfill_details(conn)
         # Advisor turns are NEW rows, so no in-place UPDATE can add them: an
@@ -194,6 +196,9 @@ def scan_all(db_path=DB_PATH, projects_dir=None, verbose=True, sources=None, ext
         # prompt_seq + tool_results for pre-existing rows (Claude only).
         if hasattr(source, "backfill_tool_results"):
             source.backfill_tool_results(conn)
+        # ToolSearch loaded_tools for pre-existing tool_results rows (Claude only).
+        if hasattr(source, "backfill_deferred_loads"):
+            source.backfill_deferred_loads(conn)
 
     stats = {}
     changed = False
