@@ -26,6 +26,7 @@ Routes:
   GET  /api/fixes              -> recorded fixes with before/after verification
   GET  /api/provenance         -> provenance labels + tooltips (provenance.LABELS)
   GET  /api/pricing            -> the single-source pricing table (pricing.PRICING)
+  GET  /api/pricing/fallbacks  -> models in the DB with no price row of their own
   GET  /icon.svg               -> resources/icon.svg (header icon)
   POST /api/rescan             -> incremental sources.scan_all() (non-destructive)
 """
@@ -1276,6 +1277,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # The single source of truth for the price table, served so the
             # frontend never hardcodes the numbers (pricing.py owns them).
             self._send_json(pricing.PRICING)
+
+        elif path == "/api/pricing/fallbacks":
+            # Models in the DB billed at another row's rates (no price row of their own).
+            self._send_json({"models": pricing.fallbacks_in_db(DB_PATH)})
 
         elif path == "/icon.svg":
             icon = find_icon_file()

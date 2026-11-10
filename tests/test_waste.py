@@ -430,6 +430,10 @@ class TestWasteReport(_Scanned):
         self.assertNotIn("/src/", top["detail"])   # basenames only
         top = self.waste.report(self.db, session_id="resident")[0]
         self.assertIn("Bash", top["detail"])
+        # the fix names tools that shrink tool results, not reply-style compression
+        for tool in ("offset/limit", "Grep before Read", "tail", "Explore subagent"):
+            self.assertIn(tool, top["fix"])
+        self.assertNotIn("caveman", top["fix"].lower())
 
     def test_finding_shape_and_ordering(self):
         for sid in FIXTURES:

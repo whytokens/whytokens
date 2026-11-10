@@ -296,7 +296,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
     <div id="session-bands"></div>
   </div>
   <div class="table-card hidden" id="session-waterfall-card">
-    <div class="section-title">Cost waterfall <span class="muted">(session total &rarr; attributed waste by cause &rarr; unattributed, API list rate)</span></div>
+    <div class="section-title">Cost waterfall <span class="muted">(session total &rarr; overhead by cause &rarr; unattributed, API list rate)</span></div>
     <div id="session-waterfall"></div>
   </div>
   <div class="table-card">
@@ -445,6 +445,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         </tr></thead>
         <tbody id="pricing-body"></tbody>
       </table>
+      <p id="pricing-fallbacks" class="muted" hidden></p>
     </div>
     </div>
   </section>

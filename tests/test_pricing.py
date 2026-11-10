@@ -210,6 +210,49 @@ class TestMythosPricing(unittest.TestCase):
                          pricing.PRICING["claude-fable-5"])
 
 
+class TestFable52Pricing(unittest.TestCase):
+    """Fable/Mythos 5.2 cut every rate 20% from 5.1 and keep cache hits at 0.025x.
+
+    Without its own row the id prefix-matches "claude-fable-5": +25% on input,
+    output and cache writes and 5x on cache reads, silently.
+    """
+
+    RATES = {"input": 8.00, "output": 40.00, "cache_read": 0.20,
+             "cache_write": 10.00, "cache_write_1h": 16.00}
+
+    def test_rates(self):
+        self.assertEqual(pricing.get_pricing("claude-fable-5-2"), self.RATES)
+        self.assertEqual(pricing.get_pricing("claude-mythos-5-2"), self.RATES)
+
+    def test_dated_and_vendor_prefixed_ids_do_not_fall_back(self):
+        for model in ("claude-fable-5-2-20261109", "anthropic/claude-fable-5-2",
+                      "us.anthropic.claude-mythos-5-2-v1:0"):
+            self.assertEqual(pricing.get_pricing(model), self.RATES, model)
+
+    def test_older_fable_rows_are_untouched(self):
+        self.assertEqual(pricing.get_pricing("claude-fable-5-1")["input"], 10.00)
+        self.assertEqual(pricing.get_pricing("claude-fable-5-1-20260901")["cache_read"], 0.25)
+        self.assertEqual(pricing.get_pricing("claude-fable-5")["cache_read"], 1.00)
+
+    def test_a_cache_heavy_turn_costs_what_the_rate_card_says(self):
+        # 1M of each class: 8 + 40 + 0.20 + (0.5M x 10 + 0.5M x 16) = 61.20
+        self.assertAlmostEqual(pricing.calc_cost(
+            "claude-fable-5-2", 1_000_000, 1_000_000, 1_000_000, 1_000_000,
+            cache_creation_1h=500_000), 61.20)
+
+    def test_fast_mode_is_twice_the_base_rate(self):
+        # Rate card: fast mode $16 / $80 against $8 / $40.
+        self.assertEqual(pricing.price_mult("fast", None, "claude-fable-5-2"), 2.0)
+
+    def test_js_mirrors_the_52_fallback(self):
+        js = (Path(__file__).resolve().parent.parent
+              / "static" / "modules" / "pricing.js").read_text(encoding="utf-8")
+        self.assertIn("m.includes('fable-5-2') || m.includes('mythos-5-2')", js)
+        self.assertLess(js.index("'claude-fable-5-2'"), js.index("'claude-fable-5-1'"))
+        # Python's generic fallback covers mythos too; JS must not price it $0.
+        self.assertIn("m.includes('fable') || m.includes('mythos')", js)
+
+
 class TestFable51Pricing(unittest.TestCase):
     """Fable/Mythos 5.1 price cache HITS at 0.025x input, every other model at 0.1x.
 
@@ -398,3 +441,60 @@ class TestOpus55Pricing(unittest.TestCase):
               / "static" / "modules" / "pricing.js").read_text(encoding="utf-8")
         self.assertLess(js.index("includes('opus-5-5')) return"),
                         js.index("includes('opus-'))  return"))
+
+
+class TestFallbackSignal(unittest.TestCase):
+    """A model id with no row of its own is billed at another row's rates. That is a guess,
+    and the resolver must say so: an id released after this table was written lands here."""
+
+    def test_match_says_how_the_row_was_found(self):
+        import pricing
+        for model, want in (
+                ("claude-fable-5-2", ("claude-fable-5-2", "exact")),
+                # a dated snapshot of a listed model is that model, not a guess
+                ("claude-haiku-4-5-20251001", ("claude-haiku-4-5", "exact")),
+                ("claude-fable-5-3", ("claude-fable-5", "prefix")),
+                ("claude-fable-5-2-fast", ("claude-fable-5-2", "prefix")),
+                ("claude-sonnet-6", ("claude-sonnet-4-6", "keyword")),
+                ("new-opus-9", ("claude-opus-4-8", "keyword")),
+                ("gpt-5.9-mini", ("gpt-5.4-mini", "keyword")),
+                ("gpt-5.9", ("gpt-5.4", "keyword")),
+                ("qwen3.6-27b", (None, None)),
+                ("", (None, None)), (None, (None, None))):
+            with self.subTest(model):
+                self.assertEqual(pricing.match(model), want)
+
+    def test_get_pricing_follows_match(self):
+        import pricing
+        for model in ("claude-fable-5-2", "claude-haiku-4-5-20251001", "claude-fable-5-3",
+                      "claude-sonnet-6", "codex-auto-review", "gpt-6-nova", "gpt-5.9-mini"):
+            with self.subTest(model):
+                key, _ = pricing.match(model)
+                self.assertEqual(pricing.get_pricing(model, "2026-11-09"),
+                                 pricing._resolve_tiers(pricing.PRICING[key], "2026-11-09"))
+        self.assertIsNone(pricing.get_pricing("qwen3.6-27b"))
+
+    def test_fallbacks_in_db_lists_only_guessed_models(self):
+        import os
+        import sqlite3
+        import tempfile
+        import pricing
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "u.db")
+            self.assertEqual(pricing.fallbacks_in_db(db), [])  # no DB yet: nothing to report
+            conn = sqlite3.connect(db)
+            self.assertEqual(pricing.fallbacks_in_db(db), [])  # no turns table yet
+            conn.execute("CREATE TABLE turns (model TEXT)")
+            conn.executemany("INSERT INTO turns VALUES (?)", [
+                ("claude-fable-5-2",), ("claude-fable-5-3",), ("claude-fable-5-3",),
+                ("claude-sonnet-6",), ("qwen3.6-27b",), (None,), ("",)])
+            conn.commit()
+            conn.close()
+            self.assertEqual(pricing.fallbacks_in_db(db), [
+                {"model": "claude-fable-5-3", "priced_as": "claude-fable-5", "how": "prefix", "turns": 2},
+                {"model": "claude-sonnet-6", "priced_as": "claude-sonnet-4-6", "how": "keyword", "turns": 1}])
+            text = pricing.format_fallbacks(pricing.fallbacks_in_db(db))
+            self.assertIn("claude-fable-5-3", text)
+            self.assertIn("claude-fable-5", text)
+            self.assertNotIn("qwen", text)
+        self.assertIn("own price row", pricing.format_fallbacks([]))

@@ -40,6 +40,11 @@ eq(v.causes.map(c => c.share.toFixed(4)).join(), (10 / 11).toFixed(4) + ',' + (1
 const ro = groupWaste([f('s1', 'resident_output', 1, 10), {...f('s2', 'resident_output', 4, 4), attribution: 'inferred'}], sessions);
 eq(ro.causes[0].observed + '/' + ro.causes[0].inferred, '0/5', 'split');
 eq(v.causes[0].observed + '/' + v.causes[0].inferred, '10/0', 'observed cause');
+// a mixed Claude/Codex habit shows the agent-neutral (inferred) fix; each session keeps its own
+const mix = groupWaste([{...f('s1', 'resident_output', 9, 10), fix: 'claude fix'}, {...f('s2', 'resident_output', 1, 4), attribution: 'inferred', fix: 'neutral fix'}],
+                       [{...sessions[0], project: 'p'}, {...sessions[1], project: 'p'}]);
+eq(mix.groups[0].fix, 'neutral fix', 'mixed habit fix');
+eq(mix.groups[0].sessions.map(x => x.fix).join(), 'claude fix,neutral fix', 'per-session fix');
 // habits: (project, cause), biggest first, sessions biggest first, titles joined
 eq(v.groups.map(g => g.project + '/' + g.cause + ':' + g.usd).join(),
    'zeta/idle_gap:5,alpha/idle_gap:5,zeta/resident_output:1', 'groups (tie: more sessions first, not by name)');
@@ -97,6 +102,25 @@ class TestWasteMarkup(unittest.TestCase):
         # range buttons only: setRange must not clear the timeline's own toggle buttons
         self.assertEqual(_SRC.count("querySelectorAll('.range-btn[data-range]')"), 2, "both range toggles scoped")
         self.assertFalse("querySelectorAll('.range-btn')" in _SRC, "an unscoped .range-btn toggle remains")
+
+
+class TestWasteCopy(unittest.TestCase):
+    """overhead is not all waste. Every cause carries an avoidability tag, the headline
+    doesn't call it all waste, and the resident_output fix names tools that cut tool results."""
+
+    def test_every_cause_tagged(self):
+        import re
+        import waste
+        block = _SRC[_SRC.index("const CAUSE_AVOID = {"):_SRC.index("const avoidTag")]
+        self.assertEqual(set(re.findall(r"^  (\w+): \[", block, re.M)), set(waste.CAUSES))
+        self.assertIn("'partly avoidable'", block)
+        self.assertEqual(_SRC.count("avoidTag(g.cause)") + _SRC.count("avoidTag(c.cause)"), 2, "tag on bars and habits")
+
+    def test_headline(self):
+        self.assertNotIn("attributed to waste", _SRC)
+        self.assertIn("in overhead</div>", _SRC)
+        self.assertIn("Not all of it can be cut", _SRC)
+        self.assertIn('data-prov="local_estimate">${fmtCostBig(v.total)} in overhead', _SRC)
 
 
 if __name__ == "__main__":

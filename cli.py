@@ -120,6 +120,10 @@ def cmd_doctor(projects_dir=None):
     print()
     print(mcp_config.format_report(mcp_config.configured_servers(Path.home(), Path.cwd())))
 
+    import pricing  # models billed at another row's rates: informational, never an exit code
+    print()
+    print(pricing.format_fallbacks(pricing.fallbacks_in_db(DB_PATH)))
+
     # Non-zero exit if EITHER source drifted, so CI / scripts can gate on it.
     if not (schema.report_is_clean(claude_report)
             and schema.codex_report_is_clean(codex_report)):

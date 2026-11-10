@@ -38,6 +38,8 @@ class TestCodexResident(unittest.TestCase):
         self.assertTrue(f[0]["advice"].startswith("Inferred"))
         self.assertIn("60,000", f[0]["detail"])
         self.assertIn("shell", f[0]["detail"])
+        self.assertNotIn("Explore", f[0]["fix"])  # Claude Code tools don't exist in Codex
+        self.assertIn("tail", f[0]["fix"])
 
     def test_growth_without_a_tool_is_not_charged(self):
         import sqlite3

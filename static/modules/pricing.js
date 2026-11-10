@@ -149,9 +149,10 @@ function resolveKey(model) {
     if (model.startsWith(key)) return key;
   }
   const m = model.toLowerCase();
+  if (m.includes('fable-5-2') || m.includes('mythos-5-2')) return 'claude-fable-5-2'; // 20% under 5.1
   // 5.1 first: its cache-read rate is 0.025x input, not 0.1x (see pricing.py).
   if (m.includes('fable-5-1') || m.includes('mythos-5-1')) return 'claude-fable-5-1';
-  if (m.includes('fable'))  return 'claude-fable-5';
+  if (m.includes('fable') || m.includes('mythos')) return 'claude-fable-5';
   if (m.includes('opus-5-5')) return 'claude-opus-5-5'; // 0.05x cache reads, not 4.8's 0.1x
   if (m.includes('opus-'))  return 'claude-opus-4-8'; // "opus-" only: a model merely ending in "opus" is a local build, not billed
   if (m.includes('sonnet')) return 'claude-sonnet-4-6';

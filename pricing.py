@@ -11,7 +11,7 @@ intentionally re-implemented in JS for live editable-pricing recompute; only the
 table is single-sourced.
 
 Prices are $ / MTok (per million tokens):
-  * Anthropic API pricing as of October 2026.
+  * Anthropic API pricing as of November 2026.
   * OpenAI (Codex) API pricing as of July 2026, web-verified against
     developers.openai.com/api/docs/pricing and .../codex/pricing.
 
@@ -47,7 +47,11 @@ its cache at 1h, and the turns table splits the two
 (no 1h tier) correct.
 """
 
+import re
+import sqlite3
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
 
 PRICING = {
     # Fable/Mythos 5.1 price cache HITS at 0.025x input ($0.25), not the 0.1x
@@ -56,6 +60,12 @@ PRICING = {
     # the 5.0 rows on purpose: get_pricing()'s prefix scan is first-wins over
     # insertion order, so "claude-fable-5-1-<date>" must meet this key before
     # "claude-fable-5" can swallow it.
+    # Fable/Mythos 5.2 (2026-11-09) cut every rate 20% from 5.1 and keep cache
+    # hits at 0.025x input ($0.20); fast mode is the generic 2x ($16/$80) —
+    # verified against platform.claude.com/docs/en/about-claude/pricing,
+    # 2026-11-09. Above the 5.1 and 5.0 rows for the same first-wins reason.
+    "claude-fable-5-2":  {"input": 8.00, "output": 40.00, "cache_read": 0.20, "cache_write": 10.00, "cache_write_1h": 16.00},
+    "claude-mythos-5-2": {"input": 8.00, "output": 40.00, "cache_read": 0.20, "cache_write": 10.00, "cache_write_1h": 16.00},  # shares Fable 5.2 pricing
     "claude-fable-5-1":  {"input": 10.00, "output": 50.00, "cache_read": 0.25, "cache_write": 12.50, "cache_write_1h": 20.00},
     "claude-mythos-5-1": {"input": 10.00, "output": 50.00, "cache_read": 0.25, "cache_write": 12.50, "cache_write_1h": 20.00},  # shares Fable 5.1 pricing
     "claude-fable-5":    {"input": 10.00, "output": 50.00, "cache_read": 1.00, "cache_write": 12.50, "cache_write_1h": 20.00},
@@ -143,44 +153,81 @@ def _resolve_tiers(entry, timestamp=None):
     return chosen
 
 
-def get_pricing(model, timestamp=None):
+_DATED = re.compile(r"-\d{8}")  # a dated snapshot id: claude-haiku-4-5-20251001
+
+
+def match(model):
+    """(PRICING key, how) for a model id; (None, None) when it is not priced.
+    how is "exact" (the id's own row, or a dated snapshot of it), "prefix" or "keyword".
+    The last two are guesses: the id has no row and bills at an older row's rates, so a
+    model released after this table was written lands there (see fallbacks_in_db)."""
     if not model:
-        return None
+        return None, None
     if model in PRICING:
-        return _resolve_tiers(PRICING[model], timestamp)
+        return model, "exact"
     for key in PRICING:
         if model.startswith(key):
-            return _resolve_tiers(PRICING[key], timestamp)
+            return key, "exact" if _DATED.fullmatch(model[len(key):]) else "prefix"
     # Substring fallback: match model family by keyword. Deliberately narrow —
     # non-priced providers (gpt-4o, glm-*, local models like qwen*) must stay
     # unmatched so they cost $0 rather than being mispriced.
     m = model.lower()
-    if "fable-5-1" in m or "mythos-5-1" in m:
-        return _resolve_tiers(PRICING["claude-fable-5-1"], timestamp)
-    if "fable" in m or "mythos" in m:
-        return _resolve_tiers(PRICING["claude-fable-5"], timestamp)
+    for words, key in _KEYWORDS:
+        if any(w in m for w in words):
+            return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "keyword"
+    return None, None
+
+
+# First hit wins, so a narrower keyword sits above its family's catch-all.
+_KEYWORDS = (
+    (("fable-5-2", "mythos-5-2"), "claude-fable-5-2"),
+    (("fable-5-1", "mythos-5-1"), "claude-fable-5-1"),
+    (("fable", "mythos"), "claude-fable-5"),
+    (("opus-5-5",), "claude-opus-5-5"),
     # "opus-" (not bare "opus") so local builds that merely END in opus
     # (e.g. qwen3.6-40b-claude-46-opus) stay unmatched and cost $0, matching
     # isBillable. Real models and variants are "claude-opus-..."/"new-opus-5".
-    if "opus-5-5" in m:
-        return _resolve_tiers(PRICING["claude-opus-5-5"], timestamp)
-    if "opus-" in m:
-        return _resolve_tiers(PRICING["claude-opus-4-8"], timestamp)
-    if "sonnet" in m:
-        return _resolve_tiers(PRICING["claude-sonnet-4-6"], timestamp)
-    if "haiku-5-5" in m:
-        return _resolve_tiers(PRICING["claude-haiku-5-5"], timestamp)
-    if "haiku" in m:
-        return _resolve_tiers(PRICING["claude-haiku-4-5"], timestamp)
-    if "codex" in m:
-        return _resolve_tiers(PRICING["gpt-5.3-codex"], timestamp)
-    if "gpt-5" in m:
-        return _resolve_tiers(PRICING["gpt-5.4-mini"] if "mini" in m else PRICING["gpt-5.4"], timestamp)
+    (("opus-",), "claude-opus-4-8"),
+    (("sonnet",), "claude-sonnet-4-6"),
+    (("haiku-5-5",), "claude-haiku-5-5"),
+    (("haiku",), "claude-haiku-4-5"),
+    (("codex",), "gpt-5.3-codex"),
+    (("gpt-5",), "gpt-5.4"),  # "mini" in the id picks gpt-5.4-mini, see match()
     # An unknown gpt-6-* variant lands on astra (the top tier) rather than $0:
     # over-counting an unrecognized id beats silently pricing it free.
-    if "gpt-6" in m:
-        return _resolve_tiers(PRICING["gpt-6-astra"], timestamp)
-    return None
+    (("gpt-6",), "gpt-6-astra"),
+)
+
+
+def get_pricing(model, timestamp=None):
+    key, _ = match(model)
+    return _resolve_tiers(PRICING[key], timestamp) if key else None
+
+
+def fallbacks_in_db(db_path):
+    """Models in the DB priced by a guess (see match): [{model, priced_as, how, turns}].
+    Empty when there is no DB or no turns table yet. Reads only."""
+    if not Path(db_path).exists():
+        return []
+    conn = sqlite3.connect(f"file:{quote(Path(db_path).resolve().as_posix(), safe='/:')}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("SELECT model, COUNT(*) FROM turns WHERE model IS NOT NULL "
+                            "GROUP BY model ORDER BY model").fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+    return [{"model": model, "priced_as": key, "how": how, "turns": turns}
+            for model, turns in rows for key, how in [match(model)] if how in ("prefix", "keyword")]
+
+
+def format_fallbacks(found):
+    if not found:
+        return "Pricing: every priced model in the DB has its own price row."
+    return "\n".join(
+        [f"Pricing: {len(found)} model id(s) have no price row of their own and are billed at "
+         "another row's rates (a newer model may be over- or under-counted):"] +
+        [f"  {f['model']} -> {f['priced_as']} ({f['how']} match, {f['turns']:,} turns)" for f in found])
 
 
 def calc_cost(model, inp, out, cache_read, cache_creation, timestamp=None,

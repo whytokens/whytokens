@@ -122,7 +122,7 @@ def _ttl(turn):
 def _rebuild_reason(turn, prev):
     """cache_miss_rebuild (Claude main chain only): a turn that rewrote most of the prefix its
     predecessor had cached. Returns None (not a rebuild), ("expected", why) or ("unexpected", likely cause).
-    Expected: gap >= TTL, partial 5m-tier expiry, compaction, model switch. /clear starts a new session id, so it shows as an
+    Expected: gap >= TTL, partial 5m-tier expiry, compaction, model switch, fast-mode switch. /clear starts a new session id, so it shows as an
     opening prefix, never as a rebuild here."""
     creation, read = turn["cache_creation_tokens"] or 0, turn["cache_read_tokens"] or 0
     prefix = prev["prefix"]
@@ -144,7 +144,11 @@ def _rebuild_reason(turn, prev):
         return "expected", "context compaction"
     if turn["model"] != prev["model"]:
         return "expected", f"model switch ({prev['model']} to {turn['model']})"
-    return "unexpected", (f"read {read:,} of {prefix:,} cached tokens inside the TTL with no compaction or model switch: "
+    # Requests at different speeds share no cached prefix, so turning fast mode on or off rewrites it.
+    was_fast, is_fast = prev.get("speed") == "fast", "speed" in turn.keys() and turn["speed"] == "fast"
+    if was_fast != is_fast:
+        return "expected", f"speed switch ({'fast' if was_fast else 'standard'} to {'fast' if is_fast else 'standard'})"
+    return "unexpected", (f"read {read:,} of {prefix:,} cached tokens inside the TTL with no compaction, model or speed switch: "
                           "the prompt prefix changed (system prompt, tool set or settings edit)")
 
 
@@ -263,11 +267,11 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
         sql = """SELECT id, session_id, timestamp, model, input_tokens, output_tokens,
                          cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens,
                          tool_name, tool_calls, is_sidechain, is_compact_summary, agent,
-                         {message_id} AS message_id, {agent_id} AS agent_id, {mult} AS mult
+                         {message_id} AS message_id, {agent_id} AS agent_id, {speed} AS speed, {mult} AS mult
                   FROM turns"""
         cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)")}
         sql = sql.format(mult=pricing.price_mult_sql(cols),
-                         **{c: c if c in cols else "NULL" for c in ("message_id", "agent_id")})
+                         **{c: c if c in cols else "NULL" for c in ("message_id", "agent_id", "speed")})
         rows = conn.execute(sql + (" WHERE session_id=?" if session_id else "") +
                             " ORDER BY session_id, timestamp, id", (session_id,) if session_id else ()).fetchall()
         loads = {}  # message_id -> tool names a ToolSearch result loaded
@@ -356,7 +360,7 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
             h1 = (turn["cache_creation_1h_tokens"] or 0) > 0 or bool(
                 (turn["cache_read_tokens"] or 0) and (previous_main or {}).get("h1"))
             previous_main = {"timestamp": turn["timestamp"], "has_tool": has_tool, "model": turn["model"],
-                             "compact": compact,
+                             "compact": compact, "speed": turn["speed"],
                              "h1": h1,
                              "ttl": 3600 if h1 else 300, "prefix": (turn["cache_read_tokens"] or 0) + creation,
                              "repeated": repeated, "tool_name": turn["tool_name"]}
@@ -379,16 +383,21 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                 if len(ranked) > 3:
                     names += f" (+{len(ranked) - 3} more)"
                 detail, fix = (f"{names} caused {sum(n for _, n in details):,} {'input' if inferred else 'cache-write'} tokens of context growth.",
-                               "Trim or summarize tool output before it returns to the conversation.")
+                               # Codex (inferred) has no offset/limit Read or Explore subagent: agent-neutral advice there.
+                               # Output styles (caveman etc.) shorten replies, not tool results, so they are not a fix here.
+                               ("Keep big tool results out of the conversation: read file ranges and search before you read, "
+                                "and cut long command output to its tail or a summary." if inferred else
+                                "Keep big tool results out of the main context: Read with offset/limit, Grep before Read, "
+                                "pipe long shell output through tail or a summary, and delegate broad reads to an Explore subagent."))
             elif cause == "repeated_reads":
                 # basenames only: findings are shown and shared, full paths carry usernames
                 files = sorted({re.split(r"[\\/]", str(path))[-1] for paths, _ in details for path in paths})
                 paths = ", ".join(files[:5]) + (f" (+{len(files) - 5} more)" if len(files) > 5 else "")
                 detail, fix = (f"Repeated Read calls of {paths} added {sum(n for _, n in details):,} cache-write tokens.",
-                               "Read the file once, then keep or summarize the needed excerpt.")
+                               "Read the file once; for a second look, Grep for the part you need or Read just that range with offset/limit.")
             elif cause == "subagent_preamble":
                 detail, fix = (f"Sidechain turns wrote {sum(details):,} cache-create tokens for inherited preambles.",
-                               "Give subagents narrower prompts and reuse fewer independent agents.")
+                               "Delegate only reads big enough to pay back the setup; do jobs under ~10 turns in the main session.")
             elif cause == "idle_gap":
                 warm = sum(w for _, _, w in details)
                 minutes = max((g.total_seconds() / 60 for g, _, _ in details), default=0)
@@ -396,11 +405,11 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                                f"for ${usd:.2f}; kept warm that context would have cost ${warm:.2f} (up to ${usd - warm:.2f} saved by compacting before the cache expired).",
                                ("Start a fresh session instead of resuming a stale one; re-onboard from the handoff file."
                                 if minutes > 240 else
-                                "Resume before the cache expires, or compact context before a long pause."))
+                                "Resume within the cache TTL (5 min, or 1 h on the long tier), or /clear or /compact before a break."))
             elif cause == "cache_miss_rebuild":
                 detail, fix = (f"{len(details)} unexpected cache miss{'' if len(details) == 1 else 'es'} rewrote "
                                f"{sum(e['tokens'] for e in evidence):,} cache tokens; likely cause: {details[0]}.",
-                               "Keep the system prompt, tool set and settings stable within a session.")
+                               "Keep the system prompt, tools, MCP servers and model unchanged mid-session; make those changes before you start, or in a new session.")
             elif cause == "deferred_tool_load":
                 events, extra = details[:-1], details[-1]
                 unused = sorted({n for d in events for n in d["unused"]})

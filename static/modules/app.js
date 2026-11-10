@@ -148,6 +148,19 @@ function renderPricingEditor() {
       <td class="pricing-source">${overridden ? 'Custom' : 'Default'}</td>
     </tr>`;
   }).join('');
+  renderPricingFallbacks();
+}
+
+// Models with no price row of their own are billed at an older row's rates: say which.
+async function renderPricingFallbacks() {
+  const note = document.getElementById('pricing-fallbacks');
+  if (!note) return;
+  let models = [];
+  try { models = (await fetchJson('/api/pricing/fallbacks')).models || []; } catch (e) { /* older server */ }
+  note.hidden = !models.length;
+  note.innerHTML = models.length ? 'No price row for: ' + models.map(m =>
+    `<span class="model-tag">${esc(m.model)}</span> billed as ${esc(m.priced_as)} (${fmt(m.turns)} turns)`
+  ).join(', ') + '. A newer model may be over- or under-counted until the table is updated.' : '';
 }
 
 function onPricingChange(input) {
@@ -269,8 +282,11 @@ function getRangeBounds(range) {
   // Inclusive of today, so "Last 7 Days" spans 7 calendar days: today-6 .. today.
   // (end is null — the filter is `day >= start` — so today-7 would span 8.)
   const days = range === '7d' ? 7 : range === '30d' ? 30 : 90;
+  // Step in the display timezone's days: a local-day step across a clock change keeps the
+  // wall-clock hour, which shifts the UTC instant by an hour and can cross UTC midnight.
   const d = new Date();
-  d.setDate(d.getDate() - (days - 1));
+  if (displayTZ === 'utc') d.setUTCDate(d.getUTCDate() - (days - 1));
+  else d.setDate(d.getDate() - (days - 1));
   return { start: iso(d), end: null };
 }
 
@@ -873,6 +889,18 @@ const CAUSE_LABEL = {
   uncached_input: 'Uncached input', cache_miss_rebuild: 'Unexpected cache misses',
   deferred_tool_load: 'Deferred tool schemas kept in context',
 };
+// How much of each cause a user can cut: overhead is not all waste. Keys must equal waste.CAUSES.
+const CAUSE_AVOID = {
+  resident_output: ['partly avoidable', 'You pay for every result Claude reads. Necessary reads are part of doing the work. The savings are in oversized results: whole files, long logs, wide searches.'],
+  repeated_reads: ['partly avoidable', 'Re-reading a file already in context pays for it twice. A different range or a changed file is a fair re-read.'],
+  subagent_preamble: ['cost of delegation', "Each subagent re-reads its setup. It's worth paying when the subagent keeps a big read out of your main session; it's wasted on tiny jobs."],
+  idle_gap: ['mostly avoidable', 'The cache expired while you were away, so the next turn paid to rebuild it. /clear before a break, or finish the thought first.'],
+  uncached_input: ['partly avoidable', 'Your newest message is always uncached; repeated material that misses the cache is the part you can cut.'],
+  cache_miss_rebuild: ['avoidable', 'The cache broke without an obvious reason. Usually a changed system prompt, tools or model mid-session.'],
+  deferred_tool_load: ['mostly avoidable', 'Tool schemas loaded but never called still ride along in every later turn.'],
+};
+const avoidTag = c => CAUSE_AVOID[c]
+  ? `<span class="avoid-tag" title="${esc(CAUSE_AVOID[c][1])}">${esc(CAUSE_AVOID[c][0])}</span>` : '';
 // Finding drawer: what happened, the fix, the evidence calls as a mini-trace, then the full
 // trace with those calls highlighted. Evidence message_ids ride along on the button.
 function evidenceDrawer(s, fix) {
@@ -909,8 +937,9 @@ function groupWaste(findings, sessions, cause = null) {
     const g = groups.get(key) || { project: s.project, cause: f.cause, tier: f.tier, fix: f.fix, usd: 0, spend: 0, observed: 0, inferred: 0, sessions: [] };
     g.usd += f.usd; g.spend += f.session_usd;
     addSplit(g, f);
+    if (f.attribution === 'inferred') g.fix = f.fix;  // a mixed Claude/Codex habit gets the agent-neutral advice
     g.sessions.push({ id: f.session_id, title: s.topic || '', date: s.last_date, usd: f.usd,
-                      session_usd: f.session_usd, detail: f.detail, evidence: f.evidence });
+                      session_usd: f.session_usd, detail: f.detail, fix: f.fix, evidence: f.evidence });
     groups.set(key, g);
   }
   const byUsd = (a, b) => b.usd - a.usd;
@@ -960,11 +989,11 @@ function wasteSparkline(weeks) {
   const W = 240, H = 36, max = Math.max(...weeks.map(w => w.pct)) || 1;
   const pts = weeks.map((w, i) => [(i * W / (weeks.length - 1)).toFixed(1), (H - 3 - (H - 6) * w.pct / max).toFixed(1)]);
   return `<svg class="waste-spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" ` +
-    `aria-label="Weekly attributed waste as a share of all spend, ${esc(weeks[0].week)} to ${esc(weeks[weeks.length - 1].week)}">` +
+    `aria-label="Weekly overhead as a share of all spend, ${esc(weeks[0].week)} to ${esc(weeks[weeks.length - 1].week)}">` +
     `<polyline fill="none" stroke="currentColor" stroke-width="1.5" points="${pts.map(p => p.join(',')).join(' ')}"/>` +
     pts.map((p, i) => `<circle cx="${p[0]}" cy="${p[1]}" r="2"><title>Week of ${esc(weeks[i].week)}: ${fmtPct(weeks[i].pct)} ` +
       `(${fmtCostBig(weeks[i].waste)} of ${fmtCostBig(weeks[i].spend)})</title></circle>`).join('') + '</svg>' +
-    `<div class="muted">Weekly attributed waste, % of all spend that week (peak ${fmtPct(max)})</div>`;
+    `<div class="muted">Weekly overhead, % of all spend that week (peak ${fmtPct(max)})</div>`;
 }
 
 let wastePayload = null;   // /api/waste is whole-DB; fetched once per data load, filtered here
@@ -1040,12 +1069,13 @@ async function renderWasteTab() {
 
   // Scope: what was searched, what was found, against what spend.
   el('waste-scope').innerHTML = v.affectedSessions
-    ? `<div class="waste-headline" data-prov="local_estimate">${fmtCostBig(v.total)} attributed to waste</div>` +
+    ? `<div class="waste-headline" data-prov="local_estimate">${fmtCostBig(v.total)} in overhead</div>` +
+      '<div>Not all of it can be cut: some is the cost of doing the work. Each cause below is tagged with how much of it you can cut.</div>' +
       `<div class="muted">${fmtPct(v.affectedUsd ? v.total / v.affectedUsd : 0)} of the ${fmtCostBig(v.affectedUsd)} spent in the ` +
       `${v.affectedSessions} affected session${v.affectedSessions === 1 ? '' : 's'} · ${esc(RANGE_LABELS[selectedRange] || selectedRange)}` +
       `${start ? ' (' + esc(start) + (end ? ' to ' + esc(end) : ' to today') + ')' : ''} · current model and project filters</div>` +
       wasteSparkline(weeklyWaste(w.findings, lastFilteredSessions, x => sessionCostAtListRates(x, x.last_date)))
-    : `<div class="muted">No material waste in ${esc(RANGE_LABELS[selectedRange] || selectedRange)} for the current filters.</div>`;
+    : `<div class="muted">No material overhead in ${esc(RANGE_LABELS[selectedRange] || selectedRange)} for the current filters.</div>`;
   el('waste-basis').textContent = 'Priced at ' + w.basis.pricing + ' (' + w.basis.label + '). Local price overrides do not apply here.';
 
   // Measurement status: one line; the per-cause matrix only behind the expander.
@@ -1068,7 +1098,7 @@ async function renderWasteTab() {
   el('waste-bars').innerHTML = v.causes.map(c =>
     `<button class="waste-bar${wasteCause === c.cause ? ' active' : ''}" data-cause="${esc(c.cause)}" onclick="setWasteCause(this.dataset.cause)"` +
     ` aria-pressed="${wasteCause === c.cause}" title="Attribution: ${esc(causeSplit(c))}. Click to show only this cause below.">` +
-    `<span class="wb-label">${esc(label(c.cause))}</span>` +
+    `<span class="wb-label">${esc(label(c.cause))} ${avoidTag(c.cause)}</span>` +
     `<span class="wb-track"><span class="wb-fill" style="width:${top ? (100 * c.usd / top).toFixed(1) : 0}%"></span></span>` +
     `<span class="wb-val">${fmtCostBig(c.usd)} <span class="muted">· ${fmtPct(c.share)} · ${c.sessions} session${c.sessions === 1 ? '' : 's'}` +
     ` · ${splitBadges(c)}</span></span></button>`
@@ -1083,20 +1113,21 @@ async function renderWasteTab() {
   el('waste-groups-title').textContent = 'Habits: project × cause' + (wasteCause ? ' — ' + label(wasteCause) : '');
   el('waste-groups').innerHTML = shown.map(g =>
     `<details class="waste-group"><summary>` +
-    `<span class="wg-project">${esc(g.project)}</span><span>${esc(label(g.cause))}</span>` +
+    `<span class="wg-project">${esc(g.project)}</span><span>${esc(label(g.cause))} ${avoidTag(g.cause)}</span>` +
     `<span class="num">${fmtCostBig(g.usd)}</span>` +
     `<span class="muted num">${g.sessions.length} session${g.sessions.length === 1 ? '' : 's'} · ${fmtPct(g.spend ? g.usd / g.spend : 0)} of their spend</span>` +
-    `</summary><p class="wg-fix"><strong>Fix:</strong> ${esc(g.fix)} <span class="muted">(${splitBadges(g)})</span></p>` + verifySlot(g.project, g.cause) +
+    `</summary>` + (CAUSE_AVOID[g.cause] ? `<p class="muted wg-why">${esc(CAUSE_AVOID[g.cause][1])}</p>` : '') +
+    `<p class="wg-fix"><strong>Fix:</strong> ${esc(g.fix)} <span class="muted">(${splitBadges(g)})</span></p>` + verifySlot(g.project, g.cause) +
     '<table><thead><tr><th>Last active</th><th>Session</th><th>Attributed</th><th>Of session</th><th>What happened</th></tr></thead><tbody>' +
     g.sessions.map(s => `<tr><td class="muted">${esc(s.date || '')}</td>` +
       `<td><button class="link-btn" data-session="${esc(s.id)}" onclick="openSessionDetail(this.dataset.session)" title="Open trace">` +
       `${esc(s.title || s.id.slice(0, 8) + '…')}</button></td>` +
       `<td class="num">${fmtCostBig(s.usd)}</td><td class="num muted">${fmtCostBig(s.session_usd)}</td>` +
-      `<td class="muted">${esc(s.detail)}</td></tr>` + evidenceDrawer(s, g.fix)).join('') +
+      `<td class="muted">${esc(s.detail)}</td></tr>` + evidenceDrawer(s, s.fix || g.fix)).join('') +
     '</tbody></table></details>'
   ).join('') + (shown.length < v.groups.length
     ? `<button class="filter-btn" onclick="showAllWaste()">Show all ${v.groups.length} habits</button>` : '')
-    || '<p class="muted">No material waste found.</p>';
+    || '<p class="muted">No material overhead found.</p>';
   fillVerifySlots(el('waste-groups'));
 }
 

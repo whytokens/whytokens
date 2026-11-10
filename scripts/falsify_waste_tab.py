@@ -45,8 +45,8 @@ MUTANTS = [
     ("waste.py", "mid.startswith((ADVISOR_ID_PREFIX, AGENT_SUMMARY_ID_PREFIX))", "mid.startswith((ADVISOR_ID_PREFIX,))"),
     ("waste.py", "mid.startswith((ADVISOR_ID_PREFIX, AGENT_SUMMARY_ID_PREFIX))", "mid.startswith((AGENT_SUMMARY_ID_PREFIX,))"),
     ("waste.py", '\n            or (not mid and row["tool_name"] == "advisor" and not row["tool_calls"]))', ")"),
-    ("waste.py", '**{c: c if c in cols else "NULL" for c in ("message_id", "agent_id")}',
-     '**{c: c for c in ("message_id", "agent_id")}'),
+    ("waste.py", '**{c: c if c in cols else "NULL" for c in ("message_id", "agent_id", "speed")}',
+     '**{c: c for c in ("message_id", "agent_id", "speed")}'),
     # Waste view: scope, cause bars, habits grouped by project x cause
     ("static/modules/app.js", "  const inScope = findings.filter(f => byId.has(f.session_id));", "  const inScope = findings;"),
     ("static/modules/app.js", "    affectedUsd: [...spend.values()].reduce((sum, v) => sum + v, 0),",
@@ -62,6 +62,16 @@ MUTANTS = [
     ("static/modules/app.js", "g.usd += f.usd; g.spend += f.session_usd;", "g.usd += f.usd; g.spend = f.session_usd;"),
     ("static/modules/app.js", "document.querySelectorAll('.range-btn[data-range]').forEach(btn =>\n    btn.classList",
      "document.querySelectorAll('.range-btn').forEach(btn =>\n    btn.classList"),
+    # overhead copy: avoidability tags, headline, concrete fix strings
+    ("static/modules/app.js", "    if (f.attribution === 'inferred') g.fix = f.fix;", "    if (false) g.fix = f.fix;"),
+    ("static/modules/app.js", "detail: f.detail, fix: f.fix, evidence", "detail: f.detail, evidence"),
+    ("static/modules/app.js", "  idle_gap: ['mostly avoidable',", "  idle_gapx: ['mostly avoidable',"),
+    ("static/modules/app.js", "${avoidTag(c.cause)}", ""),
+    ("static/modules/app.js", "${fmtCostBig(v.total)} in overhead</div>", "${fmtCostBig(v.total)} attributed to waste</div>"),
+    ("static/modules/app.js", "'<div>Not all of it can be cut:", "'<div>All of it can be cut:"),
+    ("waste.py", "Read with offset/limit, Grep before Read", "Trim tool output"),
+    ("waste.py", '"and cut long command output to its tail or a summary." if inferred else',
+     '"and cut long command output to its tail or a summary." if False else'),
 ]
 TESTS = ["tests.test_waste", "tests.test_waste_tab", "tests.test_waste_view", "tests.test_waste_codex"]
 

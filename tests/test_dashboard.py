@@ -515,6 +515,29 @@ class TestDashboardHTTP(unittest.TestCase):
             self.assertEqual(data, pricing.PRICING)
             self.assertIn("claude-opus-4-8", data)
 
+    def test_api_pricing_fallbacks_lists_models(self):
+        # The endpoint must read the served DB: one id with its own row, one priced by a guess.
+        import api as _d
+        from scanner import get_db, init_db
+        conn = get_db(_d.DB_PATH)
+        init_db(conn)
+        guessed, listed = "claude-fable-5-9-probe", "claude-fable-5-2"
+        try:
+            conn.executemany("INSERT INTO turns (session_id, timestamp, model) VALUES ('fb', '2026-11-09T00:00:00Z', ?)",
+                             [(guessed,), (guessed,), (listed,)])
+            conn.commit()
+            url = f"http://127.0.0.1:{self.port}/api/pricing/fallbacks"
+            with urllib.request.urlopen(url) as resp:
+                self.assertEqual(resp.status, 200)
+                models = {m["model"]: m for m in json.loads(resp.read())["models"]}
+            self.assertEqual(models[guessed], {"model": guessed, "priced_as": "claude-fable-5",
+                                               "how": "prefix", "turns": 2})
+            self.assertNotIn(listed, models)
+        finally:
+            conn.execute("DELETE FROM turns WHERE session_id = 'fb'")
+            conn.commit()
+            conn.close()
+
     def test_static_css_served_with_content_type(self):
         url = f"http://127.0.0.1:{self.port}/static/styles.css"
         with urllib.request.urlopen(url) as resp:
