@@ -63,7 +63,6 @@ Light and dark themes follow the OS unless you pick one.
 
 ![Sessions, light](docs/screenshots/sessions-light.png)
 ![Waste, light](docs/screenshots/waste-light.png)
-![Overview, dark](docs/screenshots/overview-dark.png)
 
 The screenshots are generated from synthetic transcripts (`scripts/demo_corpus.py`).
 
