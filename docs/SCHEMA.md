@@ -109,7 +109,9 @@ ran.
 streamed record of a message, so parallel calls are all there). `result_bytes` is
 the UTF-8 length of the `tool_result` content as the transcript holds it: a string
 as-is, in a block list each text block's text plus any other block's compact JSON.
-It is the observed figure; convert to tokens only where a detector needs it.
+It is the observed figure; convert to tokens only where a detector needs it (`waste.py`
+`RESULT_BYTES_PER_TOKEN`, one estimate: `resident_output` claims at most this many tokens of the
+next cache write, and a NULL or missing size claims nothing and is counted in the finding's detail).
 
 Either side can land first (a result often arrives in the next scan), so writes are
 a COALESCE upsert, after which each call takes `session_id` from its stored turn, so a

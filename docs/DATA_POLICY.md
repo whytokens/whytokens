@@ -9,7 +9,9 @@ What whytokens stores, where, and how to delete it. Code: `policy.py`.
 | Field | Tools | Meaning |
 |---|---|---|
 | `input_size` | all | length of the original input JSON |
+| `id` (beside `name`) | all | the tool_use id, an opaque identifier that joins a call to its result size |
 | `file_path` | Read, Write, Edit, MultiEdit | the path (needed for repeated-read findings) |
+| `offset`, `limit` | Read | the line range, as numbers (a ranged re-read is not a repeat) |
 | `notebook_path` | NotebookEdit | the path |
 | `command_len` | Bash, Codex exec/shell/apply_patch | length of the command |
 | `subagent_type` | Task, Agent | agent type |

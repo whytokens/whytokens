@@ -25,9 +25,11 @@ Routes:
   GET  /api/waste              -> waste findings, rollup, measurement status (API list rate)
   GET  /api/fixes              -> recorded fixes with before/after verification
   GET  /api/provenance         -> provenance labels + tooltips (provenance.LABELS)
+  GET  /api/version            -> version.INFO {version, commit, started_at}
   GET  /api/pricing            -> the single-source pricing table (pricing.PRICING)
   GET  /api/pricing/fallbacks  -> models in the DB with no price row of their own
   GET  /icon.svg               -> resources/icon.svg (header icon)
+  POST /api/fixes              -> record a fix {project, cause, note}; returns its verification
   POST /api/rescan             -> incremental sources.scan_all() (non-destructive)
 """
 
@@ -48,6 +50,7 @@ import pricing
 import provenance
 import scanner
 import scanrun
+import version
 from config import DB_PATH, DEFAULT_PORT
 
 
@@ -682,6 +685,31 @@ def get_session_detail(session_id, db_path=None):
     return result
 
 
+def post_fix(payload, db_path=None):
+    """Record a fix dated today (the CLI's `fix record`) and return its verification. An already recorded
+    (project, cause, note) writes nothing and comes back with "duplicate": true.
+    Raises ValueError on a bad payload, unknown cause or unknown project; nothing is written then."""
+    import fixes
+    from scanner import init_db
+    if not isinstance(payload, dict):
+        raise ValueError("body must be a JSON object")
+    project, cause, note = payload.get("project"), payload.get("cause"), payload.get("note", "")
+    if not isinstance(project, str) or not isinstance(cause, str) or not isinstance(note, str):
+        raise ValueError("project, cause and note must be strings")
+    db_path = db_path or DB_PATH
+    if not Path(db_path).exists():
+        raise ValueError(f"unknown project {project!r}")
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        init_db(conn)
+        fid, duplicate = fixes.record_fix_once(conn, project, cause, note)
+        fix = next(f for f in fixes.list_fixes(conn) if f["id"] == fid)
+    finally:
+        conn.close()
+    return {**fixes.verify(db_path, fix), "duplicate": duplicate}
+
+
 def get_fixes(db_path=None):
     """Recorded fixes with their before/after verification (Waste tab verify slot)."""
     import fixes
@@ -1273,6 +1301,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/provenance":
             self._send_json(provenance.LABELS)  # label vocabulary + tooltips
 
+        elif path == "/api/version":
+            self._send_json(version.INFO)  # running build: version, commit, process start
+
         elif path == "/api/pricing":
             # The single source of truth for the price table, served so the
             # frontend never hardcodes the numbers (pricing.py owns them).
@@ -1316,6 +1347,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self._guard(post=True):
             return
         path = urlparse(self.path).path
+        if path == "/api/fixes":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if not 0 < n <= 65536:
+                    raise ValueError("body missing or too large")
+                raw = self.rfile.read(n)
+                if len(raw) != n:
+                    raise ValueError("incomplete body")
+                self._send_json(post_fix(json.loads(raw)))
+            except (ValueError, RecursionError) as e:  # ValueError includes json.JSONDecodeError
+                self._send_json({"error": str(e)}, status=400)
+            return
         if path == "/api/rescan":
             # Incremental rescan: same engine as `python cli.py scan` (Claude +
             # Codex via sources.scan_all), just triggered from the dashboard. No

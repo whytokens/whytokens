@@ -37,6 +37,17 @@ _WHY = {"codex": "Codex reports cached input but no cache-write tokens, tool-cal
 _INFERRED = {"codex": {"resident_output": "inferred from per-request input growth after a tool call "
                                           "(Codex reports no cache-write tokens); not observed"}}
 _WHY_DEFAULT = "no detector is validated for this source"
+# resident_output claims min(next cache write, estimated tokens of the previous turn's tool
+# results); the rest of that write (assistant text, tool arguments, retained thinking, the next
+# user message) stays unattributed. A call whose result size is unknown (NULL result_bytes, or no
+# tool_results row) claims nothing and is counted in the finding's detail, never read as 0 or as
+# the whole write.
+# ponytail: one flat ratio, an ESTIMATE (prose/code run ~3-4 bytes per token). Image, PDF and other
+# base64 blocks are stored as compact JSON bytes and inflate far past their real token cost, so for
+# those the estimate is a ceiling; the next write still caps it. Per-content-type ratios if that matters.
+RESULT_BYTES_PER_TOKEN = 3.5
+
+
 def _synthetic(row):
     """Scanner-minted estimate rows. An advisor row under a parent with no message.id is
     stored with an empty id (scanner keeps it un-deduped), so it is also known by its tool."""
@@ -66,25 +77,78 @@ def _calls(row):
     return calls if isinstance(calls, list) else []
 
 
-def _tool_info(row, seen_paths):
+_WRITERS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
+def _tool_info(row, seen):
+    """(has a tool call, paths re-read). ``seen`` holds (path, offset, limit) of Reads still in context;
+    a write to a path drops it, so a re-read after an edit is a fair re-read. Rows stored before
+    offset/limit were kept read as (path, None, None), the old whole-file behaviour."""
     calls = _calls(row)
-    repeated = []
-    for call in calls:
+    repeated, idx = [], []
+    for i, call in enumerate(calls):
         if not isinstance(call, dict):
+            continue
+        inp = call.get("input") or {}
+        if call.get("name") in _WRITERS:
+            path = inp.get("file_path") or inp.get("notebook_path")
+            seen.difference_update({k for k in seen if k[0] == path})
             continue
         if call.get("name") != "Read":
             continue
-        path = (call.get("input") or {}).get("file_path")
-        if path in seen_paths:
+        path = inp.get("file_path")
+        key = (path, inp.get("offset"), inp.get("limit"))
+        if key in seen:
             repeated.append(path)
+            idx.append(i)
         if path:
-            seen_paths.add(path)
-    return bool(calls or row["tool_name"]), repeated
+            seen.add(key)
+    return bool(calls or row["tool_name"]), repeated, idx
+
+
+def _aligned(row, sizes, by_id=None):
+    """Estimated result tokens per call of ``row`` (None = unknown). A call is joined to its tool_results
+    row by tool_use id. Rows stored before ids were kept fall back to position (tool_results rows are
+    written in tool_use order) and only when the rows line up with the calls by count and name."""
+    calls, res = _calls(row), sizes.get(row["message_id"], ())
+    by_id = by_id or {}
+    positional = len(res) == len(calls) and all(isinstance(c, dict) and c.get("name") == r[0] for c, r in zip(calls, res))
+    out = []
+    for i, c in enumerate(calls):
+        cid = c.get("id") if isinstance(c, dict) else None
+        n = by_id.get(cid) if cid else (res[i][1] if positional else None)
+        out.append(None if n is None else n / RESULT_BYTES_PER_TOKEN)
+    return out
+
+
+def _repeat_claim(claims, turn, creation, prev, unknown):
+    """Claim the next write for repeated reads, only up to the estimated result tokens of the repeated
+    calls themselves. A repeat of unknown size claims nothing (and is counted in ``unknown``). Returns
+    False when nothing was claimed, so the caller can attribute the write as resident output instead."""
+    sized = [prev["aligned"][i] if i < len(prev["aligned"]) else None for i in prev["rep_idx"]]
+    known = [n for n in sized if n is not None]
+    est = min(creation, sum(known))
+    if est < 1:
+        return False
+    unknown[0] += len(sized) - len(known)
+    _claim(claims, "repeated_reads", turn, round(est), (prev["repeated"], round(est)), "Read")
+    rest = creation - round(est)  # the rest of the write belongs to the message's other, known results
+    if rest >= 1:
+        # all of the message's results, not just its kept calls: a streamed message keeps only its last call
+        others, missing = list(prev["results"][0]), prev["results"][1] - (len(sized) - len(known))
+        for n in known:
+            if ("Read", n) in others:
+                others.remove(("Read", n))
+        _resident(claims, turn, rest, {"results": (others, max(missing, 0))}, unknown)
+    return True
 
 
 def _cost(row, inp=0, creation=0):
-    return pricing.calc_cost(row["model"], inp, 0, 0, creation,
-                             row["timestamp"], row["cache_creation_1h_tokens"] if creation else 0) * row["mult"]
+    h1 = 0
+    if creation:  # a claim of part of a write carries the same share of its 1h-tier tokens, so split claims never exceed the write's cost
+        total, h1 = row["cache_creation_tokens"] or 0, row["cache_creation_1h_tokens"] or 0
+        h1 = h1 * min(creation, total) / total if total else h1
+    return pricing.calc_cost(row["model"], inp, 0, 0, creation, row["timestamp"], h1) * row["mult"]
 
 
 def _claim(claims, cause, turn, tokens, detail, tool, inp=False):
@@ -95,9 +159,123 @@ def _claim(claims, cause, turn, tokens, detail, tool, inp=False):
                               "message_id": turn["message_id"], "agent_id": turn["agent_id"]})
 
 
+def _results(row, sizes):
+    """([(tool, est_tokens)] for this turn's calls whose result size is known, unknown call count)."""
+    known = [(name or "tool", n / RESULT_BYTES_PER_TOKEN)
+             for name, n in sizes.get(row["message_id"], ()) if n is not None]
+    calls = max(len(_calls(row)), len(sizes.get(row["message_id"], ())), 1 if row["tool_name"] else 0)
+    return known, calls - len(known)
+
+
+OVERSIZED_TOKENS = 5_000  # a tool result at or above this many estimated tokens counts as oversized
+_RULES = {  # action id -> (title verb, rule text); rule text is draft, owner approves
+    "read_ranges": ("Read whole files", "Before reading a file over 500 lines, Grep for the part you need, "
+                    "then Read only that range with offset and limit."),
+    "bash_tail": ("Print long command output", "Pipe any command that can print more than 50 lines through "
+                  "`tail` or a summary; never dump full logs or test output."),
+    "search_limits": ("Search with full content", "Search with files-with-matches or a head limit first; "
+                      "ask for content only on the files you will open."),
+    "mcp_text": ("Pull big MCP results", "From `{server}`, prefer text results over screenshots or full dumps; "
+                 "request only the fields needed."),
+    "compact_before_break": ("Idle gaps on the main thread", "Before stepping away for more than 5 minutes, run /compact; "
+                             "after 4 hours, start a new session from the handoff file."),
+    "subagent_waits": ("Subagent waits past the cache TTL", "A subagent never sleeps or polls longer than 4 minutes; "
+                       "start long jobs in the background from the main thread."),
+    "small_jobs_inline": ("Short subagent jobs", "Do not spawn a subagent for a job under ~10 tool calls."),
+}
+SMALL_JOB_TURNS = 10  # a subagent lane under this many turns is a job the main thread could have done
+
+
+def idle_gap_action(evidence, gaps, types=None):
+    """Rule for idle gaps. ``evidence``/``gaps`` are the idle_gap claims and their (gap, tokens, warm)
+    details, index-aligned. Mostly-subagent gaps get subagent_waits, else compact_before_break.
+    est_usd is what the gaps cost minus what a warm cache would have billed: an upper bound."""
+    side = sum(bool(e["agent_id"]) for e in evidence) * 2 > len(evidence)
+    rid = "subagent_waits" if side else "compact_before_break"
+    verb, rule = _RULES[rid]
+    calls = sorted(({"message_id": e["message_id"], "at": e["at"], "minutes": round(g.total_seconds() / 60),
+                     "tokens": n, "usd": e["usd"], "warm_usd": w,
+                     "side": bool(e["agent_id"]), "agent_type": (types or {}).get(e["agent_id"]) if e["agent_id"] else None} for e, (g, n, w) in zip(evidence, gaps)),
+                   key=lambda c: c["usd"], reverse=True)
+    return {"id": rid, "title": f"{verb}: {len(calls)} gap{'' if len(calls) == 1 else 's'}", "rule": rule, "calls": calls[:5],
+            "est_usd": sum(c["usd"] - c["warm_usd"] for c in calls),
+            "est_basis": "Estimate, upper bound: what the gaps cost minus what the same tokens would have billed as cache reads."}
+
+
+def small_jobs_action(evidence, turns_by_lane, types):
+    """Rule for subagent preambles, or None when no lane ran under SMALL_JOB_TURNS turns.
+    Lanes without an agent_id cannot be told apart, so they never count as small."""
+    small = [dict(message_id=e["message_id"], at=e["at"], agent_type=types.get(e["agent_id"]),
+                  turns=turns_by_lane[e["agent_id"]], usd=e["usd"])
+             for e in evidence if e["agent_id"] and turns_by_lane.get(e["agent_id"], SMALL_JOB_TURNS) < SMALL_JOB_TURNS]
+    if not small:
+        return None
+    verb, rule = _RULES["small_jobs_inline"]
+    small.sort(key=lambda c: c["usd"], reverse=True)
+    lanes = {e["agent_id"] for e in evidence if e["agent_id"]}
+    loose = sum(not e["agent_id"] for e in evidence)  # unidentified writes: not countable as lanes
+    return {"id": "small_jobs_inline", "title": f"{verb}: {len(small)} of {len(lanes)} subagents ran under {SMALL_JOB_TURNS} turns"
+                                                + (f" (+{loose} unidentified cold writes not counted)" if loose else ""),
+            "rule": rule, "calls": small[:5], "est_usd": sum(c["usd"] for c in small),
+            "est_basis": "Estimate, upper bound: the whole preamble write of each short subagent, assuming none of it would be needed inline."}
+
+
+def _rule_for(tool):
+    """(action id, group key) for a tool name, or None when no rule covers it."""
+    tool = tool or ""
+    if tool == "Read":
+        return "read_ranges", tool
+    if tool == "Bash":
+        return "bash_tail", tool
+    if tool in ("Grep", "Glob"):
+        return "search_limits", "search"
+    m = re.match(r"mcp__(.+?)__", tool)
+    return ("mcp_text", m.group(1)) if m else None
+
+
+def next_step_action(calls):
+    """The one rule for the habit that kept the most oversized tool output in context, or None.
+
+    ``calls``: dicts {message_id, at, tool, file, result_tokens, prompt_seq, excess_usd}, one per tool
+    call whose result size is KNOWN (an unknown size is never passed in as zero). The oversized
+    calls of each rule group are summed; the largest group wins. ``excess_usd`` is the cache-write
+    price of the tokens above the floor, so est_usd is a lower bound, never a saving."""
+    groups = {}
+    for c in calls:
+        rule = _rule_for(c["tool"])
+        if rule and c["result_tokens"] >= OVERSIZED_TOKENS:
+            groups.setdefault(rule, []).append(c)
+    if not groups:
+        return None
+    (rid, key), big = max(groups.items(), key=lambda kv: sum(c["result_tokens"] for c in kv[1]))
+    top = sorted(big, key=lambda c: c["result_tokens"], reverse=True)[:5]
+    verb, rule = _RULES[rid]
+    avg = sum(c["result_tokens"] for c in big) / len(big)
+    return {"id": rid, "title": f"{verb} {len(big)} time{'' if len(big) == 1 else 's'}, ~{round(avg / 1000)}K tokens each",
+            "rule": rule.format(server=key),
+            "calls": [{k: c[k] for k in ("message_id", "at", "tool", "file", "result_tokens", "prompt_seq")} for c in top],
+            "est_usd": sum(c["excess_usd"] for c in big),
+            "est_basis": f"Estimate, lower bound: the {len(big)} oversized results cut to {OVERSIZED_TOKENS:,} tokens, "
+                         "at the cache-write rate only. Not a saving."}
+
+
+def _resident(claims, turn, creation, prev, unknown):
+    """Claim the next write only up to the previous turn's estimated result tokens."""
+    known, missing = prev["results"]
+    unknown[0] += missing
+    est = sum(n for _, n in known)
+    claim = min(creation, est)
+    if claim < 1:
+        return
+    scale = claim / est  # per-call figures capped with the write, so the ranking sums to the claim
+    per_call = [(name, n * scale) for name, n in known]
+    _claim(claims, "resident_output", turn, round(claim), per_call, max(per_call, key=lambda p: p[1])[0])
+
+
 def _codex_resident(claims, turn, state):
     """Codex resident_output: context growth (input + cache_read) over the previous request, when
-    that request called a tool. Charged at the fresh-input rate, capped at the turn's fresh input."""
+    that request called a tool. Charged at the fresh-input rate, capped at the turn's fresh input.
+    Not capped by result size: Codex records none (no tool_results rows), so growth is all it has."""
     ctx = (turn["input_tokens"] or 0) + (turn["cache_read_tokens"] or 0)
     grown = min(ctx - state["ctx"], turn["input_tokens"] or 0) if state["tool"] else 0
     if grown > 0:
@@ -251,6 +429,29 @@ def _deferred_tool_load(turns, loads, claims):
             {"pairs": sorted(pairs), "shared": sorted(n for n, ls in loaders.items() if len(ls) > 1)})
 
 
+def _action_calls(turns, sizes):
+    """Every call of a session with a known result size, for next_step_action. A file basename is
+    given only when the turn made one call of that tool (tool_calls carry no call id to match on)."""
+    out = []
+    last = {t["agent_id"]: i for i, t in enumerate(turns) if not _synthetic(t)}  # a lane's last turn: nothing re-reads its results
+    for i, turn in enumerate(turns):
+        if _synthetic(turn) or last[turn["agent_id"]] == i:
+            continue
+        known = [(name, n) for name, n in sizes.get(turn["message_id"], ()) if n is not None]
+        names = [c.get("name") for c in _calls(turn) if isinstance(c, dict)]
+        for name, n in known:
+            tokens = n / RESULT_BYTES_PER_TOKEN
+            path = None
+            if names.count(name) == 1:
+                path = next(((c.get("input") or {}).get("file_path") for c in _calls(turn)
+                             if isinstance(c, dict) and c.get("name") == name), None)
+            out.append({"message_id": turn["message_id"], "at": turn["timestamp"], "tool": name or "tool",
+                        "file": re.split(r"[\\/]", str(path))[-1] if path else None, "result_tokens": round(tokens),
+                        "prompt_seq": turn["prompt_seq"],
+                        "excess_usd": _cost(turn, creation=max(0, tokens - OVERSIZED_TOKENS))})
+    return out
+
+
 MIN_SHARE = 0.10  # Claude Code /usage flags behaviors at >=10% of spend; same default here
 
 
@@ -267,11 +468,11 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
         sql = """SELECT id, session_id, timestamp, model, input_tokens, output_tokens,
                          cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens,
                          tool_name, tool_calls, is_sidechain, is_compact_summary, agent,
-                         {message_id} AS message_id, {agent_id} AS agent_id, {speed} AS speed, {mult} AS mult
+                         {prompt_seq} AS prompt_seq, {message_id} AS message_id, {agent_id} AS agent_id, {speed} AS speed, {mult} AS mult
                   FROM turns"""
         cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)")}
         sql = sql.format(mult=pricing.price_mult_sql(cols),
-                         **{c: c if c in cols else "NULL" for c in ("message_id", "agent_id", "speed")})
+                         **{c: c if c in cols else "NULL" for c in ("message_id", "agent_id", "speed", "prompt_seq")})
         rows = conn.execute(sql + (" WHERE session_id=?" if session_id else "") +
                             " ORDER BY session_id, timestamp, id", (session_id,) if session_id else ()).fetchall()
         loads = {}  # message_id -> tool names a ToolSearch result loaded
@@ -282,6 +483,14 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                     loads[mid] = list(dict.fromkeys(loads.get(mid, []) + json.loads(names)))
                 except (TypeError, ValueError):
                     pass
+        sizes, by_id = {}, {}  # message_id -> [(tool_name, result_bytes or None)], one per call; call_id -> bytes
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='tool_results'").fetchone():
+            for mid, name, n, cid in conn.execute("SELECT message_id, tool_name, result_bytes, call_id FROM tool_results "
+                                             "WHERE message_id IS NOT NULL ORDER BY rowid"):
+                sizes.setdefault(mid, []).append((name, n))
+                by_id[cid] = n
+        types = dict(conn.execute("SELECT agent_id, agent_type FROM agents")) if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='agents'").fetchone() else {}
     finally:
         conn.close()
 
@@ -297,6 +506,7 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
         lanes = {}  # per-subagent state: each agent's cache prefix is its own
         cclaims = {cause: [0.0, [], []] for cause in CAUSES}  # inferred-source claims, kept apart
         cx = {"ctx": 0, "tool": False, "tool_name": None}
+        unknown = [0]  # tool calls of unknown result size that resident_output could not count
         for turn in turns:
             if turn["agent"] in _INFERRED:  # per turn: a resumed session id can mix sources
                 _codex_resident(cclaims, turn, cx)
@@ -319,23 +529,38 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
             if turn["is_sidechain"]:
                 # Only an agent's first cache write is its preamble; later writes are its own
                 # context growth, attributed like main-chain growth.
-                lane = lanes.setdefault(turn["agent_id"], {"seen": set(), "prev": None, "preamble": False})
+                lane = lanes.setdefault(turn["agent_id"], {"seen": set(), "prev": None, "preamble": False,
+                                                           "at": None, "ttl": 300})
                 compact = turn["is_compact_summary"]  # same guard as the main chain below
-                has_tool, repeated = _tool_info(turn, lane["seen"]) if not compact else (False, [])
+                if compact:
+                    lane["seen"].clear()  # compaction dropped what the lane had read; this turn's own reads are in context
+                has_tool, repeated, rep_idx = _tool_info(turn, lane["seen"])
+                if compact:
+                    has_tool, repeated, rep_idx = False, [], []
                 prev = lane["prev"]
                 if creation and not lane["preamble"]:
                     lane["preamble"] = True
                     _claim(claims, "subagent_preamble", turn, creation, creation, "Agent")
-                elif creation and not compact and prev and prev["repeated"]:
-                    _claim(claims, "repeated_reads", turn, creation, (prev["repeated"], creation), "Read")
+                elif creation and lane["at"] and (lgap := _gap(lane["at"], turn["timestamp"])) and lgap.total_seconds() >= lane["ttl"]:
+                    # the lane polled past its own prefix's TTL: an idle gap, not the previous tool's output
+                    warm = pricing.calc_cost(turn["model"], 0, 0, creation, 0, turn["timestamp"]) * turn["mult"]
+                    _claim(claims, "idle_gap", turn, creation, (lgap, creation, warm), None)
+                elif creation and not compact and prev and prev["repeated"] and _repeat_claim(claims, turn, creation, prev, unknown):
+                    pass
                 elif creation and not compact and prev and prev["has_tool"]:
-                    _claim(claims, "resident_output", turn, creation,
-                           (prev["tool_name"] or "tool", creation), prev["tool_name"])
-                lane["prev"] = {"has_tool": has_tool, "repeated": repeated, "tool_name": turn["tool_name"]}
+                    _resident(claims, turn, creation, prev, unknown)
+                lane["prev"] = {"has_tool": has_tool, "repeated": repeated, "rep_idx": rep_idx, "names": [c.get("name") if isinstance(c, dict) else None for c in _calls(turn)], "aligned": _aligned(turn, sizes, by_id), "results": _results(turn, sizes)}
+                lane["ttl"] = 3600 if (turn["cache_creation_1h_tokens"] or 0) > 0 or (
+                    (turn["cache_read_tokens"] or 0) and lane["ttl"] > 300) else 300
+                lane["at"] = turn["timestamp"]
                 previous_turn = turn
                 continue
             compact = turn["is_compact_summary"]
-            has_tool, repeated = _tool_info(turn, seen_paths) if not compact else (False, [])
+            if compact:
+                seen_paths.clear()  # compaction dropped what was read; this turn's own reads are in context
+            has_tool, repeated, rep_idx = _tool_info(turn, seen_paths)
+            if compact:
+                has_tool, repeated, rep_idx = False, [], []
             gap = _gap(previous_turn["timestamp"], turn["timestamp"]) if previous_turn else None
             if creation and previous_main:
                 if gap and gap.total_seconds() >= previous_main["ttl"]:  # TTL of the tier the prefix was cached at
@@ -348,11 +573,10 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                     elif rebuilds is not None:
                         rebuilds.append({"session_id": sid, "at": turn["timestamp"], "tokens": creation,
                                          "usd": _cost(turn, creation=creation), "reason": why[1]})
-                elif not compact and previous_main["repeated"]:
-                    _claim(claims, "repeated_reads", turn, creation, (previous_main["repeated"], creation), "Read")
+                elif not compact and previous_main["repeated"] and _repeat_claim(claims, turn, creation, previous_main, unknown):
+                    pass
                 elif not compact and previous_main["has_tool"]:
-                    _claim(claims, "resident_output", turn, creation,
-                           (previous_main["tool_name"] or "tool", creation), previous_main["tool_name"])
+                    _resident(claims, turn, creation, previous_main, unknown)
             if ((turn["agent"] or "claude") == "claude" and not (turn["cache_read_tokens"] or 0)
                     and not creation and (turn["input_tokens"] or 0)):
                 _claim(claims, "uncached_input", turn, turn["input_tokens"], turn["input_tokens"], None, inp=True)
@@ -363,7 +587,7 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                              "compact": compact, "speed": turn["speed"],
                              "h1": h1,
                              "ttl": 3600 if h1 else 300, "prefix": (turn["cache_read_tokens"] or 0) + creation,
-                             "repeated": repeated, "tool_name": turn["tool_name"]}
+                             "repeated": repeated, "rep_idx": rep_idx, "names": [c.get("name") if isinstance(c, dict) else None for c in _calls(turn)], "aligned": _aligned(turn, sizes, by_id), "results": _results(turn, sizes)}
             previous_turn = turn
 
         _deferred_tool_load(turns, loads, claims)
@@ -377,12 +601,21 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
             if not evidence or usd < floor:  # min_usd=0 (verify) must still skip causes that never fired
                 continue
             if cause == "resident_output":
-                ranked = sorted(((sum(n for other, n in details if other == name), name)
-                                 for name in {name for name, _ in details}), reverse=True)
+                pairs = [p for d in details for p in (d if isinstance(d, list) else [d])]  # Claude: per call
+                by_tool = {}
+                for name, n in pairs:
+                    by_tool[name] = by_tool.get(name, 0) + n
+                ranked = sorted(((round(n), name) for name, n in by_tool.items()), reverse=True)
                 names = ", ".join(f"{name} ({tokens:,})" for tokens, name in ranked[:3])
                 if len(ranked) > 3:
                     names += f" (+{len(ranked) - 3} more)"
-                detail, fix = (f"{names} caused {sum(n for _, n in details):,} {'input' if inferred else 'cache-write'} tokens of context growth.",
+                total_tokens = sum(e["tokens"] for e in evidence)
+                detail = (f"{names} caused {total_tokens:,} input tokens of context growth." if inferred else
+                          f"{names} kept an estimated {total_tokens:,} cache-write tokens of tool results in context"
+                          f" ({RESULT_BYTES_PER_TOKEN} bytes per token)." +
+                          (f" {unknown[0]:,} tool call{'' if unknown[0] == 1 else 's'} of unknown result size not counted."
+                           if unknown[0] else ""))
+                fix = (
                                # Codex (inferred) has no offset/limit Read or Explore subagent: agent-neutral advice there.
                                # Output styles (caveman etc.) shorten replies, not tool results, so they are not a fix here.
                                ("Keep big tool results out of the conversation: read file ranges and search before you read, "
@@ -403,7 +636,9 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                 minutes = max((g.total_seconds() / 60 for g, _, _ in details), default=0)
                 detail, fix = (f"{len(details)} idle gap{'' if len(details) == 1 else 's'} (longest {minutes:.0f} min) rewrote {sum(n for _, n, _ in details):,} cache tokens "
                                f"for ${usd:.2f}; kept warm that context would have cost ${warm:.2f} (up to ${usd - warm:.2f} saved by compacting before the cache expired).",
-                               ("Start a fresh session instead of resuming a stale one; re-onboard from the handoff file."
+                               ("Keep subagent waits under the cache TTL, or run long jobs in the background from the main thread."
+                                if sum(bool(e["agent_id"]) for e in evidence) * 2 > len(evidence) else
+                                "Start a fresh session instead of resuming a stale one; re-onboard from the handoff file."
                                 if minutes > 240 else
                                 "Resume within the cache TTL (5 min, or 1 h on the long tier), or /clear or /compact before a break."))
             elif cause == "cache_miss_rebuild":
@@ -432,7 +667,20 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                                "Keep repeated prompt material in a cacheable prefix.")
             tier = "inferred" if inferred else TIERS[cause]
             top = sorted(evidence, key=lambda e: e["usd"], reverse=True)[:5]
+            action = None
+            if inferred:
+                pass
+            elif cause == "resident_output":
+                action = next_step_action(_action_calls(turns, sizes))
+            elif cause == "idle_gap":
+                action = idle_gap_action(evidence, details, types)  # all gaps, not the top five
+            elif cause == "subagent_preamble":
+                lane_turns = {}
+                for t in turns:
+                    if t["is_sidechain"] and t["agent_id"] and not _synthetic(t):
+                        lane_turns[t["agent_id"]] = lane_turns.get(t["agent_id"], 0) + 1
+                action = small_jobs_action(evidence, lane_turns, types)
             findings.append({"cause": cause, "session_id": sid, "usd": usd, "detail": detail, "fix": fix,
                              "tier": tier, "attribution": provenance.attribution(tier), "advice": f"{tier.capitalize()}: {fix}",
-                             "evidence": top, "session_usd": total})
+                             "evidence": top, "session_usd": total, "action": action})
     return sorted(findings, key=lambda finding: finding["usd"], reverse=True)

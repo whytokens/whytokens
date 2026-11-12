@@ -139,7 +139,7 @@ th { text-align: left; padding: 8px; font-size: 11px; text-transform: uppercase;
 th.sortable { cursor: pointer; user-select: none; }
 th.sortable:focus-visible { outline-offset: -2px; }
 th.sortable:hover { color: var(--text); }
-.sort-icon { font-size: 9px; opacity: 0.8; }
+.sort-icon { font-size: 9px; opacity: 0.8; white-space: nowrap; }
 td { padding: 10px 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
 td[title], td.wrap-any { overflow-wrap: anywhere; } /* long ids, paths, tool names: break anywhere so tables fit */
 td.num, td.cost, td.cost-na, td.cost-est { white-space: nowrap; overflow-wrap: normal; }
@@ -177,11 +177,26 @@ tr:hover td { background: var(--raised); }
 .tool-call-block pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px;
                        font-family: monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap;
                        word-break: break-word; max-height: 60vh; overflow: auto; }
-.session-filter-bar { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(120px, 0.8fr) minmax(120px, 0.8fr) 100px auto auto; gap: 10px; align-items: end; margin-bottom: 14px; }
+.session-filter-bar { display: grid; grid-template-columns: minmax(160px, 260px) minmax(120px, 200px) minmax(120px, 180px) 96px auto auto; justify-content: start; gap: 12px; align-items: end; margin-bottom: 14px; }
 .filter-field label { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 5px; }
-.filter-field input, .filter-field select { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 6px 8px; font: inherit; font-size: 12px; }
+.filter-field input, .filter-field select { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 0 8px; height: 30px; box-sizing: border-box; font: inherit; font-size: 12px; }
 .filter-field input:focus, .filter-field select:focus, .pricing-input:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: var(--accent); }
-.filter-check { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; padding-bottom: 7px; white-space: nowrap; }
+.filter-check { display: flex; align-items: center; gap: 7px; height: 30px; color: var(--muted); font-size: 12px; white-space: nowrap; cursor: pointer; }
+.filter-check input { margin: 0; }
+.session-filter-bar .filter-btn { height: 30px; padding: 0 12px; border-radius: 5px; font-size: 12px; }
+/* Sessions table: labels share one top line, the provenance badge hangs under its label, numbers right-align. */
+.sessions-table th { vertical-align: top; }
+@media (min-width: 1280px) { .sessions-table th { white-space: nowrap; } } /* narrower: labels wrap rather than widen the table */
+.sessions-table th .prov { display: block; width: fit-content; margin: 4px 0 0; }
+.sessions-table :is(th, td):nth-child(n+7) { text-align: right; font-variant-numeric: tabular-nums; }
+.sessions-table th:nth-child(n+7) .prov { margin-left: auto; }
+/* Pinned table headers. A card that scrolls sideways is its own scroll container, so a header can
+   pin to the page only where tables fit without that scroll; narrower keeps the scroll, no pin. */
+@media (min-width: 1280px) {
+  div.table-card, details.table-card { overflow-x: visible; } /* element-qualified to outrank the base rule further down */
+  .table-card > table > thead th { position: sticky; top: var(--filter-bar-h, 68px); z-index: 2; background: var(--card);
+    border-bottom-color: transparent; box-shadow: inset 0 -1px 0 var(--border); } /* a collapsed border does not travel with a sticky cell */
+}
 .filter-check input { accent-color: var(--accent); }
 .pricing-input { width: 86px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 5px 7px; font: inherit; font-size: 12px; font-family: monospace; }
 .pricing-source { color: var(--muted); font-size: 11px; }
@@ -266,6 +281,8 @@ h1.page-title { font-size: 16px; font-weight: 600; margin-bottom: 14px; }
 .wg-project { font-weight: 600; overflow-wrap: anywhere; }
 .wg-fix { margin: 8px 0; }
 .wg-why { margin: 8px 0 0; }
+.wg-rule { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--border, #8884); border-radius: 6px; display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+.wg-est { margin: 8px 0; }
 .avoid-tag { display: inline-block; margin-left: 4px; padding: 0 6px; border-radius: 8px; background: var(--raised);
   font-size: 11px; color: var(--muted); white-space: nowrap; cursor: help; }
 @media (max-width: 700px) {
@@ -291,3 +308,5 @@ tr.hl td { background: color-mix(in srgb, var(--accent, #d97706) 22%, transparen
 .prov-official, .prov-observed { border-color: var(--green, #3a8); }
 .prov-local_estimate, .prov-inferred { border-style: dashed; }
 .prov-unknown { opacity: .7; }
+
+#trace-banner { margin: 0 0 10px; padding: 8px 12px; border-left: 3px solid var(--accent, #d97706); background: color-mix(in srgb, var(--accent, #d97706) 12%, transparent); font-size: 13px; }

@@ -77,6 +77,10 @@ def main(out):
                 read = ctx
             ctx += rnd.randint(400, 3000)
             turn(t, content, creation, read)
+            for call in content:  # its result: sized to the largest next write (resident_output caps there)
+                lines.append(json.dumps({"type": "user", "sessionId": sid, "cwd": cwd, "timestamp": clock.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                         "message": {"role": "user", "content": [
+                                             {"type": "tool_result", "tool_use_id": call["id"], "content": "x" * 49_000}]}}))
             heavy = bool(content)
             if habit == "subagent_preamble" and t % 10 == 5:
                 agent = f"agent-{s}-{t}"

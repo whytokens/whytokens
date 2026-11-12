@@ -31,10 +31,7 @@ def record_fix(conn, project, cause, note, when=None, file_path=None):
     if cause not in waste.CAUSES:
         raise ValueError(f"unknown cause {cause!r}; one of {', '.join(waste.CAUSES)}")
     when = when or date.today().isoformat()
-    # Reject malformed, store canonical (compared as text). date.fromisoformat reads the
-    # compact form (20260901) only from Python 3.11; we support 3.9, so expand it first.
-    if len(when) == 8 and when.isascii() and when.isdigit():
-        when = f"{when[:4]}-{when[4:6]}-{when[6:]}"
+    # Reject malformed, store canonical (compared as text). fromisoformat reads 20260901 natively.
     when = date.fromisoformat(when).isoformat()
     if not conn.execute("SELECT 1 FROM sessions WHERE project_name = ? LIMIT 1", (project,)).fetchone():
         raise ValueError(f"unknown project {project!r}")
@@ -44,6 +41,23 @@ def record_fix(conn, project, cause, note, when=None, file_path=None):
          datetime.now().isoformat(timespec="seconds")))
     conn.commit()
     return cur.lastrowid
+
+
+def record_fix_once(conn, project, cause, note):
+    """record_fix unless this (project, cause, note) is already recorded. Returns (id, duplicate).
+    The check and the insert share one write transaction, so concurrent callers record it once."""
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT id FROM fixes WHERE project = ? AND cause = ? AND note = ? ORDER BY id LIMIT 1",
+                           (project, cause, note or "")).fetchone()
+        if row:
+            conn.rollback()
+            return row[0], True
+        return record_fix(conn, project, cause, note), False  # commits
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def list_fixes(conn):
@@ -86,7 +100,8 @@ def verify(db_path, fix):
     before = _side([(s, totals.get(s, 0.0)) for s, d in rows if d < fix["fix_date"]], cause_usd)
     after = _side([(s, totals.get(s, 0.0)) for s, d in rows if d >= fix["fix_date"]], cause_usd)
     out = {"fix": fix, "before": before, "after": after, "caveat": CAVEAT, "saving_usd": 0.0,
-           "basis": waste.BASIS["label"]}
+           "basis": waste.BASIS["label"],
+           "min_sessions": MIN_SESSIONS}
     if min(before["sessions"], after["sessions"]) < MIN_SESSIONS:
         out["status"] = "insufficient data"
         out["reason"] = (f"needs at least {MIN_SESSIONS} sessions on each side "

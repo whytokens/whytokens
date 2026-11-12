@@ -339,6 +339,7 @@ def extract_tool_calls(content):
                 calls.append({
                     "name": item.get("name"),
                     "input": item.get("input") or {},
+                    "id": item.get("id"),  # additive: joins a call to its tool_results row
                 })
     return policy.redact_calls(calls)
 

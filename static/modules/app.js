@@ -20,7 +20,8 @@ import { VALID_TABS, resolveTab, applyTabVisibility, addExtRailItem, toggleRail,
 import { store, TZ_KEY, alpha, fillTokens, initTheme, setThemePref } from './theme.js';
 import { weekOf, promptBands, turnsOfBand, sessionWaterfall, causeWeekMatrix } from './analytics.js';
 import { watchProvenance, provBadge, addSplit, orUnknown } from './provenance.js';
-import { verifySlot, fillVerifySlots, resetVerify } from './verify.js';
+import { writeTraceLink, readTraceLink, findTurnRow } from './tracelink.js';
+import { verifySlot, fillVerifySlots, resetVerify, recordButton, recordFix } from './verify.js';
 import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchStatus } from './api.js';
 
 // Chart.js is loaded as a classic UMD script before this module (see index.html),
@@ -61,6 +62,8 @@ let lastHotSessions = [];
 const extTabs = new Map();
 let activeTab = 'overview';
 let selectedSessionDetail = null;
+let traceTurn = '', traceWhy = '', traceScrollPending = false;  // deep-link target turn, banner text, scroll once per open
+let traceOpenSeq = 0;  // latest openSessionDetail call; older responses are dropped
 let traceHighlight = new Set();  // message_ids of a finding's evidence calls, marked in the trace table
 let sessionFilters = { project: '', branch: '', tool: '', minCost: 0, hasCacheCreation: false };
 let sessionSortDir = 'desc';
@@ -322,6 +325,7 @@ function setRange(range) {
 
 function setDisplayTZ(mode) {
   displayTZ = mode;
+  renderBuildInfo();
   document.querySelectorAll('.tz-btn').forEach(btn =>
     btn.classList.toggle('active', btn.dataset.tz === mode)
   );
@@ -537,6 +541,7 @@ function updateURL(hash) {
   const params = new URLSearchParams();
   if (activeTab !== 'overview') params.set('tab', activeTab);
   if (activeTab === 'trace' && selectedSessionDetail) params.set('session', selectedSessionDetail.session.session_id);
+  if (activeTab === 'trace' && selectedSessionDetail) writeTraceLink(params, { turn: traceTurn, hl: traceHighlight, why: traceWhy });
   if (selectedRange !== '30d') params.set('range', selectedRange);
   // Omit tz only when it matches the Settings default, so reload restores what is shown.
   if (displayTZ !== (store.get(TZ_KEY) === 'utc' ? 'utc' : 'local')) params.set('tz', displayTZ);
@@ -901,17 +906,52 @@ const CAUSE_AVOID = {
 };
 const avoidTag = c => CAUSE_AVOID[c]
   ? `<span class="avoid-tag" title="${esc(CAUSE_AVOID[c][1])}">${esc(CAUSE_AVOID[c][0])}</span>` : '';
-// Finding drawer: what happened, the fix, the evidence calls as a mini-trace, then the full
-// trace with those calls highlighted. Evidence message_ids ride along on the button.
-function evidenceDrawer(s, fix) {
-  const ev = s.evidence || [], ids = ev.map(e => e.message_id).filter(Boolean);
-  return `<tr class="wg-drawer"><td colspan="5"><details><summary class="muted">Evidence: ${ev.length} call${ev.length === 1 ? '' : 's'}</summary>` +
+// Finding drawer. A finding with an `action` gets the next-step card (rule, ranked calls, one
+// estimate line); resident/preamble findings with none say nothing stands out; a cache miss keeps
+// the evidence table plus a checklist. Every call links to the trace at that turn.
+const CACHE_MISS_CHECKLIST = ['Did you switch model mid-session?', 'Did an MCP server connect, disconnect or change its tools?',
+  'Did you edit CLAUDE.md or settings during the session?'];
+function traceLink(s, ids, why, id, label) {
+  return id ? `<button class="link-btn" data-session="${esc(s.id)}" data-ids="${esc(ids.join(','))}" data-turn="${esc(id)}" data-why="${esc(why)}"` +
+    ` onclick="openSessionDetail(this.dataset.session, this.dataset.ids, {turn: this.dataset.turn, why: this.dataset.why})" title="Open this call in the trace">${label}</button>` : label;
+}
+const stampOf = at => esc(String(at || '').replace('T', ' ').replace('Z', ''));
+function actionRows(s, a, ids, why) {
+  const link = (c, fallback) => traceLink(s, ids, why, c.message_id, c.prompt_seq ? 'Request ' + esc(c.prompt_seq) : fallback);
+  if (a.id === 'compact_before_break' || a.id === 'subagent_waits')
+    return ['<th>When</th><th>Who</th><th>Gap</th><th>Tokens</th><th>Cost</th>', a.calls.map(c =>
+      `<tr><td class="muted">${link(c, stampOf(c.at))}</td><td>${esc(c.side ? (c.agent_type || 'subagent') : 'main thread')}</td><td class="num">${esc(c.minutes)}m</td>` +
+      `<td class="num">${fmt(c.tokens)}</td><td class="num">${fmtCostBig(c.usd)}</td></tr>`)];
+  if (a.id === 'small_jobs_inline')
+    return ['<th>When</th><th>Subagent</th><th>Turns</th><th>Cost</th>', a.calls.map(c =>
+      `<tr><td class="muted">${link(c, stampOf(c.at))}</td><td>${esc(c.agent_type || 'unknown')}</td><td class="num">${esc(c.turns)}</td>` +
+      `<td class="num">${fmtCostBig(c.usd)}</td></tr>`)];
+  return ['<th>Request</th><th>Tool</th><th>File</th><th>Est. tokens</th>', a.calls.map(c =>
+    `<tr><td class="muted">${link(c, stampOf(c.at))}</td><td>${esc(c.tool || '')}</td><td>${esc(c.file || '')}</td>` +
+    `<td class="num">${fmt(c.result_tokens)}</td></tr>`)];
+}
+function nextStepCard(s, fix, why, open, project) {
+  const ev = s.evidence || [], a = s.action, ids = (a ? a.calls : ev).map(e => e.message_id).filter(Boolean);
+  const fullTrace = `<button class="filter-btn" data-session="${esc(s.id)}" data-ids="${esc(ids.join(','))}"` +
+    ` onclick="openSessionDetail(this.dataset.session, this.dataset.ids)">Open full trace</button>`;
+  if (a) {
+    const [head, rows] = actionRows(s, a, ids, why);
+    return `<tr class="wg-drawer"><td colspan="5"><details${open ? ' open' : ''}><summary class="muted">Next step</summary>` +
+      `<p class="wg-title"><strong>${esc(a.title)}</strong></p>` +
+      `<div class="wg-rule"><code>${esc(a.rule)}</code> <button class="filter-btn" onclick="navigator.clipboard && navigator.clipboard.writeText(this.previousElementSibling.textContent)">Copy</button></div>` +
+      `<table><thead><tr>${head}</tr></thead><tbody>${rows.join('')}</tbody></table>` +
+      `<p class="muted wg-est">Estimate: about ${fmtCostBig(a.est_usd)}. ${esc(a.est_basis)}</p>${project ? recordButton(project, s.cause, a.title) + ' ' : ''}${fullTrace}</details></td></tr>`;
+  }
+  if (s.cause === 'resident_output' || s.cause === 'subagent_preamble')
+    return `<tr class="wg-drawer"><td colspan="5"><details${open ? ' open' : ''}><summary class="muted">Next step</summary>` +
+      `<p>No single call stands out. This is the cost of the work.</p>${fullTrace}</details></td></tr>`;
+  return `<tr class="wg-drawer"><td colspan="5"><details${open ? ' open' : ''}><summary class="muted">Evidence: ${ev.length} call${ev.length === 1 ? '' : 's'}</summary>` +
     `<p>${esc(s.detail)}</p><p class="wg-fix"><strong>Fix:</strong> ${esc(fix)}</p>` +
     '<table><thead><tr><th>When</th><th>Tool</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>' +
-    ev.map(e => `<tr><td class="muted">${esc(String(e.at || '').replace('T', ' ').replace('Z', ''))}</td><td>${esc(e.tool || '')}</td>` +
+    ev.map(e => `<tr><td class="muted">${traceLink(s, ids, why, e.message_id, stampOf(e.at))}</td><td>${esc(e.tool || '')}</td>` +
       `<td class="num">${fmt(e.tokens)}</td><td class="num">${fmtCostBig(e.usd)}</td></tr>`).join('') +
-    `</tbody></table><button class="filter-btn" data-session="${esc(s.id)}" data-ids="${esc(ids.join(','))}"` +
-    ` onclick="openSessionDetail(this.dataset.session, this.dataset.ids)">Open full trace</button></details></td></tr>`;
+    '</tbody></table>' + (s.cause === 'cache_miss_rebuild' ? '<p class="muted">Usual causes:</p><ul>' + CACHE_MISS_CHECKLIST.map(c => `<li>${esc(c)}</li>`).join('') + '</ul>' : '') +
+    `${fullTrace}</details></td></tr>`;
 }
 
 // Group findings into what a user acts on: a habit = (project, cause), not one session.
@@ -939,7 +979,7 @@ function groupWaste(findings, sessions, cause = null) {
     addSplit(g, f);
     if (f.attribution === 'inferred') g.fix = f.fix;  // a mixed Claude/Codex habit gets the agent-neutral advice
     g.sessions.push({ id: f.session_id, title: s.topic || '', date: s.last_date, usd: f.usd,
-                      session_usd: f.session_usd, detail: f.detail, fix: f.fix, evidence: f.evidence });
+                      session_usd: f.session_usd, detail: f.detail, fix: f.fix, evidence: f.evidence, action: f.action, cause: f.cause });
     groups.set(key, g);
   }
   const byUsd = (a, b) => b.usd - a.usd;
@@ -1119,11 +1159,11 @@ async function renderWasteTab() {
     `</summary>` + (CAUSE_AVOID[g.cause] ? `<p class="muted wg-why">${esc(CAUSE_AVOID[g.cause][1])}</p>` : '') +
     `<p class="wg-fix"><strong>Fix:</strong> ${esc(g.fix)} <span class="muted">(${splitBadges(g)})</span></p>` + verifySlot(g.project, g.cause) +
     '<table><thead><tr><th>Last active</th><th>Session</th><th>Attributed</th><th>Of session</th><th>What happened</th></tr></thead><tbody>' +
-    g.sessions.map(s => `<tr><td class="muted">${esc(s.date || '')}</td>` +
+    g.sessions.map((s, i) => `<tr><td class="muted">${esc(s.date || '')}</td>` +
       `<td><button class="link-btn" data-session="${esc(s.id)}" onclick="openSessionDetail(this.dataset.session)" title="Open trace">` +
       `${esc(s.title || s.id.slice(0, 8) + '…')}</button></td>` +
       `<td class="num">${fmtCostBig(s.usd)}</td><td class="num muted">${fmtCostBig(s.session_usd)}</td>` +
-      `<td class="muted">${esc(s.detail)}</td></tr>` + evidenceDrawer(s, s.fix || g.fix)).join('') +
+      `<td class="muted">${esc(s.detail)}</td></tr>` + nextStepCard(s, s.fix || g.fix, ((CAUSE_LABEL[g.cause] || g.cause) + ': ' + s.detail).slice(0, 200), i === 0, g.project)).join('') +
     '</tbody></table></details>'
   ).join('') + (shown.length < v.groups.length
     ? `<button class="filter-btn" onclick="showAllWaste()">Show all ${v.groups.length} habits</button>` : '')
@@ -1213,7 +1253,7 @@ function renderStats(t) {
     { label: 'Cache Creation', prov: t.cache_creation_unknown ? 'unknown' : 'official',
       value: orUnknown(t.cache_creation, t.cache_creation_unknown),
       sub: t.cache_creation_partial && !t.cache_creation_unknown ? 'writes to prompt cache (Codex not counted)' : 'writes to prompt cache' },
-    { label: 'Est. Cost',      prov: 'local_estimate', value: fmtCostBig(t.cost),          sub: 'API pricing, Sep 2026', color: C.green },
+    { label: 'Est. Cost',      prov: 'local_estimate', value: fmtCostBig(t.cost),          sub: 'API pricing, Nov 2026', color: C.green },
   ];
   document.getElementById('stats-row').innerHTML = stats.map(s => `
     <div class="stat-card">
@@ -1863,9 +1903,12 @@ function renderSessionDetail(d) {
     ['Cache Writes', fmtCost(c.cache_creation)],
     ['Cold Restarts', cold.count ? `${cold.count} · ${fmt(cold.tokens)} tok · ${fmtCost(cold.cost)}` : '0'],
   ].map(([label, value]) => `<div class="detail-stat"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`).join('');
+  const banner = document.getElementById('trace-banner');
+  banner.textContent = traceWhy ? 'Flagged: ' + traceWhy : '';
+  banner.classList.toggle('hidden', !traceWhy);
   document.getElementById('session-detail-body').innerHTML = turnsOfBand(d.turns, traceBand).map(({ t, i }) => {
     const cost = rowCost(t, t.timestamp.slice(0, 10));
-    return `<tr${traceHighlight.has(t.message_id) ? ' class="hl" aria-label="evidence call"' : ''}>
+    return `<tr${traceHighlight.has(t.message_id) ? ' class="hl" aria-label="evidence call"' : ''} data-i="${i}">
       <td class="muted">${esc(t.ts.replace('T', ' ').replace('Z', ''))}</td>
       <td title="${esc(t.actor)}">${esc(t.actor)}${t.estimated ? ' ' + provBadge('local_estimate') : ''}</td>
       <td class="muted">${t.gap_s == null ? '' : fmtGap(t.gap_s)}</td>
@@ -1887,6 +1930,12 @@ function renderSessionDetail(d) {
   document.getElementById('session-actors').textContent = d.actors.map(a =>
     `${a.actor}: ${fmt(a.turns)} turns` + (a.estimated_turns ? ` (${a.estimated_turns} estimated)` : '') +
     `, peak context ${fmt(a.peak_context)}`).join(' · ');
+  if (traceScrollPending) {  // once per open; an unknown turn id just shows the trace
+    traceScrollPending = false;
+    const at = findTurnRow(d.turns, traceTurn);
+    const row = at === null ? null : document.querySelector(`#session-detail-body tr[data-i="${at}"]`);
+    if (row) row.scrollIntoView({ block: 'center' });
+  }
   renderSessionBands(d);
   renderSessionToolBreakdown(turnsOfBand(d.turns, traceBand).map(x => x.t));
   renderSessionWaterfall(d);
@@ -2285,15 +2334,18 @@ function setTimelineLog(on) {
 
 function closeSessionDetail() { setTab('sessions'); }
 
-async function openSessionDetail(sessionId, highlightIds = '') {
-  traceHighlight = new Set(String(highlightIds || '').split(',').filter(Boolean));  // callers without ids clear it
+async function openSessionDetail(sessionId, highlightIds = '', { turn = '', why = '' } = {}) {
+  const mine = ++traceOpenSeq;
   try {
     const d = await fetchSession(sessionId);
+    if (mine !== traceOpenSeq) return;  // a later open superseded this one; its link state wins
     if (d.error) throw new Error(d.error);
+    traceHighlight = new Set(String(highlightIds || '').split(',').filter(Boolean));  // callers without ids clear it
+    traceTurn = turn; traceWhy = why; traceScrollPending = !!turn;
     selectedSessionDetail = d;
     traceBand = null;  // a band belongs to one session
     setTab('trace');  // panel visible first: the timeline canvas must not be built at 0x0
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    if (!turn) window.scrollTo({ top: 0, behavior: 'smooth' });  // a deep link scrolls to its turn in renderSessionDetail
   } catch(e) {
     console.error(e);
   }
@@ -2670,7 +2722,7 @@ async function loadData() {
     applyFilter();
     if (isFirstLoad) {
       const sessionId = readURLSession();
-      if (sessionId) openSessionDetail(sessionId);
+      if (sessionId) { const l = readTraceLink(window.location.search); openSessionDetail(sessionId, [...l.hl].join(','), { turn: l.turn, why: l.why }); }
       else { updateURL(startHash); gotoSection(startHash); }  // rewrites a legacy ?tab= to its canonical form
     }
   } catch(e) {
@@ -2718,11 +2770,23 @@ Object.assign(window, {
   setTimelineX, setTimelineLog, resetTimelineZoom, setWasteCause, setWasteCell, clearWasteWeek, setTraceBand, showAllWaste,
 });
 window.setTheme = setThemePref;
+window.recordFix = recordFix;
 
 // ── Init ─────────────────────────────────────────────────────────────────
 // Pricing must load before the first render so costs are correct. The table is
 // fetched from the server (single source); failure degrades to empty pricing
 // (costs show as $0 / N/A) rather than blocking the dashboard.
+async function renderBuildInfo() {
+  try {
+    const v = await (await fetch('/api/version')).json();
+    const d = new Date(v.started_at);
+    const when = displayTZ === 'utc' ? d.toISOString().slice(0, 16).replace('T', ' ') + ' UTC'
+      : d.toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
+    document.getElementById('build-info').textContent =
+      ['whytokens', v.version, v.commit, 'started ' + when].filter(Boolean).join(' · ');
+  } catch (e) { /* footer keeps the plain name */ }
+}
+
 async function init() {
   try {
     const table = await fetchPricing();
@@ -2738,10 +2802,15 @@ async function init() {
   renderPricingEditor();
   // Before the first fetch: the server buckets days in this timezone.
   displayTZ = readURLTZ();
+  renderBuildInfo();
   await loadExtensionTabs();  // before readURLTab/wireTabs so ?tab=<ext> resolves
   wireTabs();
   wireProjectExpand();
   wireSessionExpand();
+  // Pinned table headers sit under the filter bar, whose height changes when its controls wrap.
+  const bar = document.getElementById('filter-bar');
+  if (bar && 'ResizeObserver' in window) new ResizeObserver(() =>
+    document.documentElement.style.setProperty('--filter-bar-h', bar.offsetHeight + 'px')).observe(bar);
   loadData();
   refreshStatus();
   scheduleAutoRefresh();

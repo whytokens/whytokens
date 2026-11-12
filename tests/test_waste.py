@@ -8,8 +8,10 @@ Contract this file pins:
         session's cost) are reported, so a clean session reports [].
 
 Causes (all derivable from ``turns``; ctx(turn) = input + cache_read + cache_creation):
-  resident_output    context growth after a tool turn, carried by every later main-chain
-                     turn. EXCLUDES growth claimed by repeated_reads (disjoint).
+  resident_output    the cache write after a tool turn, capped at that turn's estimated
+                     tool-result tokens (tool_results.result_bytes); an unknown size claims
+                     nothing and is counted in the detail. EXCLUDES growth claimed by
+                     repeated_reads (disjoint).
   repeated_reads     growth after the 2nd+ Read of the SAME file_path in one session.
   subagent_preamble  the FIRST cache_creation of each subagent (agent_id; a cold read
                      starts a lane when agent_id is NULL). Later sidechain writes follow
@@ -21,7 +23,7 @@ Method (a verifier is not done until it has been seen to fail): one known-good
 session must report [], one mutant per detector must be caught with the right top cause,
 one mixed session must rank the bigger cause first, and no session may have its findings
 sum to more than it actually cost (double-counting guard). Fixtures go through the real
-scanner path (JSONL -> scan()), not hand-inserted rows.
+scanner path (JSONL -> scan_all()), not hand-inserted rows.
 """
 
 import importlib
@@ -35,13 +37,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pricing
-from scanner import scan
+import waste
+from sources import ClaudeSource, scan_all
 
 MODEL = "claude-sonnet-4-6"
 T0 = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
 CAUSES = ("resident_output", "repeated_reads", "subagent_preamble", "idle_gap", "uncached_input",
           "cache_miss_rebuild")
-KEYS = {"cause", "session_id", "usd", "detail", "fix", "tier", "advice", "evidence", "session_usd", "attribution"}
+KEYS = {"cause", "session_id", "usd", "detail", "fix", "tier", "advice", "evidence", "session_usd", "attribution", "action"}
 
 
 def _ts(minutes, seconds=0):
@@ -49,8 +52,12 @@ def _ts(minutes, seconds=0):
 
 
 def _rec(sid, n, ts, inp=200, read=0, create=400, out=300, tools=(), side=False, agent=None, advisor=0,
-         mid=True, compact=False):
-    """One assistant record in the Claude Code envelope the scanner parses."""
+         mid=True, compact=False, result_tokens=None):
+    """One assistant record in the Claude Code envelope the scanner parses. Each tool call is
+    followed by a user tool_result of ``result_tokens`` estimated tokens (None, the default: no
+    result record, so the call's size is unknown);
+    a list gives one size per call."""
+    sizes = list(result_tokens) if isinstance(result_tokens, (list, tuple)) else [result_tokens] * len(tools)
     content = [{"type": "text", "text": "..."}] + [
         {"type": "tool_use", "id": f"tu-{sid}-{n}-{i}", "name": name, "input": arg}
         for i, (name, arg) in enumerate(tools)]
@@ -68,30 +75,38 @@ def _rec(sid, n, ts, inp=200, read=0, create=400, out=300, tools=(), side=False,
                               **({"iterations": [{"type": "message"},
                                                  {"type": "advisor_message", "input_tokens": advisor,
                                                   "output_tokens": 2_000}]} if advisor else {})}},
-    })
+    }) + "".join("\n" + json.dumps({
+        "type": "user", "sessionId": sid, "timestamp": ts, "cwd": "/home/dev/acme/app", "isSidechain": side,
+        **({"agentId": agent} if agent is not None else {}),
+        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"tu-{sid}-{n}-{i}",
+                                                 "content": "x" * round(size * waste.RESULT_BYTES_PER_TOKEN)}]}})
+        for i, size in enumerate(sizes) if size is not None)
 
 
-def _main_chain(sid, n_turns, base, tool_at=None, growth=0, gap_after=None):
+def _main_chain(sid, n_turns, base, tool_at=None, growth=0, gap_after=None, results=None):
     """A main-chain session: turn 1 writes ``base``, later turns read it back.
     ``tool_at`` {turn_no: [(tool, input)]} adds tool calls; the NEXT turn grows by
-    ``growth[turn_no]``. ``gap_after`` = turn number followed by a 45-minute idle gap."""
-    tool_at, growth = tool_at or {}, growth or {}
+    ``growth[turn_no]``. ``gap_after`` = turn number followed by a 45-minute idle gap.
+    Each tool result is sized to that growth unless ``results`` {turn_no: tokens} says otherwise."""
+    tool_at, growth, results = tool_at or {}, growth or {}, results or {}
     lines, ctx, minute, n = [], base, 0, 0
     for t in range(1, n_turns + 1):
         n += 1
+        res = results.get(t, growth.get(t, 0) + 400)  # default: the result is exactly the next growth
         if t == 1:
-            lines.append(_rec(sid, n, _ts(minute), read=0, create=base, tools=tool_at.get(t, ())))
+            lines.append(_rec(sid, n, _ts(minute), read=0, create=base, tools=tool_at.get(t, ()), result_tokens=res))
         elif gap_after is not None and t == gap_after + 1:
-            lines.append(_rec(sid, n, _ts(minute), read=0, create=ctx, tools=tool_at.get(t, ())))
+            lines.append(_rec(sid, n, _ts(minute), read=0, create=ctx, tools=tool_at.get(t, ()), result_tokens=res))
         else:
             grow = growth.get(t - 1, 0) + 400
-            lines.append(_rec(sid, n, _ts(minute), read=ctx, create=grow, tools=tool_at.get(t, ())))
+            lines.append(_rec(sid, n, _ts(minute), read=ctx, create=grow, tools=tool_at.get(t, ()), result_tokens=res))
             ctx += grow
         minute += 45 if (gap_after is not None and t == gap_after) else 3
     return lines
 
 
 READ_BIG = ("Read", {"file_path": "/src/big.py"})
+RES = 21_000  # a tool result bigger than any write it precedes in these fixtures: the cap never bites
 
 FIXTURES = {
     # known-good: flat context, no tools, no gaps, no sidechain -> must report []
@@ -124,10 +139,10 @@ def _subagent_session():
         minute = 3 * (t - 1)
         dispatch = [("Agent", {"prompt": "sweep"})] if 2 <= t <= 6 else ()
         if t == 1:
-            lines.append(_rec(sid, n, _ts(minute), read=0, create=ctx, tools=dispatch))
+            lines.append(_rec(sid, n, _ts(minute), read=0, create=ctx, tools=dispatch, result_tokens=RES))
         else:
             grow = 1_500 if 3 <= t <= 7 else 400
-            lines.append(_rec(sid, n, _ts(minute), read=ctx, create=grow, tools=dispatch))
+            lines.append(_rec(sid, n, _ts(minute), read=ctx, create=grow, tools=dispatch, result_tokens=RES))
             ctx += grow
         if dispatch:
             for k, (read, create) in enumerate(((0, 45_000), (45_000, 300), (45_300, 300))):
@@ -144,7 +159,7 @@ def _busy_gap_session():
     running the whole time). The main context's cache still expired and was rewritten,
     yet the user was NOT idle: idle_gap must not fire and its fix must not be offered."""
     sid, ctx, lines = "busy_gap", 30_000, []
-    lines.append(_rec(sid, 1, _ts(0), read=0, create=ctx, tools=[("Agent", {"prompt": "long sweep"})]))
+    lines.append(_rec(sid, 1, _ts(0), read=0, create=ctx, tools=[("Agent", {"prompt": "long sweep"})], result_tokens=RES))
     for k, m in enumerate((5, 15, 25, 35)):
         lines.append(_rec(sid, 2 + k, _ts(m), read=8_000 if k else 0, create=300 if k else 8_000, side=True))
     lines.append(_rec(sid, 6, _ts(39), read=0, create=ctx + 1_000))  # 4 min after the last sidechain turn: under the 5m TTL
@@ -154,10 +169,25 @@ def _busy_gap_session():
 
 FIXTURES["busy_gap"] = _busy_gap_session()
 
+
+def _lane_gap_session(sid, gap_min):
+    """One subagent lane: a cold preamble, a Bash call, then a next turn ``gap_min`` later that
+    rewrites the whole prefix (cache_read 0) as a TTL expiry would."""
+    return [_rec(sid, 1, _ts(0), read=0, create=10_000, tools=[("Agent", {"prompt": "a"})]),
+            _rec(sid, 2, _ts(1), read=0, create=30_000, side=True, agent="a1"),
+            _rec(sid, 3, _ts(2), read=30_000, create=500, side=True, agent="a1", tools=[("Bash", {"command": "sleep"})],
+                 result_tokens=RES),
+            _rec(sid, 4, _ts(2 + gap_min), read=0, create=31_000, side=True, agent="a1"),
+            _rec(sid, 5, _ts(3 + gap_min), read=10_000, create=400)]
+
+
+FIXTURES["lane_idle"] = _lane_gap_session("lane_idle", 8)
+FIXTURES["lane_warm"] = _lane_gap_session("lane_warm", 2)
+
 PREAMBLE, GROWTH = 30_000, 20_000
 
 
-def _subagent_growth_session(sid, ids=True):
+def _subagent_growth_session(sid, ids=True, result_tokens=RES):
     """Two subagents run interleaved. Each writes a 30k preamble once, then calls its own
     tool (a1 Bash, a2 Grep) every turn and grows its OWN context 20k per turn for 9 turns.
     Only the two first writes are preamble; the growth is tool output kept in that
@@ -177,10 +207,12 @@ def _subagent_growth_session(sid, ids=True):
             advisor = 50_000 if (agent, k) == ("a1", 3) else 0
             if k == 0:
                 lines.append(_rec(sid, n, ts, read=0, create=PREAMBLE, tools=call, side=True,
-                                  agent=agent if ids is True else ("" if ids == "" else None)))
+                                  agent=agent if ids is True else ("" if ids == "" else None),
+                                  result_tokens=result_tokens))
             else:
                 lines.append(_rec(sid, n, ts, read=ctx[agent], create=GROWTH, tools=call, side=True,
-                                  agent=agent if ids is True else ("" if ids == "" else None), advisor=advisor))
+                                  agent=agent if ids is True else ("" if ids == "" else None), advisor=advisor,
+                                  result_tokens=result_tokens))
                 ctx[agent] += GROWTH
     lines.append(_rec(sid, n + 1, _ts(12), read=10_000, create=400, advisor=50_000))
     return lines
@@ -189,22 +221,25 @@ def _subagent_growth_session(sid, ids=True):
 FIXTURES["sub_growth"] = _subagent_growth_session("sub_growth")
 FIXTURES["sub_growth_noid"] = _subagent_growth_session("sub_growth_noid", ids=False)
 FIXTURES["sub_growth_blankid"] = _subagent_growth_session("sub_growth_blankid", ids="")
+# Same lanes, but every tool result is 100 tokens: the 20k growth is the agents' own work.
+FIXTURES["sub_tiny"] = _subagent_growth_session("sub_tiny", result_tokens=100)
 # Two interleaved agents both Read /src/x.py on every turn. Only a1 reads it a second time
 # within its OWN lane, so only a1's growth after that re-read is repeated_reads; a2's single
 # read is ordinary resident output, never "repeated" because a1 read the same path.
 READ_X = ("Read", {"file_path": "/src/x.py"})
 FIXTURES["sub_reads"] = [_rec("sub_reads", 1, _ts(0), read=0, create=10_000,
-                              tools=[("Agent", {"prompt": "a"}), ("Agent", {"prompt": "b"})])] + [
+                              tools=[("Agent", {"prompt": "a"}), ("Agent", {"prompt": "b"})], result_tokens=RES)] + [
     _rec("sub_reads", 2 + 2 * k + j, _ts(1 + k, 20 * j), read=0 if k == 0 else PREAMBLE + GROWTH * (k - 1),
          create=PREAMBLE if k == 0 else GROWTH, tools=[READ_X] if (agent == "a1" or k == 0) else [],
-         side=True, agent=agent)
+         side=True, agent=agent, result_tokens=RES)
     for k in range(3) for j, agent in enumerate(("a1", "a2"))]
 # One subagent compacts mid-run: its 150k rewrite is a compaction, not output of the
 # Bash call before it. As on the main chain, the compaction turn's own tool call is not
 # carried forward either, so Bash is charged exactly the one 20k write before compaction.
-FIXTURES["sub_compact"] = [_rec("sub_compact", 1, _ts(0), read=0, create=10_000, tools=[("Agent", {"prompt": "a"})])] + [
+FIXTURES["sub_compact"] = [_rec("sub_compact", 1, _ts(0), read=0, create=10_000, tools=[("Agent", {"prompt": "a"})],
+                               result_tokens=RES)] + [
     _rec("sub_compact", 2 + k, _ts(1 + k), read=r, create=c, tools=[("Bash", {"command": str(k)})],
-         side=True, agent="a1", compact=(k == 2))
+         side=True, agent="a1", compact=(k == 2), result_tokens=RES)
     for k, (r, c) in enumerate(((0, PREAMBLE), (PREAMBLE, GROWTH), (0, 150_000), (150_000, GROWTH)))]
 # A cached main chain whose last message has no message.id and calls the advisor: the
 # scanner stores that advisor row with an EMPTY message_id (no prefix to recognise it by),
@@ -212,13 +247,22 @@ FIXTURES["sub_compact"] = [_rec("sub_compact", 1, _ts(0), read=0, create=10_000,
 FIXTURES["advisor_noid"] = _main_chain("advisor_noid", 6, base=20_000)[:-1] + [
     _rec("advisor_noid", 6, _ts(15), read=22_000, create=400, advisor=50_000, mid=False)]
 
+# Result-size cap: turn 2 calls a tool and turn 3 writes 60,400 tokens (a long reply, thinking,
+# the next prompt and the result together). Only the result's estimated size may be claimed.
+READ_A, BASH = ("Read", {"file_path": "/src/a.py"}), ("Bash", {"command": "ls"})
+for _sid, _tools, _res in (("cap_tiny", [BASH], 50), ("cap_part", [READ_A], 30_000),
+                           ("cap_over", [READ_A], 100_000), ("cap_unknown", [READ_A, BASH], [30_000, None])):
+    FIXTURES[_sid] = _main_chain(_sid, 10, base=20_000, tool_at={2: _tools}, growth={2: 60_000}, results={2: _res})
+
 # Subagent transcript written under <session>/subagents/, so the scanner also mints its
 # AgentSummary row. a1 writes a 30k preamble then grows 20k after each of 5 Bash calls.
 SUBAGENT_FILES = {("summary", "agent-a1"): [
     _rec("summary", 100 + k, _ts(1 + k), read=0 if k == 0 else PREAMBLE + GROWTH * (k - 1),
-         create=PREAMBLE if k == 0 else GROWTH, tools=[("Bash", {"command": f"s{k}"})], side=True, agent="a1")
+         create=PREAMBLE if k == 0 else GROWTH, tools=[("Bash", {"command": f"s{k}"})], side=True, agent="a1",
+         result_tokens=RES)
     for k in range(6)]}
-FIXTURES["summary"] = [_rec("summary", 1, _ts(0), read=0, create=10_000, tools=[("Agent", {"prompt": "a"})]),
+FIXTURES["summary"] = [_rec("summary", 1, _ts(0), read=0, create=10_000, tools=[("Agent", {"prompt": "a"})],
+                            result_tokens=RES),
                        _rec("summary", 2, _ts(8), read=10_000, create=400)]
 EXPECTED_TOP = {"resident": "resident_output", "reread": "repeated_reads",
                 "subagent": "subagent_preamble", "idle": "idle_gap",
@@ -239,7 +283,8 @@ class _Scanned(unittest.TestCase):
             (proj / sid / "subagents").mkdir(parents=True)
             (proj / sid / "subagents" / f"{stem}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
         cls.db = str(Path(cls.tmp) / "usage.db")
-        scan(projects_dir=proj.parent, db_path=cls.db, verbose=False)
+        # the product path (scan_all + ClaudeSource): the vendored scan() alone writes no tool_results
+        scan_all(db_path=cls.db, verbose=False, sources=[ClaudeSource(projects_dirs=[str(proj.parent)])])
 
     @classmethod
     def tearDownClass(cls):
@@ -368,7 +413,7 @@ class TestWasteReport(_Scanned):
         self.assertEqual(self._rows("SELECT SUM(is_compact_summary) FROM turns WHERE session_id='sub_compact'"),
                          [(1,)])
         detail = {f["cause"]: f for f in self.waste.report(self.db, session_id="sub_compact")}["resident_output"]["detail"]
-        self.assertIn(f"Bash ({GROWTH:,}) caused {GROWTH:,} cache-write tokens", detail)
+        self.assertIn(f"Bash ({GROWTH:,}) kept an estimated {GROWTH:,} cache-write tokens", detail)
 
     def test_advisor_row_without_message_id_is_not_uncached_input(self):
         ids = self._rows("SELECT message_id FROM turns WHERE session_id='advisor_noid' AND tool_name='advisor'")
@@ -407,7 +452,10 @@ class TestWasteReport(_Scanned):
         finally:
             conn.close()
         self.assertEqual(self.waste.report(db, session_id="clean"), [])
-        self.assertTrue(self.waste.report(db, session_id="resident"))
+        self.assertTrue(self.waste.report(db, session_id="idle"))
+        # without turns.message_id no tool result can be joined: its size is unknown, so nothing
+        # is claimed (it used to claim the whole next write)
+        self.assertEqual(self.waste.report(db, session_id="resident"), [])
 
     def test_idle_gap_prices_compacting_before_the_ttl(self):
         # 61,600 tokens rebuilt at the write rate; kept warm they would have been cache reads
@@ -419,6 +467,16 @@ class TestWasteReport(_Scanned):
         self.assertIn(f"${paid - warm:.2f}", f["detail"])
         self.assertIn(f"${paid:.2f}", f["detail"])
         self.assertNotIn("$", f["fix"])  # fix is shared across a project/cause group in the UI
+
+    def test_subagent_lane_idle_gap_is_not_resident_output(self):
+        causes = {f["cause"]: f for f in self.waste.report(self.db, session_id="lane_idle")}
+        self.assertIn("idle_gap", causes)
+        self.assertNotIn("resident_output", causes)
+        self.assertIn("subagent waits", causes["idle_gap"]["fix"])
+        self.assertTrue(all(e["agent_id"] == "a1" for e in causes["idle_gap"]["evidence"]))
+        warm = {f["cause"] for f in self.waste.report(self.db, session_id="lane_warm")}
+        self.assertNotIn("idle_gap", warm)
+        self.assertIn("resident_output", warm)
 
     def test_gap_filled_by_subagent_work_is_not_idle(self):
         causes = [f["cause"] for f in self.waste.report(self.db, session_id="busy_gap")]
@@ -434,6 +492,37 @@ class TestWasteReport(_Scanned):
         for tool in ("offset/limit", "Grep before Read", "tail", "Explore subagent"):
             self.assertIn(tool, top["fix"])
         self.assertNotIn("caveman", top["fix"].lower())
+
+    def _resident(self, sid):
+        """resident_output with no threshold, so a full-write claim cannot hide under the floor."""
+        return {f["cause"]: f for f in self.real_waste.report(self.db, session_id=sid, min_share=0, min_usd=0)
+                }.get("resident_output")
+
+    def test_long_reply_after_tiny_tool_result_is_not_resident_output(self):
+        self.assertNotIn("resident_output", [f["cause"] for f in self.waste.report(self.db, session_id="cap_tiny")])
+        f = self._resident("cap_tiny")
+        self.assertIn("Bash (50) kept an estimated 50 cache-write tokens", f["detail"])
+        self.assertAlmostEqual(f["usd"], pricing.calc_cost(MODEL, 0, 0, 0, 50, _ts(6)))
+
+    def test_large_tool_result_claim_is_capped_at_its_estimated_size(self):
+        self.assertIn("Read (30,000) kept an estimated 30,000 ", self._resident("cap_part")["detail"])
+        # a result estimated bigger than the write can claim no more than the write
+        self.assertIn("Read (60,400) kept an estimated 60,400 ", self._resident("cap_over")["detail"])
+        self.assertEqual(self.waste.report(self.db, session_id="cap_part")[0]["cause"], "resident_output")
+
+    def test_unknown_result_size_claims_nothing_and_says_so(self):
+        detail = self._resident("cap_unknown")["detail"]
+        self.assertIn("Read (30,000) kept an estimated 30,000 ", detail)
+        self.assertNotIn("Bash", detail)
+        self.assertIn("1 tool call of unknown result size not counted.", detail)
+        self.assertNotIn("unknown", self._resident("cap_part")["detail"])
+
+    def test_subagent_lane_claim_is_capped_too(self):
+        self.assertNotIn("resident_output", [f["cause"] for f in self.waste.report(self.db, session_id="sub_tiny")])
+        # 2 agents x 9 growth writes x 100 tokens; the two Agent dispatches have no result record
+        detail = self._resident("sub_tiny")["detail"]
+        self.assertIn("Grep (900), Bash (900) kept an estimated 1,800 ", detail)
+        self.assertIn("2 tool calls of unknown result size not counted.", detail)
 
     def test_finding_shape_and_ordering(self):
         for sid in FIXTURES:

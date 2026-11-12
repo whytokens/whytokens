@@ -2,10 +2,15 @@
 
 Falsification contract: a fixture where nothing changed must NOT claim a saving; a real
 drop must; under 10 sessions on either side must say "insufficient data". Fixtures go
-through the real scanner (JSONL -> scan())."""
+through the real scanner (JSONL -> scan_all())."""
 
 import contextlib
+import http.client
 import io
+import json
+import time
+import threading
+from http.server import HTTPServer
 import shutil
 import sqlite3
 import tempfile
@@ -14,9 +19,11 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
+import api
 import cli
 import fixes
-from scanner import scan, init_db, CORE_TABLES
+from scanner import init_db, CORE_TABLES
+from sources import ClaudeSource, scan_all
 from tests.test_waste import _main_chain
 
 FIX_DATE = "2026-09-01"
@@ -41,7 +48,8 @@ def _build(before, after):
     for i, (day, w) in enumerate(zip(days, before + after)):
         (proj / f"s{i}.jsonl").write_text("\n".join(_session(f"s{i}", day.isoformat(), w)) + "\n", encoding="utf-8")
     db = str(Path(tmp) / "usage.db")
-    scan(projects_dir=proj.parent, db_path=db, verbose=False)
+    # scan_all, not the vendored scan(): only the source path writes tool_results (result sizes)
+    scan_all(db_path=db, verbose=False, sources=[ClaudeSource(projects_dirs=[str(proj.parent)])])
     return tmp, db
 
 
@@ -138,3 +146,122 @@ class VerifyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PostFixTests(unittest.TestCase):
+    """POST /api/fixes: records through fixes.record_fix behind the POST token."""
+    TOKEN = "tok-fix"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp, cls.db = _build([True] * 3, [False] * 3)
+        cls._patches = [mock.patch.object(api, "DB_PATH", Path(cls.db)),
+                        mock.patch.object(api.DashboardHandler, "token", cls.TOKEN),
+                        mock.patch.object(api.DashboardHandler, "allow_any_host", False)]
+        for p in cls._patches:
+            p.start()
+        cls.server = HTTPServer(("127.0.0.1", 0), api.DashboardHandler)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        for p in cls._patches:
+            p.stop()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def post(self, body, token=TOKEN):
+        c = http.client.HTTPConnection("127.0.0.1", self.port)
+        h = {"Content-Type": "application/json"}
+        if token is not None:
+            h[api.TOKEN_HEADER] = token
+        c.request("POST", "/api/fixes", body if isinstance(body, str) else json.dumps(body), h)
+        r = c.getresponse()
+        out = (r.status, r.read())
+        c.close()
+        return out
+
+    def rows(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute("SELECT project, cause FROM fixes").fetchall()
+        except sqlite3.OperationalError:  # table never created: nothing written
+            return []
+        finally:
+            conn.close()
+
+    def good(self, **kw):
+        return {"project": "acme/app", "cause": "resident_output", "note": "trim", **kw}
+
+    def test_same_fix_posted_again_is_not_recorded_twice(self):
+        body = self.good(note="dedupe me")
+        n = len(self.rows())
+        s1, b1 = self.post(body)
+        s2, b2 = self.post(body)
+        r1, r2 = json.loads(b1), json.loads(b2)
+        self.assertEqual((s1, s2), (200, 200))
+        self.assertEqual((r1["duplicate"], r2["duplicate"]), (False, True))
+        self.assertEqual(r1["fix"]["id"], r2["fix"]["id"])
+        self.assertEqual(len(self.rows()), n + 1)
+        self.post(self.good(note="a different rule"))  # another note is a new fix
+        self.assertEqual(len(self.rows()), n + 2)
+
+    def test_concurrent_posts_record_once(self):
+        body = self.good(note="race")
+        n = len(self.rows())
+        results = []
+        gate = threading.Barrier(16)
+
+        def go():
+            gate.wait()
+            results.append(api.post_fix(dict(body), db_path=self.db))
+        ts = [threading.Thread(target=go) for _ in range(16)]
+        real = fixes.record_fix
+
+        def slow(*a, **kw):  # widen the window between the duplicate check and the insert
+            time.sleep(0.05)
+            return real(*a, **kw)
+        with mock.patch.object(fixes, "record_fix", slow):
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        self.assertEqual(len(results), 16)
+        self.assertEqual(sum(not r["duplicate"] for r in results), 1)
+        self.assertEqual(len({r["fix"]["id"] for r in results}), 1)
+        self.assertEqual(len(self.rows()), n + 1)
+
+    def test_valid_post_records_and_verifies(self):
+        before = len(self.rows())
+        status, body = self.post(self.good())
+        self.assertEqual(status, 200)
+        r = json.loads(body)
+        self.assertEqual(r["status"], "insufficient data")
+        self.assertEqual(r["fix"]["fix_date"], date.today().isoformat())
+        self.assertEqual((r["before"]["sessions"], r["after"]["sessions"]), (6, 0))
+        self.assertEqual(len(self.rows()), before + 1)
+
+    def test_rejections_write_nothing(self):
+        before = self.rows()
+        cases = [(self.good(), None, 403), (self.good(), "wrong", 403),
+                 (self.good(cause="nope"), self.TOKEN, 400),
+                 (self.good(project="no/such"), self.TOKEN, 400),
+                 (self.good(note=5), self.TOKEN, 400), ([1], self.TOKEN, 400),
+                 ("{not json", self.TOKEN, 400), ("[" * 5000, self.TOKEN, 400)]
+        for body, token, want in cases:
+            self.assertEqual(self.post(body, token)[0], want, (body, token))
+        self.assertEqual(self.rows(), before)
+
+    def test_short_body_is_rejected(self):
+        before = self.rows()
+        c = http.client.HTTPConnection("127.0.0.1", self.port)
+        c.putrequest("POST", "/api/fixes")
+        c.putheader(api.TOKEN_HEADER, self.TOKEN)
+        c.putheader("Content-Length", "500")
+        c.endheaders()
+        c.send(json.dumps(self.good()).encode())
+        c.sock.shutdown(1)  # SHUT_WR: the server sees EOF before 500 bytes
+        self.assertEqual(c.getresponse().status, 400)
+        c.close()
+        self.assertEqual(self.rows(), before)

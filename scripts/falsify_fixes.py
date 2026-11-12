@@ -26,6 +26,8 @@ MUTANTS = [
     ("fixes.py", "needs at least", "needs about"),
     ("fixes.py", "if d < fix[\"fix_date\"]]", "if d < \"0000\"]"),
     ("scanner.py", '"tool_results", "fixes")', '"tool_results")'),
+    ("api.py", "        if not self._guard(post=True):", "        if not self._guard():"),
+    ("api.py", "or not isinstance(note, str):", "or False:"),
 ]
 
 

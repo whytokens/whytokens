@@ -241,20 +241,20 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         <label class="filter-check"><input id="session-cache-filter" type="checkbox" onchange="onSessionFilterChange()">Cache creation</label>
         <button class="filter-btn" onclick="clearSessionFilters()">Clear</button>
       </div>
-      <table>
+      <table class="sessions-table">
         <thead><tr>
           <th>Session</th>
           <th>Project</th>
           <th>Title</th>
-          <th class="sortable" onclick="setSessionSort('last')">Last Active <span class="sort-icon" id="sort-icon-last"></span></th>
-          <th class="sortable" onclick="setSessionSort('duration_min')">Duration <span class="sort-icon" id="sort-icon-duration_min"></span></th>
+          <th class="sortable" onclick="setSessionSort('last')">Last Active&nbsp;<span class="sort-icon" id="sort-icon-last"></span></th>
+          <th class="sortable" onclick="setSessionSort('duration_min')">Duration&nbsp;<span class="sort-icon" id="sort-icon-duration_min"></span></th>
           <th>Model</th>
-          <th class="sortable" onclick="setSessionSort('turns')">Turns <span class="sort-icon" id="sort-icon-turns"></span></th>
-          <th data-prov="official" class="sortable" onclick="setSessionSort('input')">Input <span class="sort-icon" id="sort-icon-input"></span></th>
-          <th data-prov="official" class="sortable" onclick="setSessionSort('output')">Output <span class="sort-icon" id="sort-icon-output"></span></th>
-          <th data-prov="official" class="sortable" onclick="setSessionSort('cache_read')">Cache Read <span class="sort-icon" id="sort-icon-cache_read"></span></th>
-          <th data-prov="official" class="sortable" onclick="setSessionSort('cache_creation')">Cache Creation <span class="sort-icon" id="sort-icon-cache_creation"></span></th>
-          <th data-prov="local_estimate" class="sortable" onclick="setSessionSort('cost')">Est. Cost <span class="sort-icon" id="sort-icon-cost"></span></th>
+          <th class="sortable" onclick="setSessionSort('turns')">Turns&nbsp;<span class="sort-icon" id="sort-icon-turns"></span></th>
+          <th data-prov="official" class="sortable" onclick="setSessionSort('input')">Input&nbsp;<span class="sort-icon" id="sort-icon-input"></span></th>
+          <th data-prov="official" class="sortable" onclick="setSessionSort('output')">Output&nbsp;<span class="sort-icon" id="sort-icon-output"></span></th>
+          <th data-prov="official" class="sortable" onclick="setSessionSort('cache_read')">Cache Read&nbsp;<span class="sort-icon" id="sort-icon-cache_read"></span></th>
+          <th data-prov="official" class="sortable" onclick="setSessionSort('cache_creation')">Cache Creation&nbsp;<span class="sort-icon" id="sort-icon-cache_creation"></span></th>
+          <th data-prov="local_estimate" class="sortable" onclick="setSessionSort('cost')">Est. Cost&nbsp;<span class="sort-icon" id="sort-icon-cost"></span></th>
         </tr></thead>
         <tbody id="sessions-body"></tbody>
       </table>
@@ -280,6 +280,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
   <section class="tab-panel" id="panel-trace" data-panel="trace" hidden>
     <div class="empty-state" id="trace-empty">No session selected. Pick a session on the Sessions screen, or follow a session link from Waste.</div>
     <div class="hidden" id="session-detail-view">
+  <div class="hidden" id="trace-banner" role="status"></div>
   <div class="detail-workspace-header">
     <div class="detail-title-group">
       <div class="detail-title" id="session-detail-title">Session Drilldown</div>
@@ -465,9 +466,9 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
 
 <footer>
   <div class="footer-content">
-    <p>Cost estimates use editable dashboard pricing defaults: Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>, September 2026) and OpenAI API pricing (July 2026). Custom price edits are saved in this browser only. Anthropic models (<em>fable</em>/<em>opus</em>/<em>sonnet</em>/<em>haiku</em>) are priced at API rates; plan-included Codex/GPT usage is shown in a distinct color as an API-equivalent estimate. Other models show <em>n/a</em>. Actual costs for Max/Pro/Plus subscribers differ from API pricing.</p>
+    <p>Cost estimates use editable dashboard pricing defaults: Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>, November 2026) and OpenAI API pricing (July 2026). Custom price edits are saved in this browser only. Anthropic models (<em>fable</em>/<em>opus</em>/<em>sonnet</em>/<em>haiku</em>) are priced at API rates; plan-included Codex/GPT usage is shown in a distinct color as an API-equivalent estimate. Other models show <em>n/a</em>. Actual costs for Max/Pro/Plus subscribers differ from API pricing.</p>
     <p>
-      whytokens &middot; Apache-2.0
+      <span id="build-info">whytokens</span> &middot; Apache-2.0
       &nbsp;&middot;&nbsp;
       Derived from <a href="https://github.com/phuryn/claude-usage" target="_blank">claude-usage</a> by Pawel Huryn (MIT)
     </p>

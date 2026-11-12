@@ -28,16 +28,16 @@ bill, and on a subscription plan you pay something different.
 
 ## Install and run
 
-Requires Python 3.9 or newer. No third-party dependencies.
+Requires Python 3.11 or newer. No third-party dependencies.
 
 ```sh
 # one-off, no install
-uvx --from git+https://github.com/whytokens/whytokens@v0.2.2 whytokens dashboard
+uvx --from git+https://github.com/whytokens/whytokens@v0.3.0 whytokens dashboard
 
 # or install the command
-pipx install git+https://github.com/whytokens/whytokens@v0.2.2
+pipx install git+https://github.com/whytokens/whytokens@v0.3.0
 # or, with uv
-uv tool install git+https://github.com/whytokens/whytokens@v0.2.2
+uv tool install git+https://github.com/whytokens/whytokens@v0.3.0
 whytokens dashboard
 
 # or from a clone
@@ -54,8 +54,8 @@ python cli.py dashboard       # python3 on macOS/Linux
 |---|---|
 | Overview | Totals, daily token usage with estimated cost, hourly distribution, projects, tools |
 | Sessions | Filterable session table with cost, model, tokens; expensive-session signals; CSV export |
-| Trace | One session turn by turn |
-| Waste | Spend attributed to avoidable causes by cause, week and project, with a fix for each and observed/inferred badges |
+| Trace | One session turn by turn; a finding links straight to the turn that caused it |
+| Waste | Spend attributed to avoidable causes by cause, week and project, with observed/inferred badges. Each finding opens a next-step card: the rule to paste, the calls that cost the most, a lower-bound estimate, and an "I made this change" button that records the fix and checks back later |
 | Sources | Which log locations were found and how many sessions came from each |
 | Settings | Editable price table, timezone, theme |
 

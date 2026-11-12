@@ -20,6 +20,8 @@ import api
 import config
 import policy
 import scanner
+from sources import scan_all
+from sources.claude import ClaudeSource
 import sources
 import waste
 from sources.coordinator import CoordinatorSource
@@ -44,6 +46,12 @@ def _rec(n, tools, ts="2026-08-20T10:%02d:00Z", create=30_000, read=0):
                               "cache_creation_input_tokens": create}}})
 
 
+def _result(n):
+    """The Read's tool_result, big enough that the repeated-read claim is not capped to nothing."""
+    return json.dumps({"type": "user", "sessionId": "s1", "timestamp": "2026-08-20T10:%02d:30Z" % n, "cwd": HOME, "isSidechain": False,
+                       "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"tu{n}0", "content": "x" * 200_000}]}})
+
+
 def _transcript_lines():
     reads = [("Read", {"file_path": f"{HOME}/src/big.py"})]
     return [
@@ -52,8 +60,8 @@ def _transcript_lines():
                  ("mcp__db__query", {"sql": f"select '{SECRET}'"}),
                  ("Grep", {"pattern": SECRET}),
                  ("Task", {"subagent_type": "Explore", "prompt": SECRET})]),
-        _rec(2, reads, create=60_000), _rec(3, reads, read=60_000, create=60_000),
-        _rec(4, reads, read=120_000, create=60_000), _rec(5, reads, read=180_000, create=60_000),
+        _rec(2, reads, create=60_000), _result(2), _rec(3, reads, read=60_000, create=60_000), _result(3),
+        _rec(4, reads, read=120_000, create=60_000), _result(4), _rec(5, reads, read=180_000, create=60_000), _result(5),
     ]
 
 
@@ -72,7 +80,8 @@ class PolicyCase(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def scan(self):
-        scanner.scan(projects_dir=self.proj.parent, db_path=self.db, verbose=False)
+        # the product path: scan() alone writes no tool_results, which the repeated-read cap needs
+        scan_all(db_path=str(self.db), verbose=False, sources=[ClaudeSource(projects_dirs=[str(self.proj.parent)])])
 
     def stored(self):
         with closing(sqlite3.connect(self.db)) as c:

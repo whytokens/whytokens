@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "whytokens"
-version = "0.2.2"
+version = "0.3.0"
 description = "Local profiler for Claude Code and Codex token usage"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
@@ -17,7 +17,7 @@ whytokens = "cli:main"
 # The code is flat top-level modules; api.py finds static/ and resources/ next to
 # itself, so those ship as top-level data packages to keep that layout when installed.
 [tool.setuptools]
-py-modules = ["api", "cli", "config", "extensions", "fixes", "policy", "pricing", "mcp_config", "pricing_check", "project_threads", "provenance", "scanner", "scanrun", "schema", "waste"]
+py-modules = ["api", "cli", "config", "extensions", "fixes", "policy", "pricing", "mcp_config", "pricing_check", "project_threads", "provenance", "scanner", "scanrun", "schema", "version", "waste"]
 packages = ["sources", "static", "static.modules", "static.vendor", "resources"]
 
 [tool.setuptools.package-data]

@@ -19,6 +19,7 @@ _KEEP = {
     "MultiEdit": ("file_path",), "NotebookEdit": ("notebook_path",),
     "Task": ("subagent_type",), "Agent": ("subagent_type",), "Skill": ("skill",),
 }
+_KEEP_INT = {"Read": ("offset", "limit")}  # numbers only: which range was read, never content
 # ToolSearch is deliberately absent. Its query text is not kept; the loaded tool names live
 # in tool_results.loaded_tools (identifiers, see docs/DATA_POLICY.md), not in tool_calls.
 _COMMAND_TOOLS = ("Bash", "exec", "shell", "apply_patch")
@@ -46,6 +47,10 @@ def redact_call(call):
         v = inp.get(key)
         if isinstance(v, str):
             out[key] = v[:_MAX_STR]
+    for key in _KEEP_INT.get(name, ()):
+        v = inp.get(key)
+        if isinstance(v, int) and not isinstance(v, bool):
+            out[key] = v
     if name in _COMMAND_TOOLS:
         n = inp.get("command_len")
         if not isinstance(n, int) or isinstance(n, bool):
@@ -53,7 +58,8 @@ def redact_call(call):
             n = len(cmd) if isinstance(cmd, str) else None
         if n is not None:
             out["command_len"] = n
-    return {"name": name, "input": out}
+    cid = call.get("id")
+    return {"name": name, "input": out, **({"id": cid[:_MAX_STR]} if isinstance(cid, str) and cid else {})}
 
 
 def redact_calls(calls):

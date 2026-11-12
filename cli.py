@@ -592,6 +592,10 @@ def parse_named_arg(args, flag):
     return None
 
 def main():
+        if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+            import version
+            print(version.line())
+            sys.exit(0)
         if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
             print(USAGE)
             sys.exit(0)
