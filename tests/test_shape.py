@@ -330,7 +330,14 @@ class MixTests(Base):
 class VerdictUnchangedTests(unittest.TestCase):
     def test_verify_matches_the_frozen_baseline(self):
         from tests.verify_golden import capture
-        self.assertEqual(capture(), json.loads(GOLDEN.read_text(encoding="utf-8")))
+
+        def rounded(v):  # Python 3.12 made float sum() compensated, so 3.11 differs in the last bit
+            if isinstance(v, float):
+                return round(v, 9)
+            if isinstance(v, dict):
+                return {k: rounded(x) for k, x in v.items()}
+            return [rounded(x) for x in v] if isinstance(v, list) else v
+        self.assertEqual(rounded(capture()), rounded(json.loads(GOLDEN.read_text(encoding="utf-8"))))
 
 
 class TagTests(Base):
