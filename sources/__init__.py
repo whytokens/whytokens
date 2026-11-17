@@ -196,6 +196,9 @@ def scan_all(db_path=DB_PATH, projects_dir=None, verbose=True, sources=None, ext
         # prompt_seq + tool_results for pre-existing rows (Claude only).
         if hasattr(source, "backfill_tool_results"):
             source.backfill_tool_results(conn)
+        # retry_loop inputs (is_error, Bash command_hash) for pre-existing rows (Claude only).
+        if hasattr(source, "backfill_retry_inputs"):
+            source.backfill_retry_inputs(conn)
         # ToolSearch loaded_tools for pre-existing tool_results rows (Claude only).
         if hasattr(source, "backfill_deferred_loads"):
             source.backfill_deferred_loads(conn)

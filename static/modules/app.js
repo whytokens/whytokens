@@ -23,8 +23,10 @@ import { watchProvenance, provBadge, addSplit, orUnknown } from './provenance.js
 import { writeTraceLink, readTraceLink, findTurnRow } from './tracelink.js';
 import { renderChanges } from './changes.js';
 import { verifySlot, fillVerifySlots, resetVerify, recordButton, recordFix } from './verify.js';
-import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchSessionWaste, fetchStatus } from './api.js';
-import { readSessionState, writeSessionState, readWasteState, writeWasteState, drillHref, CARD_TARGET, DEFAULT_SORT, overheadIndex, overheadOf } from './drill.js';
+import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchSessionWaste, fetchStatus, fetchBudget, postBudget, fetchWhatif } from './api.js';
+import { budgetBandHTML } from './budget.js';
+import { whatifCellHTML, lanesLineHTML } from './whatif.js';
+import { readSessionState, writeSessionState, readWasteState, writeWasteState, drillHref, CARD_TARGET, DEFAULT_SORT, overheadIndex, overheadOf, counted } from './drill.js';
 
 // Chart.js is loaded as a classic UMD script before this module (see index.html),
 // so it lives on window. Aliased here so // @ts-check doesn't flag the global.
@@ -885,7 +887,7 @@ function aggregate() {
 function renderTab(name) {
   refreshTokens();  // re-read CSS colours: a theme change only has to call renderTab
   if (extTabs.has(name)) { renderExtTab(name); return; }  // own data; not gated on rawData
-  if (name === 'settings') { renderPricingEditor(); return; }
+  if (name === 'settings') { renderPricingEditor(); renderBudgetSetting(); return; }
   if (name === 'sources') { renderSources(); return; }
   if (name === 'changes') { renderChanges(document.getElementById('panel-changes')); return; }
   if (name === 'trace') { renderTrace(); return; }
@@ -896,6 +898,8 @@ function renderTab(name) {
       document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution — ' + RANGE_LABELS[selectedRange];
       renderStats(lastTotals, lastCostTotals);
       renderWhereToAct();
+      renderBudgetBand();
+      loadModelWhatif();
       renderDailyChart(lastDaily);
       renderHourlyChart(lastHourlyAgg);
       renderModelChart(lastByModel);
@@ -938,6 +942,7 @@ const CAUSE_LABEL = {
   subagent_preamble: 'Subagent preambles', idle_gap: 'Idle gaps (cache expiry)',
   uncached_input: 'Uncached input', cache_miss_rebuild: 'Unexpected cache misses',
   deferred_tool_load: 'Deferred tool schemas kept in context',
+  large_context: 'Context carried past 250K', retry_loop: 'Retry loops', fixed_prefix: 'Fixed prefix re-read',
 };
 // How much of each cause a user can cut: overhead is not all waste. Keys must equal waste.CAUSES.
 const CAUSE_AVOID = {
@@ -948,6 +953,9 @@ const CAUSE_AVOID = {
   uncached_input: ['partly avoidable', 'Your newest message is always uncached; repeated material that misses the cache is the part you can cut.'],
   cache_miss_rebuild: ['avoidable', 'The cache broke without an obvious reason. Usually a changed system prompt, tools or model mid-session.'],
   deferred_tool_load: ['mostly avoidable', 'Tool schemas loaded but never called still ride along in every later turn.'],
+  large_context: ['observation', 'Every turn re-reads the whole context. Past 250K, a handoff or /compact is cheaper than carrying it on. Not added to the overhead total.'],
+  retry_loop: ['mostly avoidable', 'The same call failed three or more times in a row in one prompt. After the second failure, read the error and change course.'],
+  fixed_prefix: ['observation', 'System prompt, tool schemas and always-loaded instructions are re-read on every turn. Not added to the overhead total.'],
 };
 const avoidTag = c => CAUSE_AVOID[c]
   ? `<span class="avoid-tag" title="${esc(CAUSE_AVOID[c][1])}">${esc(CAUSE_AVOID[c][0])}</span>` : '';
@@ -966,6 +974,10 @@ function actionRows(s, a, ids, why) {
   if (a.id === 'compact_before_break' || a.id === 'subagent_waits')
     return ['<th>When</th><th>Who</th><th>Gap</th><th>Tokens</th><th>Cost</th>', a.calls.map(c =>
       `<tr><td class="muted">${link(c, stampOf(c.at))}</td><td>${esc(c.side ? (c.agent_type || 'subagent') : 'main thread')}</td><td class="num">${esc(c.minutes)}m</td>` +
+      `<td class="num">${fmt(c.tokens)}</td><td class="num">${fmtCostBig(c.usd)}</td></tr>`)];
+  if (a.id === 'split_or_compact')
+    return ['<th>Crossing turn</th><th>Context</th><th>Above threshold</th><th>Cost</th>', a.calls.map(c =>
+      `<tr><td class="muted">${link(c, stampOf(c.at))}</td><td class="num">${fmt(c.context)}</td>` +
       `<td class="num">${fmt(c.tokens)}</td><td class="num">${fmtCostBig(c.usd)}</td></tr>`)];
   if (a.id === 'small_jobs_inline')
     return ['<th>When</th><th>Subagent</th><th>Turns</th><th>Cost</th>', a.calls.map(c =>
@@ -1007,7 +1019,7 @@ function sessionFindingsHTML(p, project) {
   const fs = p && p.findings;
   if (!fs) return '<p class="muted">Findings unavailable for this session.</p>';
   if (!fs.length) return '<p class="muted">No attributed overhead found in this session.</p>';
-  const total = fs.reduce((n, f) => n + f.usd, 0);
+  const total = fs.filter(counted).reduce((n, f) => n + f.usd, 0);
   return `<div class="section-title">Findings in this session <span class="muted">· ${fmtCostBig(total)} attributed overhead (lower bound)</span></div>` +
     fs.map(f => {
       const label = CAUSE_LABEL[f.cause] || f.cause;
@@ -1026,10 +1038,10 @@ function sessionFindingsHTML(p, project) {
 function groupWaste(findings, sessions, cause = null) {
   const byId = new Map(sessions.map(s => [s.full_session_id, s]));
   const inScope = findings.filter(f => byId.has(f.session_id));
-  const spend = new Map(inScope.map(f => [f.session_id, f.session_usd]));
+  const spend = new Map(inScope.filter(counted).map(f => [f.session_id, f.session_usd]));
   const causes = new Map(), groups = new Map();
   for (const f of inScope) {
-    const c = causes.get(f.cause) || { cause: f.cause, tier: f.tier, usd: 0, sessions: 0, observed: 0, inferred: 0 };
+    const c = causes.get(f.cause) || { cause: f.cause, tier: f.tier, usd: 0, sessions: 0, observed: 0, inferred: 0, in_total: counted(f) };
     c.usd += f.usd; c.sessions++;
     addSplit(c, f);  // a mixed cause keeps its observed and inferred halves apart
     causes.set(f.cause, c);
@@ -1048,8 +1060,9 @@ function groupWaste(findings, sessions, cause = null) {
   }
   const byUsd = (a, b) => b.usd - a.usd;
   for (const g of groups.values()) g.sessions.sort(byUsd);
-  const total = inScope.reduce((sum, f) => sum + f.usd, 0);
-  for (const c of causes.values()) c.share = total ? c.usd / total : 0;  // of all attributed waste
+  const total = inScope.filter(counted).reduce((sum, f) => sum + f.usd, 0);
+  // of all attributed waste; an observation is not part of that total, so it has no share
+  for (const c of causes.values()) c.share = c.in_total && total ? c.usd / total : null;
   return {
     cause,
     total,
@@ -1076,7 +1089,7 @@ function weeklyWaste(findings, sessions, costOf) {
   const wk = new Map();
   const at = k => wk.get(k) || wk.set(k, { week: k, spend: 0, waste: 0 }).get(k);
   for (const s of sessions) if (s.last_date) at(weekOf(s.last_date)).spend += costOf(s);
-  for (const f of findings) { const s = byId.get(f.session_id); if (s && s.last_date) at(weekOf(s.last_date)).waste += f.usd; }
+  for (const f of findings) { const s = byId.get(f.session_id); if (s && s.last_date && counted(f)) at(weekOf(s.last_date)).waste += f.usd; }
   const keys = [...wk.keys()].sort();
   if (!keys.length) return [];
   const out = [];
@@ -1193,7 +1206,7 @@ async function renderWasteTab() {
   el('waste-measure').innerHTML = not.length ? '<tbody>' + not.map(s => {
     const reasons = [...new Set(causesM.filter(c => m.causes[c][s].status !== 'measured').map(c => {
       const x = m.causes[c][s];
-      return x.status === 'inferred' ? label(c) + ': inferred (' + x.reason + ')' : x.reason;
+      return x.status === 'inferred' ? label(c) + ': inferred (' + x.reason + ')' : x.status === 'partial' ? label(c) + ': ' + x.reason : x.reason;
     }))];
     return `<tr><td>${esc(s)}</td><td class="muted">${reasons.map(esc).join('<br>')}</td></tr>`;
   }).join('') + '</tbody>' : '';
@@ -1206,7 +1219,7 @@ async function renderWasteTab() {
     ` aria-pressed="${wasteCause === c.cause}" title="Attribution: ${esc(causeSplit(c))}. Click to show only this cause below.">` +
     `<span class="wb-label">${esc(label(c.cause))} ${avoidTag(c.cause)}</span>` +
     `<span class="wb-track"><span class="wb-fill" style="width:${top ? (100 * c.usd / top).toFixed(1) : 0}%"></span></span>` +
-    `<span class="wb-val">${fmtCostBig(c.usd)} <span class="muted">· ${fmtPct(c.share)} · ${c.sessions} session${c.sessions === 1 ? '' : 's'}` +
+    `<span class="wb-val">${fmtCostBig(c.usd)} <span class="muted">· ${c.share == null ? 'observation, not in total' : fmtPct(c.share)} · ${c.sessions} session${c.sessions === 1 ? '' : 's'}` +
     ` · ${splitBadges(c)}</span></span></button>` +
     `<a data-drill href="${esc(sessionsByCauseHref(c.cause))}" title="Sessions with this cause, biggest attributed overhead first">Top sessions</a></div>`
   ).join('') || '<p class="muted">Nothing to show.</p>';
@@ -1412,10 +1425,75 @@ async function renderWhereToAct() {
   }
   slot.innerHTML = v.causes.length
     ? '<div class="wta-head">Where to act: top causes of attributed overhead (lower bound, not savings)</div>' +
-      v.causes.slice(0, 3).map(c => `<a class="wta-row" data-drill href="${esc(wasteCauseHref(c.cause))}">` +
+      v.causes.filter(c => c.in_total).slice(0, 3).map(c => `<a class="wta-row" data-drill href="${esc(wasteCauseHref(c.cause))}">` +
         `<span>${esc(CAUSE_LABEL[c.cause] || c.cause)} ${avoidTag(c.cause)}</span><span class="num">${fmtCostBig(c.usd)}</span>` +
         `<span class="muted">${c.sessions} session${c.sessions === 1 ? '' : 's'}</span></a>`).join('')
     : '';
+}
+
+// Overview budget band: this calendar month against the monthly budget. Always the current month,
+// whatever range is selected; one fetch per overview render, a stale response is dropped.
+let budgetGen = 0;
+async function renderBudgetBand() {
+  const gen = ++budgetGen, slot = document.getElementById('budget-band');
+  let m = null;
+  try { m = await fetchBudget(displayTZ); } catch (e) { /* no band rather than a wrong one */ }
+  if (gen !== budgetGen || activeTab !== 'overview' || !slot) return;
+  const month = new URLSearchParams({ range: 'month' });
+  if (displayTZ === 'utc') month.set('tz', 'utc');
+  slot.innerHTML = budgetBandHTML(m, {
+    sessions: drillHref(month, { tab: 'sessions', sort: { col: 'cost', dir: 'desc' } }),
+    waste: drillHref(month, { tab: 'waste' }),
+    settings: drillHref(new URLSearchParams(), { tab: 'settings' }),
+  });
+}
+
+async function renderBudgetSetting() {
+  const input = document.getElementById('budget-input');
+  if (!input) return;
+  try { const m = await fetchBudget(displayTZ); input.value = m.budget == null ? '' : String(m.budget); } catch (e) { /* leave empty */ }
+}
+async function saveOrClearBudget(value) {
+  const status = document.getElementById('budget-status');
+  try {
+    await postBudget(value);
+    status.textContent = value == null ? 'Budget cleared.' : 'Saved.';
+    if (value == null) document.getElementById('budget-input').value = '';
+  } catch (e) { status.textContent = 'Not saved: ' + e.message; }
+}
+function saveBudget() {
+  const raw = document.getElementById('budget-input').value.trim(), v = Number(raw);
+  if (!raw || !isFinite(v) || v <= 0) { document.getElementById('budget-status').textContent = 'Enter an amount greater than 0, or use Clear.'; return; }
+  return saveOrClearBudget(v);
+}
+function clearBudget() { return saveOrClearBudget(null); }
+
+// Model what-if (Cost by Model column, subagent lanes, Trace): the server reprices; figures stay out of every total.
+let modelWhatif = new Map(), whatifGen = 0;
+async function loadModelWhatif() {
+  const gen = ++whatifGen, { start, end } = getRangeBounds(selectedRange);
+  try {
+    const res = await fetchWhatif({ to: 'next_tier', start, end, tz: displayTZ });
+    if (gen !== whatifGen) return;
+    modelWhatif = new Map((res.by_model || []).map(m => [m.model, m]));
+  } catch (e) { if (gen !== whatifGen) return; modelWhatif = new Map(); }  // an older failure must not blank a newer result
+  if (activeTab === 'overview') renderModelCostTable(lastByModel);
+}
+const sessionLanes = new Map();
+function lanesWhatif(sessionId) {
+  if (!sessionLanes.has(sessionId)) {
+    const p = fetchWhatif({ to: 'next_tier', actor: 'subagent', session_id: sessionId }).then(lanesLineHTML)
+      .catch(() => { if (sessionLanes.get(sessionId) === p) sessionLanes.delete(sessionId); return ''; });
+    sessionLanes.set(sessionId, p);
+  }
+  return sessionLanes.get(sessionId);
+}
+async function renderTraceWhatif(d) {
+  const box = document.getElementById('session-whatif');
+  box.innerHTML = ''; box.classList.add('hidden');
+  const html = await lanesWhatif(d.session.session_id);
+  if (selectedSessionDetail !== d || !html) return;
+  box.innerHTML = html; box.classList.remove('hidden');
 }
 
 // Bucket rows into 24 hours (display-TZ), summing turns + output, and count
@@ -1748,7 +1826,7 @@ function summarizeBreakdown(rows, day) {
   return [...byLabel.values()].sort((a, b) => b.cost - a.cost);
 }
 
-function breakdownRowsHTML(sessionId, rows, day) {
+function breakdownRowsHTML(sessionId, rows, day, whatifLine = '') {
   const buckets = summarizeBreakdown(rows, day);
   if (!buckets.length) {
     return `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}">
@@ -1779,7 +1857,8 @@ function breakdownRowsHTML(sessionId, rows, day) {
       <td class="num">${fmt(b.cache_creation)}</td>
       <td class="cost">${fmtCost(b.cost)}</td>
     </tr>` + (models.length > 1 ? modelRowsHTML(sessionId, b) : '');
-  }).join('');
+  }).join('') + (whatifLine ? `<tr class="breakdown-subrow whatif-row" data-parent-session="${esc(sessionId)}">
+      <td class="branch-cell" colspan="12">${whatifLine}</td></tr>` : '');
 }
 
 /** Per-model rows for one multi-model bucket, costliest first. */
@@ -1836,10 +1915,12 @@ function wireSessionExpand() {
       if (btn.getAttribute('aria-expanded') !== 'true' || !row.isConnected) return;
     }
     const day = /** @type {HTMLElement} */ (row).dataset.sessionDay || undefined;
+    const whatifLine = payload.error ? '' : await lanesWhatif(sessionId);
+    if (btn.getAttribute('aria-expanded') !== 'true' || !row.isConnected) return;
     const html = payload.error
       ? `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}">
            <td class="branch-cell muted" colspan="12">${esc(payload.error)}</td></tr>`
-      : breakdownRowsHTML(sessionId, payload.rows || [], day);
+      : breakdownRowsHTML(sessionId, payload.rows || [], day, whatifLine);
     row.insertAdjacentHTML('afterend', html);
   });
 }
@@ -2041,6 +2122,7 @@ function renderSessionDetail(d) {
   document.getElementById('session-detail-view').classList.remove('hidden');
   document.getElementById('session-detail-title').textContent = 'Session Drilldown — ' + s.display_id + '…';
   document.getElementById('session-detail-subtitle').textContent = s.session_id + ' · ' + s.project;
+  renderTraceWhatif(d);
   document.getElementById('session-detail-stats').innerHTML = [
     ['Project', s.project],
     ['Model', s.model],
@@ -2134,7 +2216,7 @@ async function renderSessionWaterfall(d) {
   card.classList.add('hidden');
   const w = await loadWaste();
   if (!w || selectedSessionDetail !== d) return;  // failed, or another session opened meanwhile
-  const wf = sessionWaterfall(w.findings, d.session.session_id,
+  const wf = sessionWaterfall(w.findings.filter(counted), d.session.session_id,
     sessionCostAtListRates({ model: d.session.model, by_model: d.turns }, (d.session.last || '').slice(0, 10)));
   if (!wf) return;
   const rows = [['Session total', 0, wf.total],
@@ -2564,6 +2646,7 @@ function renderModelCostTable(byModel) {
       <td class="num">${fmt(m.cache_read)}</td>
       <td class="num">${orUnknown(m.cache_creation, isEstimated(m.model))}</td>
       ${cell}
+      ${whatifCellHTML(modelWhatif.get(m.model))}
     </tr>`;
   }).join('');
   renderTableToggle('model-cost-foot', sorted.length, modelLimit, 'lessModelRows', 'moreModelRows', 'exportModelCSV');
@@ -2860,6 +2943,7 @@ async function loadData() {
     document.body.classList.remove('booting');
     wastePayload = null;  // findings follow the data: refetch on the next Waste render
     sessionFindings.clear();
+    sessionLanes.clear();  // a rescan changes an active session's lanes
     wasteGen++;
     renderMeta();
 
@@ -2940,6 +3024,8 @@ Object.assign(window, {
 });
 window.setTheme = setThemePref;
 window.recordFix = recordFix;
+window.saveBudget = saveBudget;
+window.clearBudget = clearBudget;
 
 // ── Init ─────────────────────────────────────────────────────────────────
 // Pricing must load before the first render so costs are correct. The table is

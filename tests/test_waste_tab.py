@@ -83,8 +83,9 @@ class TestApi(_Scanned):
         p = api.get_waste(db_path=self.db)
         self.assertEqual(p["basis"]["pricing"], "API list rate")
         self.assertIn("lower bound", p["basis"]["label"])
-        self.assertEqual({r["cause"] for r in p["rollup"]}, set(EXPECTED_TOP.values()) | {"idle_gap"})
-        self.assertAlmostEqual(p["total_usd"], sum(f["usd"] for f in p["findings"]))
+        # the 60K-prefix fixtures also carry the fixed_prefix observation, which is never in the total
+        self.assertEqual({r["cause"] for r in p["rollup"]}, set(EXPECTED_TOP.values()) | {"idle_gap", "fixed_prefix"})
+        self.assertAlmostEqual(p["total_usd"], sum(f["usd"] for f in p["findings"] if f["cause"] not in waste.UNCOUNTED))
         self.assertNotIn("clean", {f["session_id"] for f in p["findings"]})
         self.assertIn("causes", p["measurement"])
 

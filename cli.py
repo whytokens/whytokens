@@ -424,10 +424,14 @@ def cmd_waste(session_id=None):
         return
     print(f"amounts are {waste.BASIS['label']}")
     print(f"data through {newest}; run `whytokens scan` to refresh")
+    for cause, cells in waste.measurement(DB_PATH)["causes"].items():
+        if cells.get("claude", {}).get("status") == "partial":  # e.g. retry_loop sessions with no transcript left
+            print(f"{cause}: {cells['claude']['reason']}")
     print(f"{'session':<36} {'cause':<20} {'usd':>9}  detail  advice")
     for finding in findings:
         # full id: an 8-char prefix collided 93 times on a real DB and cannot round-trip into --session
-        print(f"{finding['session_id']:<36} {finding['cause']:<20} ${finding['usd']:>8.4f}  {finding['detail']}  {finding['advice']}")
+        obs = "" if finding["in_total"] else "  (observation, not in any total)"
+        print(f"{finding['session_id']:<36} {finding['cause']:<20} ${finding['usd']:>8.4f}{obs}  {finding['detail']}  {finding['advice']}")
 
 
 def cmd_export(as_json=False):
@@ -512,6 +516,8 @@ Usage:
   whytokens fix list                     List recorded fixes
   whytokens fix edit ID [--date D] [--note TEXT]   Correct a fix's date or note
   whytokens fix delete ID                Remove a recorded fix
+  whytokens budget [AMOUNT|--clear]      Show this month's spend vs the monthly budget (USD, API list
+                                             price); AMOUNT sets it, --clear removes it
   whytokens verify [FIX_ID]              Attributed share of spend for the fix's (project, cause),
                                              after vs before; needs 10 sessions each side
   whytokens pricing check [--offline]    Review diff of the shipped price table vs LiteLLM (OpenRouter
@@ -572,6 +578,35 @@ def cmd_pricing(rest):
     sys.exit(0 if ok else 1)
 
 
+def cmd_budget(rest, today=None):
+    import budget
+    if rest[:1] == ["--clear"]:
+        budget.set_budget(None, DB_PATH)
+        print("budget cleared")
+        return
+    if rest:
+        try:
+            budget.set_budget(float(rest[0]), DB_PATH)
+        except ValueError:
+            print("error: AMOUNT must be a finite number greater than 0 (usage: whytokens budget [AMOUNT|--clear])")
+            sys.exit(2)
+    m = budget.month_status(DB_PATH, today=today)
+    print(f"Month {m['month']} (estimated at API list price)")
+    print(f"  spent so far:        ${m['spent']:,.2f}")
+    print(f"  projected month-end: ${m['projected']:,.2f}")
+    if m["budget"] is None:
+        print("  budget:              not set (set one with `whytokens budget AMOUNT`)")
+    else:
+        over = m["gap"] > 0
+        print(f"  budget:              ${m['budget']:,.2f}")
+        print(f"  gap:                 {'over' if over else 'under'} by ${abs(m['gap']):,.2f}")
+        need = m["needed_daily"]
+        print("  needed daily rate:   " + (f"${need:,.2f}/day for the {m['days_remaining']} days left"
+                                         if need is not None else "none (no days left this month)"))
+    print("  " + ("Projection = spent + trailing 7-day daily average x days remaining" if m["method"] == "trailing_7d"
+                  else "Projection = spent + month-to-date daily average x days remaining (fewer than 7 days of data)"))
+
+
 def cmd_verify(fix_id=None):
     import fixes
     conn = require_db()
@@ -597,6 +632,7 @@ COMMANDS = {
     "fix": cmd_fix,
     "verify": cmd_verify,
     "pricing": cmd_pricing,
+    "budget": cmd_budget,
     "export": cmd_export,
     "dashboard": cmd_dashboard,
 }
@@ -649,6 +685,8 @@ def main():
             cmd_fix(rest)
         elif command == "pricing":
             cmd_pricing(rest)
+        elif command == "budget":
+            cmd_budget(rest)
         elif command == "verify":
             cmd_verify(rest[0] if rest else None)
         else:

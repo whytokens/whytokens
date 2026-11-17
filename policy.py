@@ -6,6 +6,7 @@ when ``WHYTOKENS_STORE_RAW_INPUTS`` is truthy. Stdlib only; imported by the scan
 and the Codex source so every writer of ``turns.tool_calls`` routes through here.
 """
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -24,6 +25,13 @@ _KEEP_INT = {"Read": ("offset", "limit")}  # numbers only: which range was read,
 # in tool_results.loaded_tools (identifiers, see docs/DATA_POLICY.md), not in tool_calls.
 _COMMAND_TOOLS = ("Bash", "exec", "shell", "apply_patch")
 _MAX_STR = 500
+
+
+def command_hash(cmd):
+    """Opaque identity of a shell command: sha256 of it with whitespace runs collapsed, 16 hex chars.
+    Lets a detector tell "the same command again" without storing the command. A short command's hash
+    can be brute-forced, so it is an identifier, not a secret (docs/DATA_POLICY.md)."""
+    return hashlib.sha256(" ".join(cmd.split()).encode("utf-8")).hexdigest()[:16]
 
 
 def store_raw_inputs():
@@ -58,6 +66,13 @@ def redact_call(call):
             n = len(cmd) if isinstance(cmd, str) else None
         if n is not None:
             out["command_len"] = n
+    if name == "Bash":  # Claude only: retry_loop is a Claude detector, Codex rows stay as they were
+        h = inp.get("command_hash")
+        if not isinstance(h, str):
+            cmd = inp.get("command")
+            h = command_hash(cmd) if isinstance(cmd, str) else None
+        if h:
+            out["command_hash"] = h[:16]
     cid = call.get("id")
     return {"name": name, "input": out, **({"id": cid[:_MAX_STR]} if isinstance(cid, str) and cid else {})}
 

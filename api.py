@@ -30,6 +30,9 @@ Routes:
   GET  /api/pricing            -> the single-source pricing table (pricing.PRICING)
   GET  /api/pricing/fallbacks  -> models in the DB with no price row of their own
   GET  /icon.svg               -> resources/icon.svg (header icon)
+  GET  /api/budget             -> budget.month_status(): this calendar month vs the monthly budget
+  POST /api/budget             -> {monthly_usd: number|null} set / clear the budget (token-guarded)
+  GET  /api/whatif?to&start&end&model&project&actor&session_id -> whatif.reprice(): repricing only
   POST /api/fixes              -> record a fix {project, cause, note[, date]}; returns its verification
   GET  /api/changes            -> Changes tab: fixes with status/ETA, project and cause pick-lists
   POST /api/fixes/edit         -> {id[, date][, note]}
@@ -814,7 +817,7 @@ def get_waste(db_path=None, session_id=None):
     if session_id:
         found = waste.report(db_path, session_id=session_id) if Path(db_path).exists() else []
         return {"basis": waste.BASIS, "session_id": session_id, "findings": found,
-                "total_usd": sum(f["usd"] for f in found)}
+                "total_usd": sum(f["usd"] for f in found if f.get("in_total", True))}
     if not Path(db_path).exists():
         return {"basis": waste.BASIS, "findings": [], "rollup": [], "total_usd": 0.0,
                 "measurement": {"sources": [], "causes": {}}}
@@ -832,13 +835,13 @@ def get_waste(db_path=None, session_id=None):
     rollup = {}
     for f in findings:
         r = rollup.setdefault(f["cause"], {"cause": f["cause"], "tier": f["tier"], "usd": 0.0, "sessions": 0,
-                                           "observed_usd": 0.0, "inferred_usd": 0.0})
+                                           "observed_usd": 0.0, "inferred_usd": 0.0, "in_total": f.get("in_total", True)})
         r["usd"] += f["usd"]
         r["sessions"] += 1
         r[f["attribution"] + "_usd"] += f["usd"]  # a mixed cause keeps both halves
         if r["tier"] != f["tier"]:
             r["tier"] = "inferred"  # mixed sources: the weaker tier, kept for old readers
-    payload = {"basis": waste.BASIS, "findings": findings, "total_usd": sum(f["usd"] for f in findings),
+    payload = {"basis": waste.BASIS, "findings": findings, "total_usd": sum(f["usd"] for f in findings if f.get("in_total", True)),
             "rollup": sorted(rollup.values(), key=lambda r: r["usd"], reverse=True),
             "measurement": waste.measurement(db_path)}
     _waste_cache = (key, payload)
@@ -1392,6 +1395,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/fixes":
             self._send_json(get_fixes())
+        elif path == "/api/budget":
+            import budget
+            self._send_json(budget.month_status(DB_PATH, tz=_qs1(parse_qs(parsed.query), "tz") or "local"))
+        elif path == "/api/whatif":
+            import whatif
+            q = parse_qs(parsed.query)
+            res = whatif.reprice(
+                _qs1(q, "to"), start=_qs1(q, "start"), end=_qs1(q, "end"), model=_qs1(q, "model"),
+                project=_qs1(q, "project"), actor=_qs1(q, "actor"), session_id=_qs1(q, "session_id"),
+                tz=_qs1(q, "tz"), db_path=DB_PATH)
+            self._send_json(res, status=400 if "error" in res else 200)
         elif path == "/api/changes":
             self._send_json(get_changes())
 
@@ -1455,6 +1469,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError("incomplete body")
                 self._send_json(handler(json.loads(raw)))
             except (ValueError, RecursionError) as e:  # ValueError includes json.JSONDecodeError
+                self._send_json({"error": str(e)}, status=400)
+            return
+        if path == "/api/budget":
+            import budget
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if not 0 < n <= 65536:
+                    raise ValueError("body missing or too large")
+                raw = self.rfile.read(n)
+                if len(raw) != n:
+                    raise ValueError("incomplete body")
+                body = json.loads(raw)
+                if not isinstance(body, dict) or "monthly_usd" not in body:
+                    raise ValueError("expected {monthly_usd: number|null}")
+                budget.set_budget(body["monthly_usd"], DB_PATH)
+                self._send_json(budget.month_status(DB_PATH))
+            except (ValueError, RecursionError) as e:
                 self._send_json({"error": str(e)}, status=400)
             return
         if path == "/api/rescan":

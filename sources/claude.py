@@ -14,6 +14,9 @@ from pathlib import Path
 
 import scanner
 
+# schema_meta marker of backfill_retry_inputs; waste.measurement reads it
+RETRY_INPUTS_MARKER = "retry_inputs_backfill_done_claude"
+
 NAME = "claude"
 
 
@@ -114,6 +117,64 @@ class ClaudeSource:
         scanner._meta_set(conn, marker, "1")
         conn.commit()
         return 1
+
+    def backfill_retry_inputs(self, conn):
+        """One-time backfill of the two retry_loop inputs for rows ingested before they existed,
+        from transcripts still on disk: ``tool_results.is_error`` and the Bash ``command_hash`` in
+        ``turns.tool_calls``. In-place UPDATEs of NULL / absent values only, matched by call id:
+        no row is inserted, deleted or re-priced, and a session whose transcript is gone is never
+        read, so it stays NULL (unmeasured). The marker is set only after every file was read, so
+        an interrupted or partly unreadable run simply repeats; filled values are never refilled."""
+        marker = RETRY_INPUTS_MARKER
+        if scanner._meta_get(conn, marker) == "1":
+            return 0
+        if not any(Path(d).exists() for d in self._dirs()):
+            return 0
+        if not (conn.execute("SELECT 1 FROM tool_results WHERE is_error IS NULL LIMIT 1").fetchone()
+                or conn.execute("SELECT 1 FROM turns WHERE tool_calls LIKE '%\"Bash\"%' "
+                                "AND tool_calls NOT LIKE '%command_hash%' LIMIT 1").fetchone()):
+            scanner._meta_set(conn, marker, "1")  # fresh or already current: nothing to read
+            conn.commit()
+            return 0
+        complete, filled = True, 0
+        for filepath in self.discover_files():
+            try:  # parse_jsonl_file swallows read errors; an unreadable file must keep the backfill retryable
+                open(filepath, "rb").close()
+            except OSError:
+                complete = False
+                continue
+            calls = {}
+            _, turns, _ = scanner.parse_jsonl_file(filepath, calls_out=calls)
+            before = conn.total_changes
+            conn.executemany("UPDATE tool_results SET is_error = ? WHERE call_id = ? AND is_error IS NULL",
+                             [(c["is_error"], cid) for cid, c in calls.items() if c.get("is_error") is not None])
+            hashes = {c["id"]: c["input"]["command_hash"] for t in turns for c in json.loads(t.get("tool_calls") or "[]")
+                      if isinstance(c, dict) and c.get("id") and isinstance(c.get("input"), dict)
+                      and c["input"].get("command_hash")}
+            if hashes:
+                for mid in {t["message_id"] for t in turns if t.get("message_id")}:
+                    row = conn.execute("SELECT tool_calls FROM turns WHERE message_id = ?", (mid,)).fetchone()
+                    try:
+                        stored = json.loads(row[0]) if row and row[0] else None
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(stored, list):
+                        continue
+                    changed = False
+                    for c in stored:
+                        inp = c.get("input") if isinstance(c, dict) else None
+                        if (isinstance(inp, dict) and c.get("name") == "Bash" and "command_hash" not in inp
+                                and "command" not in inp and c.get("id") in hashes):
+                            inp["command_hash"] = hashes[c["id"]]
+                            changed = True
+                    if changed:
+                        conn.execute("UPDATE turns SET tool_calls = ? WHERE message_id = ?", (json.dumps(stored), mid))
+            filled += conn.total_changes - before
+            conn.commit()  # per file: an interrupted run keeps what it filled
+        if complete:
+            scanner._meta_set(conn, marker, "1")
+        conn.commit()
+        return filled
 
     def backfill_deferred_loads(self, conn):
         """One-time backfill: ToolSearch ``loaded_tools`` for tool_results rows

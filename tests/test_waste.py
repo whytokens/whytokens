@@ -43,8 +43,8 @@ from sources import ClaudeSource, scan_all
 MODEL = "claude-sonnet-4-6"
 T0 = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
 CAUSES = ("resident_output", "repeated_reads", "subagent_preamble", "idle_gap", "uncached_input",
-          "cache_miss_rebuild")
-KEYS = {"cause", "session_id", "usd", "detail", "fix", "tier", "advice", "evidence", "session_usd", "attribution", "action"}
+          "cache_miss_rebuild", "fixed_prefix")  # fixed_prefix: an observation on the 60K-prefix fixtures
+KEYS = {"cause", "session_id", "usd", "detail", "fix", "tier", "advice", "evidence", "session_usd", "attribution", "action", "in_total"}
 
 
 def _ts(minutes, seconds=0):
@@ -527,8 +527,9 @@ class TestWasteReport(_Scanned):
     def test_finding_shape_and_ordering(self):
         for sid in FIXTURES:
             findings = self.waste.report(self.db, session_id=sid)
-            usds = [f["usd"] for f in findings]
-            self.assertEqual(usds, sorted(usds, reverse=True), sid)
+            # counted findings first, each group by dollars
+            keys = [(f["in_total"], f["usd"]) for f in findings]
+            self.assertEqual(keys, sorted(keys, reverse=True), sid)
             for f in findings:
                 self.assertEqual(set(f), KEYS, sid)
                 self.assertIn(f["cause"], CAUSES)

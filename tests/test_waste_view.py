@@ -14,6 +14,7 @@ HARNESS = """
 %(SRC)s
 const esc = s => String(s), fmtPct = v => (v * 100).toFixed(1) + '%%', fmtCostBig = c => '$' + c.toFixed(2);
 const addSplit = (acc, f) => { acc[f.attribution] += f.usd; };  // provenance.js (tested in test_provenance)
+const counted = f => f.in_total !== false;  // drill.js
 const eq = (got, want, what) => { if (got !== want) throw new Error(what + ': got ' + got + ', want ' + want); };
 const f = (sid, cause, usd, session_usd) => ({ session_id: sid, cause, usd, session_usd, tier: 'attributed cause', attribution: cause === 'resident_output' && sid === 's1' ? 'inferred' : 'observed',
                                                detail: cause + ' in ' + sid, fix: 'fix ' + cause, evidence: [] });

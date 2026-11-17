@@ -14,6 +14,7 @@ What whytokens stores, where, and how to delete it. Code: `policy.py`.
 | `offset`, `limit` | Read | the line range, as numbers (a ranged re-read is not a repeat) |
 | `notebook_path` | NotebookEdit | the path |
 | `command_len` | Bash, Codex exec/shell/apply_patch | length of the command |
+| `command_hash` | Bash | first 16 hex of sha256 of the command with whitespace runs collapsed: tells "the same command again" apart without storing it. A short command's hash can be brute-forced, so treat it as an identifier, not a secret |
 | `subagent_type` | Task, Agent | agent type |
 | `skill` | Skill | skill name |
 

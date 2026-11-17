@@ -17,7 +17,7 @@ MUTANTS = [
     # server: the per-session endpoint
     (API, "waste.report(db_path, session_id=session_id) if", "waste.report(db_path) if"),
     (API, 'get_waste(session_id=_qs1(parse_qs(parsed.query), "session_id"))', "get_waste()"),
-    (API, '"total_usd": sum(f["usd"] for f in found)}', '"total_usd": 0.0}'),
+    (API, '"total_usd": sum(f["usd"] for f in found if f.get("in_total", True))}', '"total_usd": 0.0}'),
     # URL state
     (DRILL, "if (f.cause) params.set('cause', f.cause);", ""),
     (DRILL, "if (f.minCost) params.set('smin', String(f.minCost));", ""),
@@ -36,7 +36,7 @@ MUTANTS = [
     # Overview cards and strip
     (APP, '<a class="stat-card" data-drill', '<div class="stat-card" data-drill'),
     (APP, "href: drillHref(globalParams(), { tab: 'waste' }) },", "href: '?' },"),
-    (APP, "v.causes.slice(0, 3)", "v.causes.slice(0, 4)"),
+    (APP, "v.causes.filter(c => c.in_total).slice(0, 3)", "v.causes.filter(c => c.in_total).slice(0, 4)"),
     (APP, "const v = groupWaste(p.findings, lastScopeSessions);", "const v = groupWaste(p.findings, lastFilteredSessions);"),
     (APP, "lower bound, not savings", "savings"),
     (APP, "${fmtPct(cost ? v.total / cost : 0)} of cost at list rate · lower bound", "${fmtPct(cost ? v.total / cost : 0)} of cost"),

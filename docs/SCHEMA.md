@@ -132,6 +132,29 @@ names are deduped by tool_use id. NULL = not a ToolSearch result or its transcri
 never an empty list). `ClaudeSource.backfill_deferred_loads` fills old rows from transcripts still on
 disk, once. Consumed by the `deferred_tool_load` waste cause (`waste.py`; Claude only, per `agent_id` lane).
 
+`is_error` (INTEGER, additive): the `tool_result` block's `is_error` flag, 1 or 0 (an absent flag is 0).
+NULL = the result was not seen by a scanner that records it. Bash calls in `turns.tool_calls` also carry
+`command_hash` (docs/DATA_POLICY.md) from the same version. Rows scanned earlier are filled once, on the next
+scan, by `ClaudeSource.backfill_retry_inputs` (marker `retry_inputs_backfill_done_claude`): it re-reads
+transcripts still on disk and UPDATEs only NULL `is_error` / absent `command_hash`, matched by call id; no
+row is inserted, deleted or re-priced, and an interrupted run repeats. Sessions whose transcript is gone stay
+NULL: **unmeasured**, never read as success. Consumed by the `retry_loop` waste cause;
+`waste.measurement()` reports it as `partial` for Claude with the measured / unmeasured session counts.
+
+#### Waste causes from per-turn context (no new columns)
+
+- `large_context` (observation): main-lane turns whose context (`input + cache_read + cache_creation`)
+  passes `waste.LARGE_CONTEXT_TOKENS` (250K), priced as the cache-read cost of the tokens above it; a
+  compaction starts a new crossing.
+- `fixed_prefix` (observation): the main lane's opening prefix (`cache_read + cache_creation` of its
+  first cached request, so a prefix warm from another session still counts) times each later main-lane
+  turn's `min(prefix, cache_read)` at the cache-read rate, plus the opening request. Gated at
+  `waste.FIXED_PREFIX_TOKENS` (50K). Subagent lanes stay in `subagent_preamble`.
+
+Observation findings carry `in_total: false`: they overlap the attributed causes, so `total_usd`, the
+overhead headline, the Sessions Overhead column and the Overview "where to act" strip skip them.
+`uncached_input`, also an observation, is still summed in (`in_total: true`), as before.
+
 ### `processed_files` — incremental-scan bookkeeping
 
 `(path PK, mtime REAL, lines INTEGER)`. Lets a rescan skip unchanged files and
@@ -356,6 +379,38 @@ own allowlists (`KNOWN_CODEX_*` — envelope keys/types, `payload.type`s, and th
 Codex CLI versions churn fast (frequent alphas) so they are reported informationally
 and do **not** gate. `cli.py doctor` runs both tracks and exits non-zero if either
 drifts.
+
+## Budget file
+
+Not a table: the monthly budget is a small JSON file `budget.json` next to the DB
+(`config.DB_PATH.with_name("budget.json")`, so `WHYTOKENS_DB` / `WHYTOKENS_HOME` move it
+too). `{"monthly_usd": 500.0}`, written atomically (tmp + replace); the value must be a
+finite number > 0. An absent file means no budget: the API reports `budget: null`, never 0.
+Dropping and rescanning the DB leaves it alone.
+
+`GET /api/budget` (`budget.month_status`) covers the current calendar month, whatever range
+the dashboard is filtered to, priced per day exactly like `/api/daily` (API list price):
+`{month, spent, budget, projected, gap, needed_daily, daily_rate, method, days_elapsed,
+days_remaining}`. Data runs through today inclusive; `days_remaining = days in month - day of
+month`; `daily_rate` is the average of the last 7 calendar days (sum / 7) once the month is
+7 days old (`method: "trailing_7d"`), else month-to-date spend per elapsed day
+(`"month_to_date"`); `projected = spent + daily_rate * days_remaining`; `gap = projected -
+budget` (positive = over; null without a budget); `needed_daily = (budget - spent) /
+days_remaining` (null without a budget or on the last day). `POST /api/budget
+{"monthly_usd": number|null}` sets or clears it (token-guarded like `/api/fixes`; invalid
+values are 400). CLI: `whytokens budget [AMOUNT|--clear]`.
+
+## Model what-if
+
+`GET /api/whatif?to=<model id|next_tier>&start&end&model&project&actor&session_id`
+(`whatif.reprice`) prices the same turns on another model through `pricing.reprice_turn`
+(`calc_cost` plus the fast-mode / US-only / long-prompt multiplier, so repricing a turn onto
+its own model equals its recorded cost). `to=next_tier` reprices each model onto
+`pricing.next_tier_down` (`pricing.TIER_ORDER`); a model with no cheaper tier has `to: null`
+and is left out of the totals. `actor` is `main`, `subagent` or an agent type, resolved as
+in `/api/session-breakdown`. Returns `{to, actual_usd, repriced_usd, delta_usd, by_model[],
+wording}`; an unknown `to` is a 400. Observation only: these figures never enter attributed
+overhead, the waste totals, Est. Cost or any other total.
 
 ## Evolving the schema
 

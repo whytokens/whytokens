@@ -64,12 +64,15 @@ export const CARD_TARGET = {
   'Sessions': DEFAULT_SORT,
 };
 
-/** findings -> Map(session_id -> { total, byCause }). */
+/** False for observation findings (waste.UNCOUNTED): shown and filterable, never summed into a total. */
+export const counted = f => f.in_total !== false;
+
+/** findings -> Map(session_id -> { total, byCause }). total holds counted findings only. */
 export function overheadIndex(findings) {
   const idx = new Map();
   for (const f of findings || []) {
     const e = idx.get(f.session_id) || idx.set(f.session_id, { total: 0, byCause: {} }).get(f.session_id);
-    e.total += f.usd;
+    if (counted(f)) e.total += f.usd;
     e.byCause[f.cause] = (e.byCause[f.cause] || 0) + f.usd;
   }
   return idx;

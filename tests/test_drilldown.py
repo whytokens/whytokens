@@ -137,6 +137,7 @@ _STUBS = """
 const esc = s => String(s), fmt = n => String(n), fmtCostBig = c => '$' + c.toFixed(2), fmtPct = n => (100 * n).toFixed(1) + '%';
 const has = (h, n, w) => { if (!h.includes(n)) throw new Error(w + ': missing ' + n + ' in ' + h); };
 const lacks = (h, n, w) => { if (h.includes(n)) throw new Error(w + ': unexpected ' + n); };
+const counted = f => f.in_total !== false;  // drill.js
 """
 
 

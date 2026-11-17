@@ -57,6 +57,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
   <h1 class="sr-only">whytokens</h1>
 
   <section class="tab-panel" id="panel-overview" data-panel="overview">
+    <div class="budget-band" id="budget-band"></div>
     <div class="stats-row" id="stats-row"><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div></div>
     <div class="where-to-act" id="where-to-act"></div>
     <div class="charts-grid">
@@ -94,6 +95,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <th data-prov="official" class="sortable" onclick="setModelSort('cache_read')">Cache Read <span class="sort-icon" id="msort-cache_read"></span></th>
           <th data-prov="official" class="sortable" onclick="setModelSort('cache_creation')">Cache Creation <span class="sort-icon" id="msort-cache_creation"></span></th>
           <th data-prov="local_estimate" class="sortable" onclick="setModelSort('cost')">Est. Cost <span class="sort-icon" id="msort-cost"></span></th>
+          <th title="The same tokens repriced on the next tier down, from the server. Repricing only: it does not say the cheaper model would have done the work.">If on next tier down</th>
         </tr></thead>
         <tbody id="model-cost-body"></tbody>
       </table>
@@ -285,6 +287,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
     </div>
   </div>
   <div class="detail-stats" id="session-detail-stats"></div>
+  <div class="whatif-note hidden" id="session-whatif"></div>
   <div class="table-card session-findings hidden" id="session-findings" aria-live="polite"></div>
   <div class="table-card hidden" id="session-bands-card">
     <div class="section-title">Requests <span class="muted">(click one to filter the tables below)</span></div>
@@ -421,6 +424,13 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         <label class="autorefresh-label" title="Rescan every 30 seconds while the selected range includes today. Off by default.">
           <input type="checkbox" id="autorefresh-cb" onchange="onAutoRefreshToggle()"> Auto-refresh every 30 seconds
         </label>
+      </div>
+      <div class="settings-row" id="budget-setting">
+        <label class="filter-label" for="budget-input">Monthly budget (USD, estimated at API list price)</label>
+        <input type="number" id="budget-input" min="0" step="any" inputmode="decimal" placeholder="not set">
+        <button class="export-btn" onclick="saveBudget()">Save</button>
+        <button class="export-btn" onclick="clearBudget()">Clear</button>
+        <span class="muted" id="budget-status" role="status"></span>
       </div>
     </div>
     <div id="pricing">

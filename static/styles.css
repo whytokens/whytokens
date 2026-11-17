@@ -372,3 +372,24 @@ body.booting .chart-wrap { border-radius: 6px; background: linear-gradient(90deg
 .chg-edit { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: flex-end; margin-top: 8px; }
 .chg-edit[hidden] { display: none; }
 .chg-empty ol { padding-left: 20px; }
+
+/* Overview budget band and the model what-if lines (tokens only, both themes) */
+.budget-band { margin: 0 0 16px; padding: 12px 16px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; }
+.budget-band:empty { display: none; }
+.budget-head { font-size: 12px; margin-bottom: 8px; }
+.budget-title { font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
+.budget-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.budget-cell .label { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 2px; }
+.budget-cell .value { font-size: 20px; font-weight: 700; }
+.budget-over { color: var(--red); }
+.budget-under { color: var(--green); }
+.budget-verdict { margin-top: 8px; font-size: 13px; font-weight: 700; }
+.budget-sub { margin-top: 4px; font-size: 12px; }
+.budget-links { margin-top: 8px; display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; }
+.budget-links a { color: var(--accent); }
+.whatif-note { margin: 0 0 16px; font-size: 13px; }
+.whatif-note.hidden:empty { display: none; }
+.whatif-line { font-weight: 700; }
+.whatif-cell { white-space: nowrap; }
+.breakdown-subrow.whatif-row td { font-size: 12px; }
+#budget-input { width: 120px; padding: 4px 8px; background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }

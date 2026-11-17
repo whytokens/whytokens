@@ -98,3 +98,31 @@ export async function fetchSessionWaste(sessionId) {
   const resp = await fetch('/api/waste?session_id=' + encodeURIComponent(sessionId));
   return resp.json();
 }
+
+/** GET /api/budget — this calendar month against the monthly budget (budget.month_status). */
+export async function fetchBudget(tz = 'local') {
+  const resp = await fetch('/api/budget?tz=' + encodeURIComponent(tz));
+  if (!resp.ok) throw new Error(String(resp.status));
+  return resp.json();
+}
+
+/** POST /api/budget — set the monthly budget (USD) or clear it with null. Resolves to the
+ * fresh month status; rejects with the server's message on an invalid value. */
+export async function postBudget(monthlyUsd) {
+  const resp = await fetch('/api/budget', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Whytokens-Token': document.querySelector('meta[name=whytokens-token]')?.content || '' },
+    body: JSON.stringify({ monthly_usd: monthlyUsd }),
+  });
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(body.error || String(resp.status));
+  return body;
+}
+
+/** GET /api/whatif — the same turns repriced on another model (observation only, server-side prices). */
+export async function fetchWhatif(params = {}) {
+  const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== '' && v != null)).toString();
+  const resp = await fetch('/api/whatif?' + qs);
+  if (!resp.ok) throw new Error(String(resp.status));
+  return resp.json();
+}

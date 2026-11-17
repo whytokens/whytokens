@@ -343,3 +343,33 @@ def surcharge_cost(model, row, timestamp=None):
         return 0.0
     return calc_cost(model, x["input"], x["output"], x["cache_read"], x["cache_creation"],
                      timestamp, cache_creation_1h=x["cache_creation_1h"])
+
+
+# Model what-if (whatif.py): the Claude price tiers from most to least expensive. A model's
+# "next tier down" is the entry after its family; older ids (opus-4-x, sonnet-4-x) map onto
+# the same current ids. Observation only: repricing does not say the cheaper model would
+# have done the work.
+TIER_ORDER = ("claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
+_TIER_FAMILIES = (("fable", "mythos"), ("opus",), ("sonnet",), ("haiku",))
+
+
+def next_tier_down(model):
+    """A concrete cheaper model id for ``model``, or None (cheapest tier, or not a Claude model)."""
+    m = (model or "").lower()
+    for rank, words in enumerate(_TIER_FAMILIES):
+        if any(w in m for w in words):
+            return TIER_ORDER[rank + 1] if rank + 1 < len(TIER_ORDER) else None
+    return None
+
+
+def reprice_turn(row, to_model):
+    """One turn (or a group of identical-class turns) priced as if run on ``to_model``.
+
+    ``row`` has input/output/cache_read/cache_creation/cache_creation_1h tokens plus
+    timestamp, speed, inference_geo. Goes through calc_cost and price_mult, so fast
+    mode, US-only inference and the long-prompt tier survive repricing. Repricing a
+    turn onto its own model equals its recorded cost."""
+    prompt = (row["input"] or 0) + (row["cache_read"] or 0) + (row["cache_creation"] or 0)
+    return price_mult(row.get("speed"), row.get("inference_geo"), to_model, prompt) * calc_cost(
+        to_model, row["input"] or 0, row["output"] or 0, row["cache_read"] or 0,
+        row["cache_creation"] or 0, row.get("timestamp"), cache_creation_1h=row["cache_creation_1h"] or 0)

@@ -12,19 +12,52 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
+import policy
 import pricing
 import provenance
 from scanner import ADVISOR_ID_PREFIX, AGENT_SUMMARY_ID_PREFIX
 
 
 CAUSES = ("resident_output", "repeated_reads", "subagent_preamble", "idle_gap", "uncached_input",
-          "cache_miss_rebuild", "deferred_tool_load")
+          "cache_miss_rebuild", "deferred_tool_load", "large_context", "retry_loop", "fixed_prefix")
 # Evidence tiers (plan decision 4). Nothing here is measured before/after, so no cause may
 # claim "demonstrated saving" until v1.1.
 TIERS = {"resident_output": "attributed cause", "repeated_reads": "attributed cause",
          "subagent_preamble": "attributed cause", "idle_gap": "attributed cause",
          "uncached_input": "observation", "cache_miss_rebuild": "attributed cause",
-         "deferred_tool_load": "inferred"}
+         "deferred_tool_load": "inferred", "large_context": "observation", "retry_loop": "inferred",
+         "fixed_prefix": "observation"}
+# Observations that overlap the attributed causes (they price reads other causes may also touch), so
+# their dollars are shown, filterable and linkable but never summed into a total: each finding carries
+# in_total=False. uncached_input is also an observation but is still summed in, as it always was.
+UNCOUNTED = ("large_context", "fixed_prefix")
+LARGE_CONTEXT_TOKENS = 250_000  # main-lane context (input + cache read + cache write) past this is "large"
+# fixed_prefix fires only when the opening prefix is at least this big: a lean prefix is the cost of
+# running at all, so a lean session scores zero. ponytail: one flat default, tune against real starts.
+FIXED_PREFIX_TOKENS = 50_000
+RETRY_RUN = 3  # this many consecutive failing calls of one tool on one input, in one prompt, is a retry loop
+
+
+def _retry_coverage(conn):
+    """retry_loop cell for Claude: Claude sessions with tool calls, split into measured (at least one
+    call with a known error flag) and unmeasured. Once the scan's backfill has run (its marker set),
+    the unmeasured ones are those whose transcripts are no longer on disk."""
+    from sources.claude import RETRY_INPUTS_MARKER
+    if "is_error" not in {r[1] for r in conn.execute("PRAGMA table_info(tool_results)")}:
+        return {"status": "partial", "reason": "per-call error flags are not recorded yet; run `whytokens scan`"}
+    total, measured = conn.execute("""
+        SELECT COUNT(*), COALESCE(SUM(EXISTS(SELECT 1 FROM tool_results r
+                                             WHERE r.session_id = s.session_id AND r.is_error IS NOT NULL)), 0)
+        FROM (SELECT DISTINCT session_id FROM turns
+              WHERE COALESCE(agent, 'claude') = 'claude' AND tool_calls IS NOT NULL) s""").fetchone()
+    if measured == total:
+        return {"status": "measured", "reason": ""}
+    done = conn.execute("SELECT 1 FROM sqlite_master WHERE name='schema_meta'").fetchone() and conn.execute(
+        "SELECT 1 FROM schema_meta WHERE key = ? AND value = '1'", (RETRY_INPUTS_MARKER,)).fetchone()
+    why = ("their transcripts are no longer on disk, so per-call error flags cannot be recovered" if done else
+           "the next `whytokens scan` backfills those whose transcripts are still on disk")
+    return {"status": "partial", "reason": f"{measured:,} sessions measured, {total - measured:,} unmeasured: {why}",
+            "measured": measured, "unmeasured": total - measured}
 # One pricing basis for findings and totals: pricing.calc_cost at API list rate.
 BASIS = {"pricing": "API list rate",
          "label": "attributed, lower bound, at API list rate; not savings"}
@@ -61,9 +94,11 @@ def measurement(db_path):
     conn = sqlite3.connect(f"file:{quote(Path(db_path).resolve().as_posix(), safe='/:')}?mode=ro", uri=True)
     try:
         sources = sorted({r[0] or "claude" for r in conn.execute("SELECT DISTINCT agent FROM turns")})
+        retry = _retry_coverage(conn) if "claude" in sources else None
     finally:
         conn.close()
-    cell = lambda src, cause: ({"status": "measured", "reason": ""} if src in _MEASURED else
+    cell = lambda src, cause: (retry if src == "claude" and cause == "retry_loop" else
+                               {"status": "measured", "reason": ""} if src in _MEASURED else
                                {"status": "inferred", "reason": _INFERRED[src][cause]} if cause in _INFERRED.get(src, ()) else
                                {"status": "not measurable", "reason": _WHY.get(src, _WHY_DEFAULT)})
     return {"sources": sources, "causes": {c: {s: cell(s, c) for s in sources} for c in CAUSES}}
@@ -452,6 +487,173 @@ def _action_calls(turns, sizes):
     return out
 
 
+def _ctx(t):
+    return (t["input_tokens"] or 0) + (t["cache_read_tokens"] or 0) + (t["cache_creation_tokens"] or 0)
+
+
+def _read_cost(t, tokens):
+    return pricing.calc_cost(t["model"], 0, 0, tokens, 0, t["timestamp"]) * t["mult"]
+
+
+def _ev(t, tokens, usd, tool=None):
+    return {"at": t["timestamp"], "tokens": tokens, "usd": usd, "tool": tool,
+            "message_id": t["message_id"], "agent_id": t["agent_id"]}
+
+
+def _large_context(main, claims):
+    """Main-lane turns whose context is past LARGE_CONTEXT_TOKENS, priced as the cache-read cost of
+    the tokens above it (ctx - threshold, not capped by the turn's own cache read). The first turn past
+    it is a crossing; a compaction starts a new segment, so the next turn past it is a new crossing."""
+    c, over = claims["large_context"], False
+    for t in main:
+        ctx = _ctx(t)
+        if ctx > LARGE_CONTEXT_TOKENS:
+            tokens = ctx - LARGE_CONTEXT_TOKENS
+            usd = _read_cost(t, tokens)
+            c[0] += usd
+            c[1].append({"crossing": not over, "context": ctx})
+            c[2].append({**_ev(t, tokens, usd, "context"), "crossing": not over, "context": ctx})
+            over = True
+        if t["is_compact_summary"]:
+            over = False
+
+
+def _split_action(evidence):
+    """Next step for large_context: hand off or compact before the threshold, pointing at each crossing."""
+    cross = [e for e in evidence if e["crossing"]]
+    k = LARGE_CONTEXT_TOKENS // 1000
+    return {"id": "split_or_compact",
+            "title": f"Split or compact here: context crossed {k}K {len(cross)} time{'' if len(cross) == 1 else 's'}",
+            "rule": f"Before the context passes {k}K tokens, write a handoff file and start a fresh session, "
+                    "or run /compact; do not carry one session past that size.",
+            "calls": [{"message_id": e["message_id"], "at": e["at"], "context": e["context"],
+                       "tokens": e["tokens"], "usd": e["usd"]} for e in cross[:5]],
+            "est_usd": sum(e["usd"] for e in evidence),
+            "est_basis": f"Observation: cache-read cost of the context above {k}K on {len(evidence)} turns. "
+                         "It overlaps other causes, so it is not added to the overhead total. Not a saving."}
+
+
+def _fixed_prefix(main, claims):
+    """The opening prefix of the main lane (cache read + write of its first cached request, so a
+    system prompt already warm from another session still counts) re-read by every later main turn:
+    min(prefix, that turn's cache read) at the cache-read rate, plus the opening request's own
+    prefix. Subagent lanes are never here (their preamble is subagent_preamble). Compaction does
+    not reset it: the system prompt and tools survive /compact."""
+    first = next((t for t in main if (t["cache_creation_tokens"] or 0) or (t["cache_read_tokens"] or 0)), None)
+    if first is None:
+        return
+    c = claims["fixed_prefix"]
+    prefix = (first["cache_creation_tokens"] or 0) + (first["cache_read_tokens"] or 0)
+    if prefix < FIXED_PREFIX_TOKENS:
+        return
+    usd = _cost(first, creation=first["cache_creation_tokens"] or 0) + _read_cost(first, first["cache_read_tokens"] or 0)
+    c[0] += usd
+    c[2].append(_ev(first, prefix, usd, "opening prefix"))
+    later = 0
+    for t in main[main.index(first) + 1:]:
+        tokens = min(prefix, t["cache_read_tokens"] or 0)
+        if tokens:
+            usd = _read_cost(t, tokens)
+            c[0] += usd
+            c[2].append(_ev(t, tokens, usd, "prefix re-read"))
+            later += 1
+    c[1].append({"prefix": prefix, "turns": later})
+
+
+_PATH_KEYS = ("file_path", "notebook_path")
+
+
+def _call_key(call):
+    """(tool, identity) of a call's input, or None when the stored input cannot tell two calls apart.
+    Shell commands: the policy's command_hash (or the raw command, when the raw-input opt-in kept it)."""
+    name, inp = call.get("name"), call.get("input") or {}
+    if not isinstance(inp, dict):
+        return None
+    if name in policy._COMMAND_TOOLS:
+        if isinstance(inp.get("command"), str):
+            return name, " ".join(inp["command"].split())
+        return (name, "#" + inp["command_hash"]) if isinstance(inp.get("command_hash"), str) else None
+    path = next((inp[k] for k in _PATH_KEYS if isinstance(inp.get(k), str)), None)
+    return (name, path) if path else None
+
+
+def _retry_loop(turns, errs, claims, trcalls=None):
+    """Per lane and user prompt: RETRY_RUN or more consecutive failing calls of one tool on one input
+    (same command after whitespace normalisation, or same path). Successful unrelated calls in between
+    are ignored, but an Edit/Write to another file ends the run (an edit-test loop is work, not a
+    retry), as do a success or unknown result of the same call, a different failing call and a new
+    prompt. Priced: output plus the part of the cache write no other cause claimed, of each turn that
+    issued the 2nd and later failures; the first attempt's turn is never priced.
+    Conservative where data is missing: a turn with no prompt boundary (subagent turns carry no
+    prompt_seq) ends the run and starts none, and so does a turn whose tool_results rows show a
+    writer call its tool_calls lost (a streamed message keeps only its last record's calls)."""
+    trcalls = trcalls or {}
+    taken = {}  # message_id -> cache-write tokens already claimed by a write-based cause
+    for cause in ("resident_output", "repeated_reads", "subagent_preamble", "idle_gap", "cache_miss_rebuild"):
+        for e in claims[cause][2]:
+            taken[e["message_id"]] = taken.get(e["message_id"], 0) + e["tokens"]
+    runs, state = [], {}  # lane -> [prompt_seq, key, [turn of each failing call]]
+
+    def close(lane):
+        st = state.pop(lane, None)
+        if st and len(st[2]) >= RETRY_RUN:
+            runs.append(st)
+    for t in turns:
+        if _synthetic(t) or (t["is_sidechain"] and not t["agent_id"]) or (t["agent"] or "claude") not in _MEASURED:
+            continue
+        lane = t["agent_id"] if t["is_sidechain"] else None
+        if lane in state and state[lane][0] != t["prompt_seq"]:
+            close(lane)
+        seen = {c.get("id") for c in _calls(t) if isinstance(c, dict)}
+        if t["prompt_seq"] is None or any(cid not in seen and name in _WRITERS
+                                          for cid, name in trcalls.get(t["message_id"], ())):
+            close(lane)
+            continue
+        for call in _calls(t):
+            if not isinstance(call, dict):
+                continue
+            key, err = _call_key(call), errs.get(call.get("id"))
+            st = state.get(lane)
+            if st:
+                if key == st[1]:
+                    if err == 1:
+                        st[2].append(t)
+                        continue
+                    close(lane)  # the same call succeeded, or its result is unknown
+                elif err == 1 or call.get("name") in _WRITERS:
+                    close(lane)  # another call failed, or a file was written: not the same retry
+                else:
+                    continue  # a successful unrelated call (a Read, a search) leaves the run open
+            if key and err == 1:
+                state[lane] = [t["prompt_seq"], key, [t]]
+    for lane in list(state):
+        close(lane)
+    c, priced = claims["retry_loop"], set()
+    for _, (tool, ident), run in runs:
+        usd = 0.0
+        for t in run:
+            if t["id"] in priced or t["id"] == run[0]["id"]:  # also a parallel call in the first attempt's turn
+                continue
+            priced.add(t["id"])
+            write = max(0, (t["cache_creation_tokens"] or 0) - taken.get(t["message_id"], 0))
+            out = t["output_tokens"] or 0
+            u = _cost(t, creation=write) + pricing.calc_cost(t["model"], 0, out, 0, 0, t["timestamp"]) * t["mult"]
+            usd += u
+            c[2].append(_ev(t, write + out, u, tool))
+        if usd:
+            c[0] += usd
+            c[1].append({"tool": tool, "ident": ident, "failures": len(run)})
+
+
+def _retry_name(d):
+    """What the fix names: the path's basename (full paths carry usernames), the command when the raw
+    opt-in stored it, else the command's length-free hash id (the command itself is never stored)."""
+    ident = d["ident"]
+    if d["tool"] in policy._COMMAND_TOOLS:
+        return f"command {ident[1:9]} (stored as a hash; open the linked turns to see it)" if ident.startswith("#") else f"`{ident[:120]}`"
+    return re.split(r"[\\/]", str(ident))[-1]
+
+
 MIN_SHARE = 0.10  # Claude Code /usage flags behaviors at >=10% of spend; same default here
 
 
@@ -483,12 +685,15 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                     loads[mid] = list(dict.fromkeys(loads.get(mid, []) + json.loads(names)))
                 except (TypeError, ValueError):
                     pass
-        sizes, by_id = {}, {}  # message_id -> [(tool_name, result_bytes or None)], one per call; call_id -> bytes
+        errs = dict(conn.execute("SELECT call_id, is_error FROM tool_results WHERE is_error IS NOT NULL")) if "is_error" in {
+            r[1] for r in conn.execute("PRAGMA table_info(tool_results)")} else {}
+        sizes, by_id, trcalls = {}, {}, {}  # message_id -> [(tool_name, result_bytes or None)], one per call; call_id -> bytes
         if conn.execute("SELECT 1 FROM sqlite_master WHERE name='tool_results'").fetchone():
             for mid, name, n, cid in conn.execute("SELECT message_id, tool_name, result_bytes, call_id FROM tool_results "
                                              "WHERE message_id IS NOT NULL ORDER BY rowid"):
                 sizes.setdefault(mid, []).append((name, n))
                 by_id[cid] = n
+                trcalls.setdefault(mid, []).append((cid, name))
         types = dict(conn.execute("SELECT agent_id, agent_type FROM agents")) if conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name='agents'").fetchone() else {}
     finally:
@@ -591,6 +796,10 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
             previous_turn = turn
 
         _deferred_tool_load(turns, loads, claims)
+        _retry_loop(turns, errs, claims, trcalls)
+        main = [t for t in turns if (t["agent"] or "claude") in _MEASURED and not t["is_sidechain"] and not _synthetic(t)]
+        _large_context(main, claims)
+        _fixed_prefix(main, claims)
         total = sum(pricing.calc_cost(t["model"], t["input_tokens"] or 0, t["output_tokens"] or 0,
                                       t["cache_read_tokens"] or 0, t["cache_creation_tokens"] or 0,
                                       t["timestamp"], t["cache_creation_1h_tokens"] or 0) * t["mult"]
@@ -662,11 +871,37 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                            f"Remove one of the overlapping servers {a} / {b}.")
                 else:
                     fix = "Use select:<name> instead of keyword search."
+            elif cause == "large_context":
+                cross = sum(d["crossing"] for d in details)
+                detail = (f"{len(details)} main-thread turn{'' if len(details) == 1 else 's'} ran past "
+                          f"{LARGE_CONTEXT_TOKENS // 1000}K tokens of context (largest {max(d['context'] for d in details):,}; "
+                          f"crossed {cross} time{'' if cross == 1 else 's'}); re-reading the part above "
+                          f"{LARGE_CONTEXT_TOKENS // 1000}K cost ${usd:.2f}.")
+                fix = (f"Hand off to a fresh session or /compact before the context passes {LARGE_CONTEXT_TOKENS // 1000}K; "
+                       "the crossing turn is linked below.")
+            elif cause == "retry_loop":
+                worst = max(details, key=lambda d: d["failures"])
+                detail = (f"{len(details)} retry loop{'' if len(details) == 1 else 's'}: {worst['tool']} on "
+                          f"{_retry_name(worst)} failed {worst['failures']} times in a row in one prompt.")
+                fix = (f"After the second identical failure of {worst['tool']} on {_retry_name(worst)}, stop and read the error; "
+                       "change the input or the code before running it again.")
+            elif cause == "fixed_prefix":
+                d = details[0]
+                detail = (f"Carrying the fixed prefix cost ${usd:.2f} over {d['turns']:,} turns: an opening prefix of "
+                          f"{d['prefix']:,} tokens (system prompt, tool schemas, always-loaded instructions and the "
+                          "first prompt; transcripts do not split them) re-read on every main-thread turn.")
+                fix = ("Trim always-loaded instructions (CLAUDE.md and its imports) and disable connectors and MCP "
+                       "servers this project does not use.")
+                if claims["deferred_tool_load"][2]:
+                    fix += " This session also has a deferred tool load finding: load tools with select:<name>."
             else:
                 detail, fix = (f"{sum(details):,} input tokens were billed without a cache read or write.",
                                "Keep repeated prompt material in a cacheable prefix.")
             tier = "inferred" if inferred else TIERS[cause]
             top = sorted(evidence, key=lambda e: e["usd"], reverse=True)[:5]
+            if cause == "large_context":  # the crossing turns first, then the costliest turns after them
+                cross = [e for e in evidence if e["crossing"]][:5]
+                top = cross + [e for e in top if not e["crossing"]][:5 - len(cross)]
             action = None
             if inferred:
                 pass
@@ -680,7 +915,11 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                     if t["is_sidechain"] and t["agent_id"] and not _synthetic(t):
                         lane_turns[t["agent_id"]] = lane_turns.get(t["agent_id"], 0) + 1
                 action = small_jobs_action(evidence, lane_turns, types)
+            elif cause == "large_context":
+                action = _split_action(evidence)
             findings.append({"cause": cause, "session_id": sid, "usd": usd, "detail": detail, "fix": fix,
                              "tier": tier, "attribution": provenance.attribution(tier), "advice": f"{tier.capitalize()}: {fix}",
-                             "evidence": top, "session_usd": total, "action": action})
-    return sorted(findings, key=lambda finding: finding["usd"], reverse=True)
+                             "evidence": top, "session_usd": total, "action": action,
+                             "in_total": cause not in UNCOUNTED})
+    # counted causes first: the top finding of a session is an attributed one, observations follow
+    return sorted(findings, key=lambda finding: (finding["in_total"], finding["usd"]), reverse=True)

@@ -139,7 +139,7 @@ COLUMN_MIGRATIONS = {
     "turns": TURN_MIGRATIONS,
     # ToolSearch results. loaded_tools = JSON list of the tool names whose schemas the
     # result loaded (never the query text); NULL = not a ToolSearch result / transcript gone.
-    "tool_results": {"loaded_tools": "TEXT", "total_deferred_tools": "INTEGER"},
+    "tool_results": {"loaded_tools": "TEXT", "total_deferred_tools": "INTEGER", "is_error": "INTEGER"},
     "sessions": {
         "agent": "TEXT DEFAULT 'claude'",
         # Session topic (from custom-title / ai-title records). The one-time
@@ -415,6 +415,14 @@ def tool_result_sizes(record):
         else:
             n = 0
         yield b["tool_use_id"], n
+
+
+def tool_result_errors(record):
+    """Yield (tool_use_id, 1 or 0) for each tool_result block: its ``is_error`` flag (absent = 0)."""
+    content = (record.get("message") or {}).get("content")
+    for b in content if isinstance(content, list) else []:
+        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id"):
+            yield b["tool_use_id"], 1 if b.get("is_error") is True else 0
 
 
 def deferred_loads(record):
@@ -1020,6 +1028,8 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=No
                         for cid, n in tool_result_sizes(record):
                             calls_out.setdefault(cid, {"call_id": cid, "session_id": session_id})[
                                 "result_bytes"] = n
+                        for cid, err in tool_result_errors(record):
+                            calls_out.setdefault(cid, {"call_id": cid, "session_id": session_id})["is_error"] = err
                         for cid, names, total in deferred_loads(record):
                             row = calls_out.setdefault(cid, {"call_id": cid, "session_id": session_id})
                             row["loaded_tools"] = list(dict.fromkeys(row.get("loaded_tools", []) + names))
@@ -1548,8 +1558,8 @@ def upsert_tool_results(conn, rows):
     rows = list(rows)
     conn.executemany("""
         INSERT INTO tool_results (call_id, session_id, message_id, tool_name, result_bytes,
-                                  loaded_tools, total_deferred_tools)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                  loaded_tools, total_deferred_tools, is_error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(call_id) DO UPDATE SET
             -- Provisional: the UPDATE below re-homes the call to its turn's session.
             session_id   = COALESCE(tool_results.session_id, excluded.session_id),
@@ -1557,10 +1567,11 @@ def upsert_tool_results(conn, rows):
             tool_name    = COALESCE(excluded.tool_name, tool_results.tool_name),
             result_bytes = COALESCE(excluded.result_bytes, tool_results.result_bytes),
             loaded_tools = COALESCE(excluded.loaded_tools, tool_results.loaded_tools),
-            total_deferred_tools = COALESCE(excluded.total_deferred_tools, tool_results.total_deferred_tools)
+            total_deferred_tools = COALESCE(excluded.total_deferred_tools, tool_results.total_deferred_tools),
+            is_error     = COALESCE(excluded.is_error, tool_results.is_error)
     """, [(r["call_id"], r.get("session_id"), r.get("message_id"), r.get("tool_name"),
            r.get("result_bytes"), json.dumps(r["loaded_tools"]) if r.get("loaded_tools") else None,
-           r.get("total_deferred_tools")) for r in rows])
+           r.get("total_deferred_tools"), r.get("is_error")) for r in rows])
     conn.executemany("""
         UPDATE tool_results SET session_id = (
             SELECT t.session_id FROM turns t
