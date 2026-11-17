@@ -12,10 +12,11 @@ import glob
 import json
 from pathlib import Path
 
+import policy
 import scanner
 
 # schema_meta marker of backfill_retry_inputs; waste.measurement reads it
-RETRY_INPUTS_MARKER = "retry_inputs_backfill_done_claude"
+RETRY_INPUTS_MARKER = "retry_inputs_backfill_v3_done_claude"  # v3: also gives path-keyed calls their id back; a v2-done DB runs once more
 
 NAME = "claude"
 
@@ -45,6 +46,19 @@ def _attribution_agent(path):
     return None
 
 
+def _stores_a_call_without_id(conn):
+    """True when any stored tool call lacks its id. Per call, not per row: one call that kept its id
+    must not hide a neighbour in the same message that lost it. Runs once per database, before the marker."""
+    for (raw,) in conn.execute("SELECT tool_calls FROM turns WHERE tool_calls LIKE '%\"name\"%'"):
+        try:
+            calls = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(calls, list) and any(isinstance(c, dict) and not c.get("id") for c in calls):
+            return True
+    return False
+
+
 class ClaudeSource:
     name = NAME
 
@@ -69,11 +83,16 @@ class ClaudeSource:
         return config.claude_projects_dirs(scanner.DEFAULT_PROJECTS_DIRS)
 
     def discover_files(self):
+        import config
+        own = config.claude_project_dir_name(config.LLM_CWD).casefold()
         files = []
         for d in self._dirs():
             d = Path(d)
             if d.exists():
-                files.extend(glob.glob(str(d / "**" / "*.jsonl"), recursive=True))
+                # The LLM adapter's own `claude -p` sessions (llm.py) are never ingested,
+                # or the tool would measure itself.
+                files.extend(f for f in glob.glob(str(d / "**" / "*.jsonl"), recursive=True)
+                             if Path(f).relative_to(d).parts[0].casefold() != own)
         files.sort()
         return files
 
@@ -130,9 +149,12 @@ class ClaudeSource:
             return 0
         if not any(Path(d).exists() for d in self._dirs()):
             return 0
+        if policy.store_raw_inputs():
+            return 0  # the re-parse yields raw commands, no hashes: leave the marker for a scan without the opt-in
         if not (conn.execute("SELECT 1 FROM tool_results WHERE is_error IS NULL LIMIT 1").fetchone()
                 or conn.execute("SELECT 1 FROM turns WHERE tool_calls LIKE '%\"Bash\"%' "
-                                "AND tool_calls NOT LIKE '%command_hash%' LIMIT 1").fetchone()):
+                                "AND tool_calls NOT LIKE '%command_hash%' LIMIT 1").fetchone()
+                or _stores_a_call_without_id(conn)):
             scanner._meta_set(conn, marker, "1")  # fresh or already current: nothing to read
             conn.commit()
             return 0
@@ -151,24 +173,54 @@ class ClaudeSource:
             hashes = {c["id"]: c["input"]["command_hash"] for t in turns for c in json.loads(t.get("tool_calls") or "[]")
                       if isinstance(c, dict) and c.get("id") and isinstance(c.get("input"), dict)
                       and c["input"].get("command_hash")}
-            if hashes:
-                for mid in {t["message_id"] for t in turns if t.get("message_id")}:
-                    row = conn.execute("SELECT tool_calls FROM turns WHERE message_id = ?", (mid,)).fetchone()
+            fresh_by_mid = {t["message_id"]: json.loads(t.get("tool_calls") or "[]") for t in turns if t.get("message_id")}
+            if fresh_by_mid:
+                for mid, fresh in fresh_by_mid.items():
+                    row = conn.execute("SELECT tool_calls FROM turns WHERE message_id = ? AND message_id IS NOT NULL AND message_id != ''", (mid,)).fetchone()
                     try:
                         stored = json.loads(row[0]) if row and row[0] else None
                     except (TypeError, ValueError):
                         continue
                     if not isinstance(stored, list):
                         continue
+                    # Rows stored before call ids were kept have none to match on: pair them with the
+                    # re-parsed calls by position, only when both lists name the same tools in order.
+                    aligned = len(stored) == len(fresh) and all(
+                        isinstance(a, dict) and isinstance(b, dict) and a.get("name") == b.get("name")
+                        for a, b in zip(stored, fresh))
                     changed = False
-                    for c in stored:
+                    for i, c in enumerate(stored):
                         inp = c.get("input") if isinstance(c, dict) else None
-                        if (isinstance(inp, dict) and c.get("name") == "Bash" and "command_hash" not in inp
-                                and "command" not in inp and c.get("id") in hashes):
-                            inp["command_hash"] = hashes[c["id"]]
-                            changed = True
+                        if not isinstance(inp, dict) or "command" in inp:
+                            continue
+                        if c.get("name") != "Bash":
+                            # path-keyed calls (Read, Edit, ...) need only their id back to join their result:
+                            # same tool at the same position with the very same stored input
+                            f = fresh[i] if aligned else {}
+                            if not c.get("id") and f.get("id") and f.get("input") == inp:
+                                c["id"] = f["id"]
+                                changed = True
+                            continue
+                        if c.get("id"):
+                            h = None if "command_hash" in inp else hashes.get(c["id"])
+                            if h:
+                                inp["command_hash"] = h
+                                changed = True
+                            continue
+                        f = fresh[i] if aligned else {}
+                        finp = f.get("input") if isinstance(f.get("input"), dict) else {}
+                        h = finp.get("command_hash")
+                        # The same position is not proof of the same call (a streamed message keeps only its
+                        # last record's calls): the stored command length must agree with the re-parsed one,
+                        # and a hash that is already there must be this one. Otherwise the row stays unmeasured.
+                        if (not h or not f.get("id") or inp.get("command_len") != finp.get("command_len")
+                                or inp.get("command_hash", h) != h):
+                            continue
+                        inp["command_hash"] = h
+                        c["id"] = f["id"]  # the detector joins a call to its result's is_error by id
+                        changed = True
                     if changed:
-                        conn.execute("UPDATE turns SET tool_calls = ? WHERE message_id = ?", (json.dumps(stored), mid))
+                        conn.execute("UPDATE turns SET tool_calls = ? WHERE message_id = ? AND message_id IS NOT NULL AND message_id != ''", (json.dumps(stored), mid))
             filled += conn.total_changes - before
             conn.commit()  # per file: an interrupted run keeps what it filled
         if complete:
@@ -474,7 +526,7 @@ class ClaudeSource:
                 print(f"  Warning: error reading {filepath}: {e}")
                 complete = False
         before = conn.total_changes
-        conn.executemany("UPDATE turns SET is_compact_summary = 1 WHERE message_id = ? AND is_compact_summary = 0",
+        conn.executemany("UPDATE turns SET is_compact_summary = 1 WHERE message_id = ? AND message_id IS NOT NULL AND message_id != '' AND is_compact_summary = 0",
                          ((m,) for m in ids if m))
         filled = conn.total_changes - before
         if complete:  # an unreadable file would stay uncorrected forever; the UPDATE is idempotent, so retry

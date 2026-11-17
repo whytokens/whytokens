@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # (file, original, mutant) - each pattern is one line and must turn the suite red on its own.
 MUTANTS = [
+    ("api.py", "            except (sqlite3.Error, OSError) as e:  # e.g. the settings file is locked", "            except ZeroDivisionError as e:  # e.g. the settings file is locked"),
     ("fixes.py", "MIN_SESSIONS = 10", "MIN_SESSIONS = 5"),
     ("fixes.py", "    elif a < MIN_SESSIONS:", "    elif False:"),
     ("fixes.py", "    if b < MIN_SESSIONS:", "    if False:"),
@@ -30,6 +31,26 @@ MUTANTS = [
     ("static/modules/changes.js", "if (!confirm(`Delete", "if (false && !confirm(`Delete"),
     ("static/modules/changes.js", "if (c.state !== 'waiting') return '';", "if (false) return '';"),
     ("static/modules/changes.js", "if (c.eta_days == null) return", "if (false) return"),
+    ("api.py", "    everything = _gathered(fixes, db_path) if listed else None  # one pass for every change, not one each", "    everything = None"),
+    ("api.py", "    everything = _gathered(fixes, db_path) if listed else None  # one pass for every fix, not one each", "    everything = None"),
+    ("fixes.py", "    if fix[\"cause\"] in waste.UNCOUNTED:", "    if False:"),
+    ("fixes.py", "\"large_context\": \"Context carried past 250K\", ", ""),
+    ("api.py", "        if not out[\"projects\"]:", "        if False:"),
+    ("static/modules/changes.js", "if (!d.projects.includes(pre)) f.project.add(new Option(pre, pre));", ""),
+    ("static/modules/changes.js", "c.saving_usd == null ?", "false ?"),
+    ("api.py", "except (ValueError, TypeError, OverflowError, RecursionError) as e:  # ValueError includes", "except (ValueError, RecursionError) as e:  # ValueError includes"),
+    ("api.py", "except (sqlite3.Error, OSError) as e:  # e.g. the DB is locked by a scan", "except ZeroDivisionError as e:  # e.g. the DB is locked by a scan"),
+    # a build without model help (public): no adapter routes, no page flag, CLI says so, help omits it
+    ("api.py", 'elif path == "/api/llm" and HAS_LLM:', 'elif path == "/api/llm":'),
+    ("api.py", 'HAS_LLM and path in ("/api/llm/preview", "/api/llm/run")', 'path in ("/api/llm/preview", "/api/llm/run")'),
+    ("api.py", "            if HAS_LLM:  # the page loads llm.js", "            if True:  # the page loads llm.js"),
+    ("api.py", "            if HAS_LLM:  # the page loads llm.js", "            if False:  # the page loads llm.js"),
+    ("cli.py", '        print("whytokens llm: model help is not part of this build")\n        sys.exit(2)', "        return"),
+    ("cli.py", "    return USAGE if has_llm else re.sub(", "    return USAGE if True else re.sub("),
+    ("cli.py", '    return USAGE if has_llm else re.sub(r"  whytokens llm .*?\\n(?=  whytokens )"',
+               '    return USAGE if has_llm else re.sub(r"  whytokens llm .*?\\n"'),
+    ("static/modules/app.js", """(document.querySelector('meta[name="whytokens-llm"]') ? import('./llm.js') : Promise.reject())""",
+                              "import('./llm.js')"),
 ]
 
 

@@ -183,15 +183,15 @@ class ThreadTitlesTest(unittest.TestCase):
         self.run_apply(files)
         self.assertEqual(self.topic("custom"), ("Mine", "custom"))
         self.assertEqual(self.topic("ai"), ("Thread title", "thread"))
-        self.assertEqual(self.topic("ai2"), ("AI guess", "ai"))       # prompt never beats ai
-        self.assertEqual(self.topic("bare"), ("first & only", "prompt"))
+        self.assertEqual(self.topic("ai2"), ("AI guess", "ai"))
+        self.assertEqual(self.topic("bare"), (None, None))            # no title: the prompt is not a topic
         self.assertEqual(self.topic("plain"), (None, None))
         self.assertEqual(self.topic("blocks"), (None, None))
 
-    def test_prompt_upgrades_later_and_eviction_keeps_title(self):
+    def test_untitled_upgrades_later_and_eviction_keeps_title(self):
         f = [self.session("s", [wake_line("cmsg_A", "the ask")])]
-        self.run_apply(f)
-        self.assertEqual(self.topic("s"), ("the ask", "prompt"))
+        self.assertEqual(self.run_apply(f), 0)
+        self.assertEqual(self.topic("s"), (None, None))
         self.cache("a", coordinator(spawn("t", "Real title", message_id="cmsg_A")))
         self.run_apply(f)
         self.assertEqual(self.topic("s"), ("Real title", "thread"))
@@ -204,8 +204,8 @@ class ThreadTitlesTest(unittest.TestCase):
         truncated = b"\xff\x15\xfe" + b"\x00" * 12 + b"\xff\x0f" + v8({"k": "value"})[:-4]
         (self.blobs / "trunc").write_bytes(b"\xff\x11\x02" + snappy_literal(truncated))
         f = [self.session("s", [wake_line("cmsg_A", "ask")])]
-        self.assertEqual(pt.apply_thread_titles(self.conn, f, self.tmp / "nope"), 1)
-        self.assertEqual(self.topic("s"), ("ask", "prompt"))
+        self.assertEqual(pt.apply_thread_titles(self.conn, f, self.tmp / "nope"), 0)
+        self.assertEqual(self.topic("s"), (None, None))
         self.assertEqual(pt.load_thread_titles(self.tmp / "blob"), {})
 
     def test_self_referencing_value_terminates(self):
@@ -224,8 +224,9 @@ class ThreadTitlesTest(unittest.TestCase):
     def test_malformed_record_does_not_abort(self):
         f = [self.session("s", [json.dumps({"type": "user", "message": "malformed"}), json.dumps([1]),
                                 wake_line("cmsg_A", "ask")])]
+        self.cache("a", coordinator(spawn("t", "Title", message_id="cmsg_A")))
         self.assertEqual(self.run_apply(f), 1)
-        self.assertEqual(self.topic("s"), ("ask", "prompt"))
+        self.assertEqual(self.topic("s"), ("Title", "thread"))
 
     def test_shared_instructions_fall_back_to_ids(self):
         self.cache("a", coordinator(spawn("t1", "Title A", message_id="cmsg_A", instructions="Same."),
@@ -283,15 +284,16 @@ class ThreadTitlesTest(unittest.TestCase):
         self.cache("a", coordinator(spawn("t1", "Wrong", message_id="cmsg_OLD"),
                                     spawn("t2", "Right", message_id="cmsg_A")))
         f = [self.session("s", [line])]
-        self.assertEqual(pt.thread_keys(f[0])[1], "the real ask")
+        self.assertEqual(pt.thread_keys(f[0]), ["cmsg_A"])
         self.run_apply(f)
         self.assertEqual(self.topic("s"), ("Right", "thread"))
 
 
-class AiTitleBeatsPromptTest(unittest.TestCase):
-    """End to end through the real scan: a later ai-title replaces the prompt fallback."""
+class AiTitleFillsUntitledThreadTest(unittest.TestCase):
+    """End to end through the real scan: a thread with no cached title stays untitled
+    (its prompt is not stored) until an ai-title arrives."""
 
-    def test_ai_title_replaces_prompt(self):
+    def test_ai_title_fills_untitled_thread(self):
         tmp = Path(tempfile.mkdtemp())
         proj = tmp / "projects" / "p"
         proj.mkdir(parents=True)
@@ -320,7 +322,7 @@ class AiTitleBeatsPromptTest(unittest.TestCase):
 
         mtime = f.stat().st_mtime
         scan()
-        self.assertEqual(topic(), ("the ask", "prompt"))
+        self.assertEqual(topic(), (None, None))
         with open(f, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"type": "ai-title", "sessionId": "s1", "aiTitle": "AI title"}) + "\n")
         # Same timestamp tick as the first scan (what a fast machine produces): the append

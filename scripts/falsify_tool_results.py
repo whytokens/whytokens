@@ -19,7 +19,8 @@ MUTANTS = [
     ("scanner.py", "    if \"turns\" not in tables:\n        return False",
      "    if True:\n        return False"),
     ("scanner.py", "    return any(not set(cols) <= _table_cols(conn, table)", "    return False and any(not set(cols) <= _table_cols(conn, table)"),
-    ("scanner.py", "    if bak.exists():\n        return bak\n", ""),
+    # The same-day early return is no longer a single point of failure: the hard-link publish also refuses to
+    # replace a backup (falsify_scan_lock.py breaks that one), so removing the early return alone changes nothing.
     ("scanner.py", "        conn.backup(dest)\n", "        pass\n"),
     # NULL, never 0.
     ("scanner.py", "    \"prompt_seq\": \"INTEGER\",", "    \"prompt_seq\": \"INTEGER DEFAULT 0\","),
@@ -32,8 +33,10 @@ MUTANTS = [
     ("scanner.py", " and set(CORE_INDEXES) <= indexes", ""),
     ("scanner.py", "            t[\"prompt_seq\"] = f.get(\"prompt_seq\")\n", "            pass\n"),
     ("scanner.py", "b.get(\"type\") in (\"image\", \"document\")", "b.get(\"type\") in ()"),
-    ("sources/claude.py", "_, turns, _ = scanner.parse_jsonl_file(filepath, calls_out=calls)",
-     "_, turns, _ = scanner._parse_file(filepath, 0, None, None, calls)"),
+    ("sources/claude.py", "calls = {}\n                _, turns, _ = scanner.parse_jsonl_file(filepath, calls_out=calls)",
+     "calls = {}\n                _, turns, _ = scanner.parse_jsonl_file(filepath)"),
+    ("sources/claude.py", "calls = {}\n            _, turns, _ = scanner.parse_jsonl_file(filepath, calls_out=calls)",
+     "calls = {}\n            _, turns, _ = scanner.parse_jsonl_file(filepath)"),
     ("scanner.py", "!= 'claude' THEN NULL", "!= 'nope' THEN NULL"),
     ("scanner.py", "message_id   = COALESCE(excluded.message_id, tool_results.message_id)",
      "message_id   = excluded.message_id"),
@@ -52,7 +55,7 @@ MUTANTS = [
 
 
 def run(tree):
-    return subprocess.run([sys.executable, "-m", "unittest", "tests.test_tool_results"],
+    return subprocess.run([sys.executable, "-m", "unittest", "tests.test_tool_results", "tests.test_context_retry_prefix"],
                           cwd=tree, capture_output=True, text=True).returncode
 
 

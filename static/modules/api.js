@@ -10,6 +10,18 @@ export async function fetchData(tz = 'local') {
   return resp.json();
 }
 
+/** The scan banner's one line: how long it has run and what it is doing, in plain words.
+ * `sc` is /api/status's `scan`; a file count is shown only when there is one. */
+export function scanLine(sc, nowSec) {
+  const secs = Math.max(0, Math.round(nowSec - (sc.started || nowSec)));
+  const took = secs < 60 ? secs + 's' : Math.floor(secs / 60) + 'm ' + String(secs % 60).padStart(2, '0') + 's';
+  const what = sc.phase === 'prepare' ? 'Preparing: after an update, older sessions are re-read once. This can take a minute or two.'
+    : sc.phase === 'finish' ? 'Finishing: recomputing session totals.'
+    : sc.total ? 'Reading ' + sc.source + ' transcripts: ' + sc.done.toLocaleString('en-US') + ' of ' + sc.total.toLocaleString('en-US') + ' files.'
+    : 'Looking for new ' + (sc.source || 'transcript') + ' data.';
+  return 'Scanning, ' + took + ' so far. ' + what + ' The numbers below refresh every 15 seconds and when it finishes.';
+}
+
 /** GET /api/session?session_id=… — per-session drilldown. */
 export async function fetchSession(sessionId) {
   const resp = await fetch('/api/session?session_id=' + encodeURIComponent(sessionId));

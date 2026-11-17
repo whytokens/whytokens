@@ -91,7 +91,7 @@ class TestFrontend(unittest.TestCase):
 
     def test_sortable_session_headers(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        for key, kind in (("cost", "local_estimate"), ("cache_read", "official"), ("input", "official")):
+        for key, kind in (("cost", "local_estimate"),):
             self.assertIn(f"""<th data-prov="{kind}" class="sortable" onclick="setSessionSort('{key}')">""", html)
 
     def test_every_cost_and_token_header_is_tagged(self):

@@ -68,5 +68,41 @@ class TestReviewWt4(unittest.TestCase):
                 self.assertEqual(out.returncode, 0, out.stderr[-600:])
 
 
+# The body of aggregate() up to its totals, run on a session that spans midnight under range Today.
+SPAN = """
+const { rowCost, sessionCost, isEstimated } = P;
+const day = (d, n) => ({ day: d, model: d0.model, input: n, output: n, cache_read: 4 * n, cache_creation: n, turns: 1 });
+const d0 = d;
+let rawData = { daily_by_model: [day('2026-11-12', 3e6), day('2026-11-13', 1e6)],
+  sessions_all: [{ model: d.model, last_date: '2026-11-13', project: 'p', input: 4e6, output: 4e6, cache_read: 16e6, cache_creation: 4e6, turns: 2 }] };
+let selectedRange = 'today', selectedModels = new Set([d.model]), lastScopeSessions;
+const getRangeBounds = () => ({ start: '2026-11-13', end: '2026-11-13' }), applySessionFilters = x => x;
+%(AGG)s
+  return { daily, byModel, totals, costTotals };
+}
+const r = aggregate();
+const chart = r.daily.reduce((n, x) => n + x.cost, 0), table = r.byModel.reduce((n, m) => n + m.cost, 0);
+if (!(chart > 0)) throw new Error('fixture priced nothing');
+eq(r.costTotals.total, chart, 'Est. Cost card == daily chart');
+eq(r.costTotals.total, table, 'Est. Cost card == model table');
+const today = rawData.daily_by_model[1], b = P.rowCostBreakdown(today, today.day);
+for (const k of ['input', 'output', 'cache_read', 'cache_creation', 'cache_savings']) eq(r.costTotals[k], b[k], k + ' card on per-day rows');
+eq(r.costTotals.cache_tokens, r.totals.cache_read, 'cache share on the same rows as the token sub-lines');
+"""
+
+
+class TestCardsMatchCharts(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_dollar_cards_use_the_per_day_rows_of_the_chart(self):
+        agg = _SRC[_SRC.index("function aggregate() {"):_SRC.index("  // By tool: aggregate from server-side")]
+        agg = agg.replace("  if (!rawData) return;", "")
+        body = (HEAD % {"SRC": _fn("aggregateCostBreakdown", "function sessionSignals(")}) + SPAN % {"AGG": agg}
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(_MOD / "pricing.js", Path(tmp) / "pricing.mjs")
+            (Path(tmp) / "payload.json").write_text(json.dumps({"pricing": pricing.PRICING, "model": MODEL}))
+            out = subprocess.run(["node", "--input-type=module", "-e", body], cwd=tmp, capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr[-600:])
+
+
 if __name__ == "__main__":
     unittest.main()

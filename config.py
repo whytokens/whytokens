@@ -13,6 +13,7 @@ with the ``PORT`` environment variable.
 """
 
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -27,6 +28,21 @@ _TESTING = "unittest" in sys.modules and not os.environ.get("WHYTOKENS_HOME")
 DATA_DIR = Path(os.environ.get("WHYTOKENS_HOME") or
                 (tempfile.mkdtemp(prefix="whytokens-test-") if _TESTING else Path.home() / ".whytokens"))
 DB_PATH = Path(os.environ.get("WHYTOKENS_DB") or (DATA_DIR / "whytokens.db"))
+
+# Working dir of the opt-in LLM adapter's own `claude -p` calls (llm.py). Claude Code files
+# a session under ~/.claude/projects/<encoded cwd>; ingestion skips that dir so the tool never
+# measures itself (sources/claude.py), on top of the --no-session-persistence flag.
+LLM_CWD = DATA_DIR / "llm-cwd"
+# The adapter is left out of public builds. Look for its file beside the app, never on the import
+# path: an unrelated package named `llm` must not switch it on.
+HAS_LLM = (Path(__file__).resolve().parent / "llm.py").is_file()
+
+
+def claude_project_dir_name(path):
+    r"""The ~/.claude/projects subdir name Claude Code uses for a cwd: every non-alphanumeric
+    character becomes '-' (C:\src\.x -> C--src--x)."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
 
 # Default dashboard port (claude-usage uses 8080). Override with env PORT.
 DEFAULT_PORT = 8090

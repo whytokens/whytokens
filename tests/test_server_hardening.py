@@ -69,6 +69,21 @@ class TestHostAndOrigin(Base):
         for host in ("evil.example", "evil.example:8090", "127.0.0.1.evil.example", "192.168.1.5:8090", None):
             self.assertEqual(self.req("GET", "/api/data", {"Host": host})[0], 403, host)
 
+    def test_bound_address_is_the_only_extra_host(self):
+        with mock.patch.object(api.DashboardHandler, "allowed_hosts", api.LOOPBACK_HOSTS + ("192.168.1.5",)):
+            self.assertEqual(self.req("GET", "/api/pricing", {"Host": "192.168.1.5:8090"})[0], 200)
+            self.assertEqual(self.req("GET", "/api/pricing", {"Host": "evil.example"})[0], 403)
+
+    def test_network_shaped_static_path_is_refused_before_it_is_resolved(self):
+        import extensions
+        ext = {"dir": Path(self._tmp.name), "tabs": [{"static_dir": "p"}]}
+        with mock.patch("pathlib.Path.resolve", side_effect=AssertionError("resolved")):
+            for rel in ("//192.0.2.1/share/x", "/192.0.2.1/x", "\\\\192.0.2.1\\share\\x", "a\\b.js", "C:x.js", "x.js:s"):
+                self.assertIsNone(api.resolve_static(rel), rel)
+                self.assertIsNone(extensions.static_file(ext, rel), rel)
+        self.assertEqual(self.req("GET", "/static///192.0.2.1/share/x")[0], 404)
+        self.assertEqual(self.req("GET", "/static/modules/format.js")[0], 200)
+
     def test_foreign_origin_refused_even_on_get(self):
         self.assertEqual(self.req("GET", "/api/data", {"Origin": "http://evil.example"})[0], 403)
 
@@ -110,26 +125,41 @@ class TestPostToken(Base):
         js = (Path(api.__file__).parent / "static" / "modules" / "api.js").read_text(encoding="utf-8")
         self.assertIn("whytokens-token", js)
         self.assertIn(api.TOKEN_HEADER, js)
+        posts = [c for c in js.split('export async function ') if "method: 'POST'" in c]
+        self.assertTrue(posts)
+        for c in posts:   # every state-changing call sends it, not just one of them
+            self.assertIn(api.TOKEN_HEADER, c, c.split('(')[0])
 
 
 class TestLoopbackBind(unittest.TestCase):
     def test_non_loopback_requires_unsafe_host(self):
         for host in ("0.0.0.0", "192.168.1.5", "example.com"):
-            with mock.patch.object(api, "ThreadingHTTPServer") as srv:   # never bind for real
+            with mock.patch.object(api, "_Server") as srv:   # never bind for real
                 srv.return_value.serve_forever.side_effect = KeyboardInterrupt
                 with self.assertRaises(SystemExit):
                     api.serve(host=host, port=0)
 
     def test_unsafe_host_flag_allows_it(self):
-        with mock.patch.object(api, "ThreadingHTTPServer") as srv:
+        with mock.patch.object(api, "_Server") as srv:
             srv.return_value.serve_forever.side_effect = KeyboardInterrupt
             with mock.patch.multiple(api.DashboardHandler, token=None, allow_any_host=False):
                 api.serve(host="0.0.0.0", port=0, unsafe_host=True)
                 self.assertTrue(api.DashboardHandler.allow_any_host)
             srv.assert_called_once()
 
+    def test_unsafe_host_on_one_address_still_checks_host(self):
+        for host in ("127.0.0.1", "192.168.1.5"):
+            with mock.patch.object(api, "_Server") as srv:
+                srv.return_value.serve_forever.side_effect = KeyboardInterrupt
+                with mock.patch.multiple(api.DashboardHandler, token=None, allow_any_host=True,
+                                         allowed_hosts=api.LOOPBACK_HOSTS):
+                    api.serve(host=host, port=0, unsafe_host=True)
+                    self.assertFalse(api.DashboardHandler.allow_any_host, host)
+                    self.assertIn(host, api.DashboardHandler.allowed_hosts)
+                    self.assertNotIn("evil.example", api.DashboardHandler.allowed_hosts)
+
     def test_serve_generates_a_token(self):
-        with mock.patch.object(api, "ThreadingHTTPServer") as srv:
+        with mock.patch.object(api, "_Server") as srv:
             srv.return_value.serve_forever.side_effect = KeyboardInterrupt
             with mock.patch.multiple(api.DashboardHandler, token=None, allow_any_host=False):
                 api.serve(host="localhost", port=0)
@@ -141,3 +171,45 @@ class TestLoopbackBind(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(__import__("shutil").which("node"), "node not installed")
+class TestRowsEscapeTranscriptNames(unittest.TestCase):
+    """Project, branch, agent type and session id come from transcripts. Runs the real row
+    renderers with a hostile name and reads the HTML they produce."""
+
+    def test_hostile_names_never_reach_the_html(self):
+        import subprocess
+        static = Path(api.__file__).parent / "static" / "modules"
+        app = (static / "app.js").read_text(encoding="utf-8")
+        fmt = (static / "format.js").read_text(encoding="utf-8")
+        cut = lambda src, a, b: src[src.index(a):src.index(b, src.index(a))]
+        code = r"""
+const elements = {};
+const document = {
+  createElement() { return {textContent: '', get innerHTML() {
+    return this.textContent.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }}; },
+  getElementById(id) { return elements[id] ||= {innerHTML: ''}; }
+};
+const fmt = String, fmtCost = String, fmtPct = String, fmtWall = String;
+const sortProjectBranch = r => r, branchLimit = 10, renderTableToggle = () => {};
+""" + cut(fmt, "export function esc(", "/**").replace("export ", "") \
+            + cut(app, "function renderSubagentDispatchTable(", "// ── Tool call detail") \
+            + cut(app, "function renderProjectBranchCostTable(", "// ── CSV Export") + r"""
+const assert = require('node:assert/strict');
+const BAD = `"><img src=x onerror=alert(1)>`;
+const row = {agent_type: BAD, project: BAD, branch: BAD, session_id: BAD, full_session_id: BAD};
+renderSubagentDispatchTable([row]);
+renderSessionSignalsTable([row]);
+renderProjectBranchCostTable([row]);
+const SAFE = '&quot;&gt;&lt;img';
+for (const [id, want] of [['subagent-dispatch-body', 5], ['session-signals-body', 4], ['project-branch-cost-body', 3]]) {
+  const html = elements[id].innerHTML;
+  assert.ok(!html.includes('<img'), id + ' lets a tag through');
+  assert.ok(!html.includes('"&gt;&lt;img'), id + ' lets a quote close its attribute');
+  assert.equal(html.split(SAFE).length - 1, want, id + ' escaped count');
+}
+"""
+        out = subprocess.run(["node", "-e", code], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)

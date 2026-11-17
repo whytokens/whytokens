@@ -179,10 +179,14 @@ class ScanTest(unittest.TestCase):
                 s = c.execute("SELECT agent, project_name, total_output_tokens, turn_count "
                               "FROM sessions WHERE session_id='cse_X'").fetchone()
                 n = c.execute("SELECT COUNT(*) FROM turns WHERE agent='coordinator'").fetchone()[0]
+                # A bad blob is recorded as done, not retried and reported on every scan.
+                bad = c.execute("SELECT COUNT(*) FROM processed_files WHERE path LIKE ?",
+                                ("%" + str(Path("00") / "9"),)).fetchone()[0]
             finally:
                 c.close()
             self.assertEqual(s, ("coordinator", PROJECT, 40 + 50 + 3, 3))
             self.assertEqual(n, 3)
+            self.assertEqual(bad, 1)
 
     def test_newest_blob_first_keeps_true_start(self):
         with tempfile.TemporaryDirectory() as d:

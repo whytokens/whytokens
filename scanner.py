@@ -198,15 +198,33 @@ def backup_before_migration(conn):
     if not path or not schema_change_pending(conn):
         return None
     bak = Path(f"{path}.bak-{datetime.now():%Y%m%d}")
-    if bak.exists():
+    if bak.exists() and bak.stat().st_size:
         return bak
-    tmp = Path(f"{bak}.tmp")
+    tmp = Path(f"{bak}.{os.getpid()}.tmp")  # per process: two migrating at once must not share one file
+    tmp.unlink(missing_ok=True)  # a leftover from a killed run is not a database to append to
     dest = sqlite3.connect(tmp)
     try:
         conn.backup(dest)
     finally:
         dest.close()
-    os.replace(tmp, bak)
+    try:
+        try:
+            # A hard link publishes atomically and never replaces: a slower process, whose copy may
+            # already be of the migrated DB, cannot overwrite the first, pre-migration backup.
+            os.link(tmp, bak)
+        # shortcut: the two replace paths below check, then replace, so they are not atomic; they run only
+        # for an empty leftover or without hard links. Upgrade to a shared publish lock if either turns up in use.
+        except FileExistsError:
+            if not bak.stat().st_size:
+                os.replace(tmp, bak)  # an empty leftover is not a backup
+        except OSError:  # a filesystem without hard links
+            if not (bak.exists() and bak.stat().st_size):
+                os.replace(tmp, bak)
+    except OSError:  # Windows: another process is putting its own copy of the same pre-migration DB there
+        if not (bak.exists() and bak.stat().st_size):
+            raise
+    finally:
+        tmp.unlink(missing_ok=True)
     return bak
 
 
@@ -319,7 +337,11 @@ def init_db(conn):
         existing_cols = _table_cols(conn, table)
         for col, spec in migrations.items():
             if col not in existing_cols:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {spec}")
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {spec}")
+                except sqlite3.OperationalError as e:  # another process added it since the column list was read
+                    if "duplicate column name" not in str(e):
+                        raise
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_agent_id ON turns(agent_id)")
     # Conditional unique index: only dedup non-null message IDs
     conn.execute("""
@@ -942,6 +964,8 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=No
                         line_count -= 1
                         break
                     continue
+                if not isinstance(record, dict):  # valid JSON, wrong shape: skip it, keep the rest of the file
+                    continue
 
                 if info is not None and record.get("timestamp"):
                     info["events"].append(record["timestamp"])
@@ -1039,8 +1063,8 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=No
                                 row["total_deferred_tools"] = total
 
                 if rtype == "assistant":
-                    msg = record.get("message", {})
-                    usage = msg.get("usage", {})
+                    msg = record.get("message") or {}
+                    usage = msg.get("usage") or {}
                     model = msg.get("model", "")
                     message_id = msg.get("id", "")
                     if info is not None and message_id:
@@ -1481,7 +1505,7 @@ def upsert_sessions(conn, sessions):
 def insert_turns(conn, turns):
     # A real advisor_message turn supersedes the estimate minted while the
     # iteration was missing from the transcript: drop it so nothing double-bills.
-    conn.executemany("DELETE FROM turns WHERE message_id = ?", [
+    conn.executemany("DELETE FROM turns WHERE message_id = ? AND message_id IS NOT NULL AND message_id != ''", [
         (t["message_id"].rsplit(":", 1)[0] + ":est",)
         for t in turns if is_advisor_turn(t) and not t["message_id"].endswith(":est")])
     conn.executemany("""
@@ -1510,7 +1534,8 @@ def insert_turns(conn, turns):
             cache_creation_5m_tokens = excluded.cache_creation_5m_tokens,
             cache_creation_1h_tokens = excluded.cache_creation_1h_tokens,
             tool_name                = excluded.tool_name,
-            inference_geo            = excluded.inference_geo,
+            tool_calls               = excluded.tool_calls,
+            inference_geo           = excluded.inference_geo,
             speed                    = excluded.speed,
             stop_reason              = excluded.stop_reason,
             estimated                = excluded.estimated,

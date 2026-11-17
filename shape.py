@@ -95,6 +95,11 @@ def sync_shapes(conn):
         if shape is None or ver != SHAPE_VERSION or st != sig.get(sid)]
     if not stale:
         return 0
+    if not conn.in_transaction:
+        # Take the write lock before reading: a read that is upgraded to a write fails at once ("database
+        # is locked", no busy wait) when anything else committed in between, e.g. a change recorded in
+        # the dashboard while the scan runs.
+        conn.execute("BEGIN IMMEDIATE")
     conn.execute("CREATE TEMP TABLE IF NOT EXISTS _stale_shape (session_id TEXT PRIMARY KEY)")
     conn.execute("DELETE FROM _stale_shape")
     conn.executemany("INSERT INTO _stale_shape VALUES (?)", [(s,) for s in stale])

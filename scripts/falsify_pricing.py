@@ -28,7 +28,11 @@ MUTANTS = [
     ("pricing.py", 'return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "keyword"', 'return key, "keyword"', PRICING),
     ("pricing.py", 'return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "keyword"', 'return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "exact"', PRICING),
     # the fallback list includes models that have their own row
-    ("pricing.py", 'if how in ("prefix", "keyword")]', "if how]", PRICING),
+    ("pricing.py", 'if how in ("prefix", "keyword") or (how is None and model and tokens)]', "if how]", PRICING),
+    # an unmatched model with tokens dropped from the report (silent $0), or a zero-token id reported
+    ("pricing.py", '(how is None and model and tokens)]', "False]", PRICING),
+    ("pricing.py", '(how is None and model and tokens)]', "(how is None and model)]", PRICING),
+    ("pricing.py", '    return "\\n".join(lines) or "Pricing: every model', '    return "Pricing: every model', PRICING),
     ("pricing.py", "    if not Path(db_path).exists():\n        return []", "    if False:\n        return []", PRICING),
     ("pricing.py", "    except sqlite3.OperationalError:\n        return []", "    except ZeroDivisionError:\n        return []", PRICING),
     ("api.py", 'self._send_json({"models": pricing.fallbacks_in_db(DB_PATH)})', "self._send_json({})", HTTP),

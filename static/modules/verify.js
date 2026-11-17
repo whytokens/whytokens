@@ -53,7 +53,8 @@ function describe(r) {
     `before: ${side(r.before)}<br>after: ${side(r.after)}<br><em>${esc(r.status)}</em>`;
   if (r.reason) h += `: ${esc(r.reason)}`;
   if (r.status === 'no material change') h += ': try the next call on the list';
-  if (r.status === 'reduced') h += `: about ${fmtCostBig(r.saving_usd)} less over the after period (${esc(r.basis)})`;
+  if (r.status === 'reduced') h += r.saving_usd == null ? `: ${esc(r.note)}`
+    : `: about ${fmtCostBig(r.saving_usd)} less over the after period (${esc(r.basis)})`;
   return h + `<br>${esc(r.caveat)}</p>` + SEE_ALL;
 }
 
@@ -68,7 +69,6 @@ export async function fillVerifySlots(root) {
     if (done.has(b.dataset.rproject + '|' + b.dataset.rcause + '|' + b.dataset.rnote)) b.outerHTML = '<span class="muted">Recorded</span>';
   for (const slot of slots) {
     const mine = results.filter(r => r.fix.project === slot.dataset.vproject && r.fix.cause === slot.dataset.vcause);
-    slot.innerHTML = mine.length ? mine.map(describe).join('')
-      : `<p>No fix recorded yet. From a terminal instead: <code>${esc(recordHint(slot.dataset.vproject, slot.dataset.vcause))}</code></p>` + SEE_ALL;
+    slot.innerHTML = mine.map(describe).join('');  // nothing recorded: nothing to show
   }
 }

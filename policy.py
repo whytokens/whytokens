@@ -9,10 +9,12 @@ and the Codex source so every writer of ``turns.tool_calls`` routes through here
 import hashlib
 import json
 import os
+import re
 import sqlite3
 
 RAW_ENV = "WHYTOKENS_STORE_RAW_INPUTS"
 MIGRATION_KEY = "tool_calls_redacted_v1"
+PROMPT_TOPICS_KEY = "prompt_topics_cleared_v1"
 
 # tool name -> input keys kept verbatim. Everything else is reduced to sizes.
 _KEEP = {
@@ -105,14 +107,63 @@ def migrate_tool_calls(conn, meta_get, meta_set):
             updates.append((new, rowid))
     conn.executemany("UPDATE turns SET tool_calls = ? WHERE rowid = ?", updates)
     conn.commit()
-    # Purge before marking done: a blocked VACUUM/checkpoint (another connection open)
-    # leaves the marker unset, so the next scan retries the purge.
-    try:
-        conn.execute("VACUUM")
-        busy = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
-    except sqlite3.OperationalError:
-        return len(updates)
-    if not busy:
+    # Purge before marking done: a blocked one leaves the marker unset, so the next scan retries.
+    if _purged(conn):
         meta_set(conn, MIGRATION_KEY, "1")
         conn.commit()
     return len(updates)
+
+
+def _purged(conn):
+    """VACUUM and checkpoint, so rewritten text does not stay in the file's free pages.
+    False when blocked (another connection open)."""
+    try:
+        conn.execute("VACUUM")
+        return not conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+    except sqlite3.OperationalError:
+        return False
+
+
+def clear_prompt_topics(conn, meta_get, meta_set):
+    """Older versions kept the first 80 characters of a Projects thread's trigger message as
+    the session topic (topic_source 'prompt'). Clear those once and purge them from the file.
+    Returns rows cleared."""
+    state = meta_get(conn, PROMPT_TOPICS_KEY)
+    if state == "1":
+        return 0
+    n = conn.execute("UPDATE sessions SET topic = NULL, topic_source = NULL "
+                     "WHERE topic_source = 'prompt'").rowcount
+    if n or state:
+        meta_set(conn, PROMPT_TOPICS_KEY, "purge")  # survives a blocked purge, so the next scan retries it
+        conn.commit()
+        if not _purged(conn):
+            return n
+    meta_set(conn, PROMPT_TOPICS_KEY, "1")
+    conn.commit()
+    return n
+
+
+# Paths a payload may carry by accident: a drive path (C:\x, C:/x), a UNC path, or a POSIX path
+# of two or more segments. Names may hold spaces (C:\Users\Jo Smith\my notes.txt) and nothing marks
+# where they end, so a path runs to the end of the line or the next quote: over-redacting the
+# words after it is the safe direction. Used by the LLM adapter's outbound scrub.
+_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\|(?<![\w.])/(?=[^\s/]+/))[^\"'<>|\r\n]*")
+# MCP tool ids carry user-chosen server names (often the project's).
+_MCP_RE = re.compile(r"\bmcp__[\w.-]+")
+
+
+def placeholders(text, sensitive, seen=None):
+    """``text`` with every sensitive string (project names, cwds, branches) and every path-like
+    run replaced by a stable placeholder: ``project-1``, ``path-1``. Longest names first, so a
+    project name inside a cwd never leaves half a path behind. Outbound payloads only."""
+    names = sorted({s for s in sensitive if s and len(s) >= 2}, key=len, reverse=True)
+    seen = {} if seen is None else seen  # shared across calls: project-1 stays the same project
+
+    def tag(kind, value):
+        return seen.setdefault(value, f"{kind}-{1 + sum(1 for v in seen.values() if v.startswith(kind))}")
+
+    for n in names:
+        kind = "path" if ("/" in n or "\\" in n) else "project"
+        text = re.sub(re.escape(n), lambda m, n=n, kind=kind: tag(kind, n), text, flags=re.IGNORECASE)
+    text = _MCP_RE.sub(lambda m: tag("tool", m.group(0)), text)
+    return _PATH_RE.sub(lambda m: tag("path", m.group(0)), text)

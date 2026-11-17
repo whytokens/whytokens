@@ -13,12 +13,23 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # (file, original, mutant) - each must turn the first-run tests red on its own.
 MUTANTS = [
+    ("static/modules/app.js", """if (/[",\\r\\n]/.test(s)) {""", """if (/[",\\n]/.test(s)) {"""),  # a carriage return splits the row
     ("sources/__init__.py", 'open(filepath, "rb").close()', "pass"),
-    ("sources/__init__.py", "PROGRESS.update(source=source.name, done=0, total=len(files))", "pass"),
+    ("sources/__init__.py", 'PROGRESS.update(source=source.name, done=0, total=len(files), phase="walk")', "pass"),
     ("api.py", "if not claude and not codex:", "if False:"),
     ("api.py", "elif not claude:", "elif False:"),
     ("api.py", "if not sessions:", "if True:"),
     ("api.py", "Pick another port with --port.", "Pick another port."),
+    ("api.py", "            if time.monotonic() >= deadline:", "            if True:"),  # no wait for a port a stopping instance still holds
+    # scan banner: a stage never reported, a stale one kept, a count that says nothing, the every-second reload
+    ("sources/__init__.py", '    PROGRESS["phase"] = "prepare"', "    pass"),
+    ("sources/__init__.py", '    PROGRESS["phase"] = "finish"', "    pass"),
+    ("scanrun.py", "errors=[], phase=None)", "errors=[])"),
+    ("scanrun.py", 'total=p["total"], phase=p["phase"],', 'total=p["total"], phase=None,'),
+    ("static/modules/api.js", "    : sc.total ? 'Reading '", "    : true ? 'Reading '"),
+    ("static/modules/api.js", "sc.phase === 'prepare' ? 'Preparing", "false ? 'Preparing"),
+    ("static/modules/app.js", "  } else if (wasScanning) loadData();", "  }"),
+    ("api.py", "    if scan or os.path.exists(DB_PATH):", "    if scan:"),
     ("api.py", 'running = st is None', 'running = False'),
     ("scanrun.py", "if not _lock.acquire(blocking=False):", "if False:"),
     ("scanrun.py", "        _lock.release()", "        pass"),
@@ -28,6 +39,19 @@ MUTANTS = [
     ("config.py", '"exists": Path(d).is_dir()}', '"exists": True}'),
     ("scripts/perf_budget.py", "if measured[k] > limit * scale:", "if False:"),
     ("scripts/perf_budget.py", "if measured[k] > limit:", "if False:"),
+    # mistyped commands report failure; a flag is never another flag's value
+    ("cli.py", 'sys.exit(0 if len(sys.argv) < 2 or sys.argv[1] in ("help", "--help", "-h") else 2)', "sys.exit(0)"),
+    ("cli.py", 'sys.exit(0 if len(sys.argv) < 2 or sys.argv[1] in ("help", "--help", "-h") else 2)', "sys.exit(2)"),
+    ("cli.py", '        print("usage: whytokens export --json")\n        sys.exit(2)',
+     '        print("usage: whytokens export --json")\n        return'),
+    ("cli.py", 'if i + 1 >= len(args) or args[i + 1].startswith("--"):', "if i + 1 >= len(args):"),
+    ("cli.py", 'if i + 1 >= len(args) or args[i + 1].startswith("--"):', 'if i + 1 < len(args) and args[i + 1].startswith("--"):'),
+    ("cli.py", 'args[i + 1].startswith("--"):', 'args[i + 1].startswith("-"):'),
+    # a late response replacing a newer one; CSV cells that start a formula, numbers left alone
+    ("static/modules/app.js", "    if (seq !== loadSeq) return;", "    if (false) return;"),
+    ("static/modules/app.js", "    if (seq !== loadSeq) return;", "    if (seq === loadSeq) return;"),
+    ("static/modules/app.js", """if (/^[=+\\-@\\t\\r]/.test(s) && !isFinite(Number(s))) s = "'" + s;""", ""),
+    ("static/modules/app.js", "/.test(s) && !isFinite(Number(s))) s =", "/.test(s)) s ="),
 ]
 TESTS = ["tests.test_first_run"]
 

@@ -33,7 +33,6 @@ MUTANTS = [
     (F, "            stack.extend(reversed(x))", "            stack.extend(x)"),
     (F, "    if data[1] == 0x11:", "    if True:"),                                  # uncompressed blob
     (F, "                        continue  # malformed, not a prompt", "                        break"),
-    ("scanner.py", 'existing_source in ("ai", "prompt")', 'existing_source == "ai"'),
     (F, "                    keys.append(_MSG_ID.search(trig[0]).group(1))", "                    pass"),
     (F, """next((x for x in msgs if 'trigger="true"' in x[0]), msgs[-1] if msgs else None)""",
         "(msgs[0] if msgs else None)"),                                           # trigger message
@@ -43,10 +42,8 @@ MUTANTS = [
     (F, '        renamed = source == "thread" and rank == _RANK["thread"] and title != current',
         '        renamed = source == "thread" and rank == _RANK["thread"]'),          # rewrite unchanged
     (F, "                    keys.append(cse.group(1))", "                    pass"),
-    (F, '                    body = " ".join(html.unescape(_TAGS.sub(" ", trig[1])).split())',
-        '                    body = trig[1]'),
-    (F, '_RANK = {"prompt": 1, "ai": 2, "thread": 3, "custom": 4}',
-        '_RANK = {"prompt": 3, "ai": 2, "thread": 3, "custom": 4}'),
+    # data policy: no prompt text as a topic (the cleanup of older rows is in falsify_data_policy.py)
+    (F, '        source = "thread"\n', '        source = "thread"\n        title = title or "the ask"\n'),
     (F, "        if not title or (_RANK[source] <= rank and not renamed):", "        if not title:"),
     (F, "        except Exception:  # cache files", "        except ValueError:  # cache files"),
     (F, "                    if r.get(\"type\") == \"user\" and not r.get(\"isMeta\"):\n"

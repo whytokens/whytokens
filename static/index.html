@@ -217,6 +217,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
   <section class="tab-panel" id="panel-sessions" data-panel="sessions" hidden>
     <div class="table-card">
       <div class="section-header"><div class="section-title">Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
+      <p class="muted" id="sessions-basis-note">Each row is a whole session, listed under its last active day. Overview totals count each day's turns, so they can differ from the sum of this list when a session spans more than one day. <span id="sessions-sort-note"></span></p>
       <div class="session-filter-bar">
         <div class="filter-field">
           <label for="session-project-filter">Project</label>
@@ -252,21 +253,13 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
       <table class="sessions-table">
         <thead><tr>
           <th>Session</th>
-          <th>Project</th>
-          <th>Title</th>
           <th class="sortable" onclick="setSessionSort('last')">Last Active&nbsp;<span class="sort-icon" id="sort-icon-last"></span></th>
           <th class="sortable" onclick="setSessionSort('duration_min')">Duration&nbsp;<span class="sort-icon" id="sort-icon-duration_min"></span></th>
           <th>Model</th>
           <th class="sortable" onclick="setSessionSort('turns')">Turns&nbsp;<span class="sort-icon" id="sort-icon-turns"></span></th>
-          <th data-prov="official" class="sortable" onclick="setSessionSort('input')">Input&nbsp;<span class="sort-icon" id="sort-icon-input"></span></th>
-          <th data-prov="official" class="sortable" onclick="setSessionSort('output')">Output&nbsp;<span class="sort-icon" id="sort-icon-output"></span></th>
-          <th data-prov="official" class="sortable" onclick="setSessionSort('cache_read')">Cache Read&nbsp;<span class="sort-icon" id="sort-icon-cache_read"></span></th>
-          <th data-prov="official" class="sortable" onclick="setSessionSort('cache_creation')">Cache Creation&nbsp;<span class="sort-icon" id="sort-icon-cache_creation"></span></th>
           <th data-prov="local_estimate" class="sortable" onclick="setSessionSort('cost')">Est. Cost&nbsp;<span class="sort-icon" id="sort-icon-cost"></span></th>
-          <th class="sortable" onclick="setSessionSort('cache_share')" title="cache read as a share of the prompt">Cache Share&nbsp;<span class="sort-icon" id="sort-icon-cache_share"></span></th>
           <th class="sortable" onclick="setSessionSort('overhead')" title="Attributed overhead (lower bound, API list rate); the selected cause's share when a cause is chosen">Overhead&nbsp;<span class="sort-icon" id="sort-icon-overhead"></span></th>
           <th class="sortable" onclick="setSessionSort('shape')" title="What the session mostly did, from the tools it called">Shape&nbsp;<span class="sort-icon" id="sort-icon-shape"></span></th>
-          <th class="sortable" onclick="setSessionSort('peers')" title="Cost per prompt as a multiple of the median for comparable sessions in the same project">vs peers&nbsp;<span class="sort-icon" id="sort-icon-peers"></span></th>
         </tr></thead>
         <tbody id="sessions-body"></tbody>
       </table>
@@ -441,6 +434,11 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         <span class="filter-label">Refresh</span>
         <label class="autorefresh-label" title="Rescan every 30 seconds while the selected range includes today. Off by default.">
           <input type="checkbox" id="autorefresh-cb" onchange="onAutoRefreshToggle()"> Auto-refresh every 30 seconds
+        </label>
+      </div>
+      <div class="settings-row">
+        <label class="filter-label">
+          <input type="checkbox" id="budget-show-cb" checked onchange="setBudgetShown(this.checked)"> Show monthly budget on Overview
         </label>
       </div>
       <div class="settings-row" id="budget-setting">

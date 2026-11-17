@@ -428,7 +428,7 @@ class TestBackupBeforeMigration(unittest.TestCase):
 
     def test_failed_backup_blocks_migration(self):
         self._old_db()
-        os.makedirs(f"{_bak(self.db)}.tmp")  # the temp target can't be opened as a file
+        os.makedirs(f"{_bak(self.db)}.{os.getpid()}.tmp")  # the temp target can't be opened as a file
         conn = get_db(self.db)
         with self.assertRaises(Exception):
             init_db(conn)

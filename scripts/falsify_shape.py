@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # (file, original, mutant) - each original must occur exactly once.
 MUTANTS = [
+    ("api.py", """quote(Path(db_path).resolve().as_posix(), safe='/:')}?mode=ro", uri=True) if Path""", """Path(db_path).resolve().as_posix()}?mode=ro", uri=True) if Path"""),
     ("shape.py", "    if cats[top] / n >= DOMINANT_SHARE:", "    if True:"),                      # threshold ignored
     ("shape.py", "    if n < MIN_TOOL_CALLS:", "    if False:"),                              # no chat floor
     ("shape.py", "                m = median(group)", "                m = sum(group) / len(group)"),  # mean instead of median
@@ -35,6 +36,7 @@ MUTANTS = [
     ("fixes.py", "            if min(sides[\"before\"][\"sessions\"], sides[\"after\"][\"sessions\"]) >= MIN_SESSIONS:", "            if True:"),  # same-shape gate
     ("budget.py", "            d.pop(\"monthly_usd\", None)", "            d.clear()"),                  # clearing the budget drops tags
     ("budget.py", "    if len(tag) > TAG_MAX or any(ord(c) < 32 for c in tag):", "    if False:"),  # tag unchecked
+    ("static/modules/shapes.js", "f.shape === 'unknown' ? e && (!e.shape || e.shape === 'unknown') : e && e.shape === f.shape", "e && e.shape === f.shape"),
 ]
 
 

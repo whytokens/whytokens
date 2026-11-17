@@ -20,6 +20,7 @@ there is a single implementation of each. Source-specific knowledge (where files
 how records parse, how tokens map) lives entirely in the per-source module.
 """
 
+import contextlib
 import os
 import sys
 import time
@@ -45,7 +46,8 @@ def get_sources(projects_dir=None):
 
 
 # Live scan progress for the dashboard (one scan runs at a time; see scanrun.py).
-PROGRESS = {"source": None, "done": 0, "total": 0, "errors": []}
+# phase: "prepare" (one-time upgrades of older rows), "walk" (reading files), "finish" (totals, shapes)
+PROGRESS = {"source": None, "done": 0, "total": 0, "errors": [], "phase": None}
 
 
 def _file_error(source, path, exc):
@@ -75,7 +77,7 @@ def _scan_source(conn, source, verbose):
     files = source.discover_files()
     new_files = updated_files = skipped_files = total_turns = 0
     sessions_seen = set()
-    PROGRESS.update(source=source.name, done=0, total=len(files))
+    PROGRESS.update(source=source.name, done=0, total=len(files), phase="walk")
 
     for filepath in files:
         PROGRESS["done"] += 1
@@ -104,38 +106,47 @@ def _scan_source(conn, source, verbose):
         except OSError as e:  # unreadable: report it, don't mark processed, keep scanning
             _file_error(source.name, filepath, e)
             continue
-        parsed = source.parse_file(filepath, start_line=old_lines)
-        session_metas, turns, line_count, agents = parsed[:4]
-        tool_results = parsed[4] if len(parsed) > 4 else ()
+        try:
+            parsed = source.parse_file(filepath, start_line=old_lines)
+            session_metas, turns, line_count, agents = parsed[:4]
+            tool_results = parsed[4] if len(parsed) > 4 else ()
 
-        if not is_new and line_count <= old_lines:
-            # mtime changed but the file didn't grow — just refresh the stamp.
-            conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ? AND source = ?",
-                         (_trusted_mtime(mtime), filepath, source.name))
+            if not is_new and line_count <= old_lines:
+                # mtime changed but the file didn't grow — just refresh the stamp.
+                conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ? AND source = ?",
+                             (_trusted_mtime(mtime), filepath, source.name))
+                conn.commit()
+                skipped_files += 1
+                continue
+
+            sessions = []
+            if turns or session_metas:
+                sessions = scanner.aggregate_sessions(session_metas, turns)
+                scanner.upsert_sessions(conn, sessions)
+                scanner.insert_turns(conn, turns)
+                scanner.upsert_agents(conn, agents)
+                scanner.upsert_tool_results(conn, tool_results)
+
+            conn.execute("""
+                INSERT OR REPLACE INTO processed_files (path, mtime, lines, source)
+                VALUES (?, ?, ?, ?)
+            """, (filepath, _trusted_mtime(mtime), line_count, source.name))
             conn.commit()
-            skipped_files += 1
+        except Exception as e:
+            # One odd record (a field of an unexpected type) must not stop every later file,
+            # the other sources and the reconcile. Not marked processed: the next scan retries it.
+            conn.rollback()
+            _file_error(source.name, filepath, e)
             continue
 
-        if turns or session_metas:
-            sessions = scanner.aggregate_sessions(session_metas, turns)
-            scanner.upsert_sessions(conn, sessions)
-            scanner.insert_turns(conn, turns)
-            scanner.upsert_agents(conn, agents)
-            scanner.upsert_tool_results(conn, tool_results)
-            for s in sessions:
-                sessions_seen.add(s["session_id"])
+        for s in sessions:
+            sessions_seen.add(s["session_id"])
+        if sessions:
             total_turns += len(turns)
-
         if is_new:
             new_files += 1
         else:
             updated_files += 1
-
-        conn.execute("""
-            INSERT OR REPLACE INTO processed_files (path, mtime, lines, source)
-            VALUES (?, ?, ?, ?)
-        """, (filepath, _trusted_mtime(mtime), line_count, source.name))
-        conn.commit()
 
     return {
         "new": new_files, "updated": updated_files, "skipped": skipped_files,
@@ -144,7 +155,43 @@ def _scan_source(conn, source, verbose):
     }
 
 
+class ScanBusy(RuntimeError):
+    """Another process is scanning this DB."""
+
+
+@contextlib.contextmanager
+def _scan_lock(db_path):
+    """One scan per DB file across processes. Two scans at once fail each other mid-write (a locked
+    database in one, a constraint error in the other), so the second one is refused up front.
+    An OS byte lock on a sidecar file: it goes away with the process, so a crash leaves no stale lock."""
+    if str(db_path) == ":memory:":
+        yield
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)  # a first run: get_db has not made it yet
+    f = open(f"{db_path}.scanlock", "a+b")
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ScanBusy(f"another whytokens process is scanning {db_path}; wait for it to finish") from None
+        yield
+    finally:
+        f.close()
+
+
 def scan_all(db_path=DB_PATH, projects_dir=None, verbose=True, sources=None, extensions=None):
+    """``_scan_all`` under the per-DB scan lock; raises ScanBusy when another process holds it."""
+    with _scan_lock(db_path):
+        return _scan_all(db_path, projects_dir, verbose, sources, extensions)
+
+
+def _scan_all(db_path, projects_dir, verbose, sources, extensions):
     """Scan every registered source into one DB, then reconcile once.
 
     Returns ``{source_name: stats}``. The reconcile (recompute session totals from
@@ -152,6 +199,13 @@ def scan_all(db_path=DB_PATH, projects_dir=None, verbose=True, sources=None, ext
     past the deduped turns actually inserted.
     """
     conn = scanner.get_db(db_path)
+    try:
+        return _scan_conn(conn, projects_dir, verbose, sources, extensions)
+    finally:
+        conn.close()
+
+
+def _scan_conn(conn, projects_dir, verbose, sources, extensions):
     scanner.init_db(conn)
 
     if sources is None:
@@ -166,9 +220,11 @@ def scan_all(db_path=DB_PATH, projects_dir=None, verbose=True, sources=None, ext
     # Runs before the per-source walk so a freshly-upgraded DB gets old sessions'
     # topics filled in on the very next scan, gated by a schema_meta marker so it
     # never repeats.
+    PROGRESS["phase"] = "prepare"
     scanner.backfill_worktree_projects_once(conn, verbose=verbose)
     # Data policy: rewrite stored tool inputs to allowlisted metadata, once.
     policy.migrate_tool_calls(conn, scanner._meta_get, scanner._meta_set)
+    policy.clear_prompt_topics(conn, scanner._meta_get, scanner._meta_set)
     for source in sources:
         if hasattr(source, "backfill_topics"):
             source.backfill_topics(conn)
@@ -215,6 +271,7 @@ def scan_all(db_path=DB_PATH, projects_dir=None, verbose=True, sources=None, ext
         src_changed = s.pop("_changed", False)
         changed = changed or src_changed
         stats[source.name] = s
+    PROGRESS["phase"] = "finish"
 
     # Subagent identity sweep (Claude only). Runs AFTER the walk — unlike the
     # backfills above — because it enriches rows the walk itself may have just
@@ -250,5 +307,4 @@ def scan_all(db_path=DB_PATH, projects_dir=None, verbose=True, sources=None, ext
             print(f"  [{name}] new={s['new']} updated={s['updated']} "
                   f"skipped={s['skipped']} turns={s['turns']} sessions={s['sessions']}")
 
-    conn.close()
     return stats

@@ -102,7 +102,6 @@ def _write(path, d):
     if not d:
         path.unlink(missing_ok=True)
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")  # one temp file per writer
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:

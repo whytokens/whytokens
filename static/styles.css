@@ -106,7 +106,10 @@ details.collapsible > summary .export-btn { margin-left: auto; }
 .breakdown-subrow:hover td { background: var(--raised); }
 .breakdown-subrow .branch-cell { font-family: inherit; padding-left: 24px; }
 .model-subrow td { opacity: 0.7; font-size: 0.92em; }
-.stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 24px; }
+/* Eight cards: 2, 4 or 8 per row, so the last row is never one card on its own (auto-fit gave 7 + 1). */
+.stats-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 24px; }
+@media (min-width: 700px) { .stats-row { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (min-width: 1700px) { .stats-row { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
 .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
 a.stat-card { display: block; color: inherit; text-decoration: none; }
 a.stat-card:hover { border-color: var(--accent); background: var(--raised); }
@@ -206,8 +209,17 @@ tr:hover td { background: var(--raised); }
 .sessions-table th { vertical-align: top; }
 @media (min-width: 1280px) { .sessions-table th { white-space: nowrap; } } /* narrower: labels wrap rather than widen the table */
 .sessions-table th .prov { display: block; width: fit-content; margin: 4px 0 0; }
-.sessions-table :is(th, td):nth-child(n+7) { text-align: right; font-variant-numeric: tabular-nums; }
-.sessions-table th:nth-child(n+7) .prov { margin-left: auto; }
+/* Turns, Est. Cost, Overhead */
+.sessions-table > thead th:nth-child(n+5):nth-child(-n+7), .sessions-table tr.session-row > td:nth-child(n+5):nth-child(-n+7) { text-align: right; font-variant-numeric: tabular-nums; }
+.sessions-table > thead th:nth-child(n+5):nth-child(-n+7) .prov { margin-left: auto; }
+.session-title { text-align: left; font-weight: 600; }
+.session-sub { margin: 2px 0 0 22px; font-size: 12px; overflow-wrap: anywhere; }
+.session-id { font-family: monospace; }
+.session-totals-subrow td { background: var(--sub); border-bottom: none; }
+.session-totals-subrow .detail-stats { margin: 0; }
+.sub-table { width: 100%; }
+.sub-table :is(th, td):nth-child(n+3) { text-align: right; font-variant-numeric: tabular-nums; }
+.sub-table tr:last-child td { border-bottom: none; }
 /* Pinned table headers. A card that scrolls sideways is its own scroll container, so a header can
    pin to the page only where tables fit without that scroll; narrower keeps the scroll, no pin. */
 @media (min-width: 1280px) {
@@ -221,7 +233,7 @@ tr:hover td { background: var(--raised); }
 .detail-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 14px; }
 .detail-stat { border: 1px solid var(--border); border-radius: 6px; padding: 10px; }
 .detail-stat .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
-.detail-stat .value { font-size: 15px; font-weight: 700; }
+.detail-stat .value { font-size: 14px; font-weight: 700; line-height: 1.3; overflow-wrap: anywhere; }
 .detail-workspace-header { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 18px; }
 .detail-title-group { min-width: 0; }
 .detail-title { color: var(--accent); font-size: 20px; font-weight: 700; margin-bottom: 4px; }
@@ -294,13 +306,25 @@ h1.page-title { font-size: 16px; font-weight: 600; margin-bottom: 14px; }
 .waste-bar.active { border-color: var(--accent); background: var(--selected); }
 .wb-track { height: 12px; background: var(--raised); border-radius: 3px; overflow: hidden; }
 .wb-fill { display: block; height: 100%; background: var(--accent); }
+.wb-baseline .wb-fill { background: var(--muted); opacity: 0.55; }
+.wb-group-head { margin: 12px 8px 2px; font-size: 12px; font-weight: 600; }
 .waste-group { border-top: 1px solid var(--border); padding: 6px 0; }
 .waste-group summary { display: grid; grid-template-columns: 1.4fr 1.4fr 0.7fr 1.6fr; gap: 10px; cursor: pointer; padding: 4px 0; }
 .wg-project { font-weight: 600; overflow-wrap: anywhere; }
 .wg-fix { margin: 8px 0; }
+/* The drawer belongs to the session row above it: no divider between them, indented, edged, tinted. */
+.waste-group tr:has(+ .wg-drawer) > td { border-bottom: none; }
+.wg-drawer > td { padding: 0 8px 10px 28px; }
+.wg-drawer > td > details { border-left: 3px solid var(--border); background: var(--raised); border-radius: 0 6px 6px 0; padding: 6px 10px; }
+.wg-drawer summary { cursor: pointer; }
+.wg-date { white-space: nowrap; }
+.wg-session { text-align: left; }
 .wg-why { margin: 8px 0 0; }
 .wg-rule { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--border, #8884); border-radius: 6px; display: flex; gap: 10px; align-items: center; justify-content: space-between; }
 .wg-est { margin: 8px 0; }
+.wg-step { margin: 8px 0 4px; }
+.wg-evidence { margin: 8px 0; }
+.wg-evidence summary { cursor: pointer; }
 .avoid-tag { display: inline-block; margin-left: 4px; padding: 0 6px; border-radius: 8px; background: var(--raised);
   font-size: 11px; color: var(--muted); white-space: nowrap; cursor: help; }
 @media (max-width: 700px) {
@@ -391,6 +415,11 @@ body.booting .chart-wrap { border-radius: 6px; background: linear-gradient(90deg
 .whatif-note.hidden:empty { display: none; }
 .whatif-line { font-weight: 700; }
 .whatif-cell { white-space: nowrap; }
+.llm-badge { font-size: 0.75em; padding: 0 0.4em; border: 1px dashed currentColor; border-radius: 3px; opacity: 0.8; }
+.llm-label { font-size: 0.85em; margin-top: 2px; }
+.llm-row td { white-space: normal; }
+.llm-stdin, .llm-diff { max-height: 18em; overflow: auto; white-space: pre-wrap; font-size: 0.8em; }
+.llm-result.error { color: var(--red); }
 .breakdown-subrow.whatif-row td { font-size: 12px; }
 #budget-input { width: 120px; padding: 4px 8px; background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
 

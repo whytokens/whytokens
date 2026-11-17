@@ -33,6 +33,9 @@ Routes:
   GET  /api/budget             -> budget.month_status(): this calendar month vs the monthly budget
   POST /api/budget             -> {monthly_usd: number|null} set / clear the budget (token-guarded)
   GET  /api/whatif?to&start&end&model&project&actor&session_id -> whatif.reprice(): repricing only
+  GET  /api/llm                -> llm.totals(): the opt-in adapter's own spend + stored labels / judges
+  POST /api/llm/preview        -> {kind, session_id, cause?}: the exact outbound call, unsent (token-guarded)
+  POST /api/llm/run            -> {confirm}: send that preview, nothing else (token-guarded)
   GET  /api/shapes             -> work shapes: by-shape table, per-session shape + peer multiple, project tags
   POST /api/project-tag        -> {project, tag|null} set / clear a project's display tag (token-guarded)
   POST /api/fixes              -> record a fix {project, cause, note[, date]}; returns its verification
@@ -48,10 +51,12 @@ import os
 import secrets
 import re
 import sqlite3
+import threading
+import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import date, datetime
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import config
 import extensions
@@ -61,6 +66,9 @@ import scanner
 import scanrun
 import version
 from config import DB_PATH, DEFAULT_PORT
+
+# The opt-in model-help adapter (llm.py) is left out of public builds; its routes exist only with it.
+HAS_LLM = config.HAS_LLM
 
 
 def _day_expr(tz, col="timestamp"):
@@ -721,7 +729,8 @@ def post_fix(payload, db_path=None):
         fix = next(f for f in fixes.list_fixes(conn) if f["id"] == fid)
     finally:
         conn.close()
-    return {**fixes.verify(db_path, fix), "duplicate": duplicate}
+    # the cached pass the Changes tab asks for next, not a second measurement of the whole DB
+    return {**fixes.verify(db_path, fix, fixes._slice(_gathered(fixes, db_path), fix)), "duplicate": duplicate}
 
 
 def get_fixes(db_path=None):
@@ -737,7 +746,22 @@ def get_fixes(db_path=None):
             "SELECT 1 FROM sqlite_master WHERE name = 'fixes'").fetchone() else []
     finally:
         conn.close()
-    return {"results": [fixes.verify(db_path, f) for f in listed]}
+    everything = _gathered(fixes, db_path) if listed else None  # one pass for every fix, not one each
+    return {"results": [fixes.verify(db_path, f, fixes._slice(everything, f)) for f in listed]}
+
+
+_gather_cache = None  # (db state key, fixes._gather_all result)
+
+
+def _gathered(fixes, db_path):
+    """``fixes._gather_all`` per DB state. It is a pure function of the DB and takes seconds on a real-size
+    one, and the Changes tab and every Trace open (its verify slot) both ask for it."""
+    global _gather_cache
+    with _waste_lock:
+        key = _db_state_key(db_path)
+        if not (_gather_cache and _gather_cache[0] == key):
+            _gather_cache = (key, fixes._gather_all(db_path))
+        return _gather_cache[1]
 
 
 def get_changes(db_path=None):
@@ -754,11 +778,20 @@ def get_changes(db_path=None):
         has = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'fixes'").fetchone()
         listed = fixes.list_fixes(conn) if has else []
         out["projects"] = [r[0] for r in conn.execute(
-            "SELECT DISTINCT project_name FROM sessions WHERE project_name IS NOT NULL AND project_name != '' "
-            "AND COALESCE(agent, 'claude') = 'claude' ORDER BY project_name")]
+            # Busiest first, and only projects that can ever reach a verdict: verify needs MIN_SESSIONS
+            # before the change, so one-session temp and scratch folders would only bury the real ones.
+            "SELECT project_name FROM sessions WHERE project_name IS NOT NULL AND project_name != '' "
+            "AND COALESCE(agent, 'claude') = 'claude' GROUP BY project_name HAVING COUNT(*) >= ? "
+            "ORDER BY COUNT(*) DESC, project_name", (fixes.MIN_SESSIONS,))]
+        if not out["projects"]:  # a new install has no busy project yet: offer them all rather than none
+            out["projects"] = [r[0] for r in conn.execute(
+                "SELECT project_name FROM sessions WHERE project_name IS NOT NULL AND project_name != '' "
+                "AND COALESCE(agent, 'claude') = 'claude' GROUP BY project_name ORDER BY COUNT(*) DESC, project_name")]
     finally:
         conn.close()
-    out["changes"] = [fixes.change_view(db_path, f) for f in sorted(listed, key=lambda f: (f["fix_date"], f["id"]), reverse=True)]
+    everything = _gathered(fixes, db_path) if listed else None  # one pass for every change, not one each
+    out["changes"] = [fixes.change_view(db_path, f, everything=everything)
+                      for f in sorted(listed, key=lambda f: (f["fix_date"], f["id"]), reverse=True)]
     return out
 
 
@@ -801,6 +834,7 @@ def post_fix_delete(payload, db_path=None):
 
 
 _waste_cache = None  # (db state key, payload)
+_waste_lock = threading.Lock()  # one report at a time: requests that arrive while it computes wait for its result
 
 
 def _stat_or_none(path):
@@ -853,6 +887,20 @@ def get_shapes(db_path=None):
     return {**base, **body}
 
 
+def post_llm_preview(body):
+    import llm
+    if not isinstance(body, dict) or not isinstance(body.get("session_id"), str):
+        raise ValueError("expected {kind, session_id, cause?}")
+    return llm.preview(body.get("kind"), body["session_id"], body.get("cause"), DB_PATH)
+
+
+def post_llm_run(body):
+    import llm
+    if not isinstance(body, dict):
+        raise ValueError("expected {confirm}")
+    return llm.run(body.get("confirm"), DB_PATH)
+
+
 def post_project_tag(payload, db_path=None):
     """Set or clear a project's display tag. ValueError on a bad payload, tag or unknown project."""
     import budget
@@ -864,7 +912,7 @@ def post_project_tag(payload, db_path=None):
     if "tag" not in payload:
         raise ValueError("tag is required (null or blank clears it)")
     db_path = db_path or DB_PATH
-    conn = sqlite3.connect(f"file:{Path(db_path).resolve().as_posix()}?mode=ro", uri=True) if Path(db_path).exists() else None
+    conn = sqlite3.connect(f"file:{quote(Path(db_path).resolve().as_posix(), safe='/:')}?mode=ro", uri=True) if Path(db_path).exists() else None
     try:
         known = conn is not None and conn.execute("SELECT 1 FROM sessions WHERE project_name = ?", (project,)).fetchone()
     finally:
@@ -891,7 +939,13 @@ def get_waste(db_path=None, session_id=None):
     # A pure function of the DB (list-rate pricing, no overrides), so cache it per DB state.
     # WAL writes leave the main file untouched until checkpoint, hence the -wal stat too
     # (an empty -wal counts as absent: a read-only connect creates one).
-    # ponytail: single-entry cache, no lock; two racing first requests both compute, harmless.
+    # Single-entry cache behind a lock: on a real-size DB the report takes seconds, and requests racing
+    # it (every open tab refreshes) each computing their own held the whole server for minutes.
+    with _waste_lock:
+        return _waste_payload(waste, db_path)
+
+
+def _waste_payload(waste, db_path):
     global _waste_cache
     key = _db_state_key(db_path)
     if _waste_cache and _waste_cache[0] == key:
@@ -1301,6 +1355,8 @@ def resolve_static(rel_path):
     else None. Guards against path traversal (``../``) and absolute/symlinked
     escapes by resolving the candidate and confirming STATIC_ROOT is a parent.
     """
+    if extensions.unsafe_rel(rel_path):  # before resolve(): a //host/share path would be contacted
+        return None
     root = STATIC_ROOT.resolve()
     candidate = (root / rel_path).resolve()
     try:
@@ -1325,7 +1381,8 @@ def _host_name(netloc):
 class DashboardHandler(BaseHTTPRequestHandler):
     # Set by serve(). None fails closed: every POST is refused until a token exists.
     token = None
-    allow_any_host = False   # serve(unsafe_host=True) only
+    allow_any_host = False   # serve(unsafe_host=True) on a wildcard address only
+    allowed_hosts = LOOPBACK_HOSTS  # serve(unsafe_host=True) adds the address it bound
     extensions = []          # set by serve(); loaded descriptors (extensions.py)
 
     def _refuse(self, why):
@@ -1335,7 +1392,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _guard(self, post=False):
         """Host must be loopback (DNS rebinding), Origin same-origin, POST needs the token."""
         host = self.headers.get("Host")
-        if not self.allow_any_host and _host_name(host) not in LOOPBACK_HOSTS:
+        if not self.allow_any_host and _host_name(host) not in self.allowed_hosts:
             return self._refuse("bad host")
         origin = self.headers.get("Origin")
         if origin is not None and origin != f"http://{host}":
@@ -1401,6 +1458,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             # the page carries the startup token that authorizes POSTs
             meta = f'<meta name="whytokens-token" content="{self.token or ""}">'.encode()
+            if HAS_LLM:  # the page loads llm.js only when it exists, so public builds see no 404
+                meta += b'<meta name="whytokens-llm" content="1">'
             body = index.read_bytes().replace(b"</head>", meta + b"</head>", 1)
             self._send_bytes(body, "text/html; charset=utf-8", extra_headers={"Cache-Control": "no-cache"})
 
@@ -1462,6 +1521,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(get_fixes())
         elif path == "/api/shapes":
             self._send_json(get_shapes(DB_PATH))
+        elif path == "/api/llm" and HAS_LLM:
+            import llm
+            self._send_json(llm.totals(DB_PATH))
         elif path == "/api/budget":
             import budget
             self._send_json(budget.month_status(DB_PATH, tz=_qs1(parse_qs(parsed.query), "tz") or "local"))
@@ -1525,9 +1587,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self._guard(post=True):
             return
         path = urlparse(self.path).path
-        if path in ("/api/fixes", "/api/fixes/edit", "/api/fixes/delete", "/api/project-tag"):
+        if path in ("/api/fixes", "/api/fixes/edit", "/api/fixes/delete", "/api/project-tag") or (
+                HAS_LLM and path in ("/api/llm/preview", "/api/llm/run")):
             handler = {"/api/fixes": post_fix, "/api/fixes/edit": post_fix_edit, "/api/fixes/delete": post_fix_delete,
-                       "/api/project-tag": post_project_tag}[path]
+                       "/api/project-tag": post_project_tag, "/api/llm/preview": post_llm_preview,
+                       "/api/llm/run": post_llm_run}[path]
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 if not 0 < n <= 65536:
@@ -1536,8 +1600,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if len(raw) != n:
                     raise ValueError("incomplete body")
                 self._send_json(handler(json.loads(raw)))
-            except (ValueError, RecursionError) as e:  # ValueError includes json.JSONDecodeError
-                self._send_json({"error": str(e)}, status=400)
+            except (ValueError, TypeError, OverflowError, RecursionError) as e:  # ValueError includes json.JSONDecodeError
+                self._send_json({"error": str(e) or type(e).__name__}, status=400)
+            except (sqlite3.Error, OSError) as e:  # e.g. the DB is locked by a scan
+                self._send_json({"error": f"{type(e).__name__}: {e}"}, status=503)
             return
         if path == "/api/budget":
             import budget
@@ -1553,8 +1619,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError("expected {monthly_usd: number|null}")
                 budget.set_budget(body["monthly_usd"], DB_PATH)
                 self._send_json(budget.month_status(DB_PATH))
-            except (ValueError, RecursionError) as e:
-                self._send_json({"error": str(e)}, status=400)
+            except (ValueError, TypeError, OverflowError, RecursionError) as e:
+                self._send_json({"error": str(e) or type(e).__name__}, status=400)
+            except (sqlite3.Error, OSError) as e:  # e.g. the settings file is locked
+                self._send_json({"error": f"{type(e).__name__}: {e}"}, status=503)
             return
         if path == "/api/rescan":
             # Incremental rescan: same engine as `python cli.py scan` (Claude +
@@ -1582,6 +1650,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_404()
 
 
+BIND_WAIT_S = 8  # how long serve() waits for a port that a stopping instance still holds
+
+
+class _Server(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second process bind a port that is already being served, so a
+    # second dashboard would start (and scan) beside the first instead of failing to listen.
+    allow_reuse_address = os.name != "nt"
+    # A page load opens a dozen connections at once; with the default backlog of 5 the ones that arrive
+    # while a request holds the interpreter are refused and the page renders half empty.
+    request_queue_size = 128
+
+
 def serve(host=None, port=None, unsafe_host=False, scan=False, projects_dir=None):
     """Serve the dashboard. ``scan=True`` streams a scan in the background after the
     port is bound, so the page is up (and shows progress) before the first scan ends."""
@@ -1592,14 +1672,30 @@ def serve(host=None, port=None, unsafe_host=False, scan=False, projects_dir=None
                          "data and can trigger rescans. Pass --unsafe-host to override.")
     DashboardHandler.extensions = extensions.load()
     DashboardHandler.token = secrets.token_urlsafe(32)
-    DashboardHandler.allow_any_host = unsafe_host
-    try:
-        server = ThreadingHTTPServer((host, port), DashboardHandler)
-    except OSError as e:
-        raise SystemExit(f"Cannot listen on {host}:{port} ({e.strerror or e}). Is whytokens already "
-                         f"running? Pick another port with --port.")
+    # --unsafe-host on one address still checks Host (DNS rebinding) against that address.
+    # shortcut: a wildcard bind cannot know its names, so it accepts any Host; list them if that matters.
+    bound = _host_name(host)
+    DashboardHandler.allow_any_host = unsafe_host and bound in ("0.0.0.0", "::")
+    DashboardHandler.allowed_hosts = LOOPBACK_HOSTS + ((bound,) if unsafe_host else ())
+    deadline = time.monotonic() + BIND_WAIT_S
+    while True:
+        try:
+            server = _Server((host, port), DashboardHandler)
+            break
+        except OSError as e:  # a restart starts the new instance while the old one is still letting go of the port
+            if time.monotonic() >= deadline:
+                raise SystemExit(f"Cannot listen on {host}:{port} ({e.strerror or e}). Is whytokens already "
+                                 f"running? Pick another port with --port.")
+            time.sleep(0.25)
+    if scan or os.path.exists(DB_PATH):
+        # Empty DB so the page loads before the scan lands; an existing DB written by an older
+        # version gets its additive columns here, or serving without a scan reads missing columns.
+        conn = scanner.get_db(DB_PATH)
+        try:
+            scanner.init_db(conn)
+        finally:
+            conn.close()
     if scan:
-        scanner.init_db(scanner.get_db(DB_PATH))  # empty DB, so the page loads before the scan lands
         scanrun.start(DB_PATH, projects_dir)
     print(f"Dashboard running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")

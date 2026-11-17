@@ -30,6 +30,7 @@ CAUSE_LABELS = {
     "subagent_preamble": "Subagent preambles", "idle_gap": "Idle gaps (cache expiry)",
     "uncached_input": "Uncached input", "cache_miss_rebuild": "Unexpected cache misses",
     "deferred_tool_load": "Deferred tool schemas kept in context",
+    "large_context": "Context carried past 250K", "retry_loop": "Retry loops", "fixed_prefix": "Fixed prefix re-read",
 }
 RATE_DAYS = 28  # window for a project's recent session pace
 
@@ -137,23 +138,33 @@ def _side(sessions, cause_usd):
     return {"sessions": len(sessions), "usd": usd, "cause_usd": cause, "pct": cause / usd if usd else 0.0}
 
 
-def _gather(db_path, fix):
-    """What verify measures: per-session spend, the project's sessions (id, start day, shape) and the
-    cause's attributed dollars per session."""
+def _gather_all(db_path):
+    """Everything verify measures, once for the whole DB: per-session spend, every claude session
+    (project, id, start day, shape) and each cause's attributed dollars per session."""
     conn = sqlite3.connect(f"file:{quote(Path(db_path).resolve().as_posix(), safe='/:')}?mode=ro", uri=True)
     try:
         totals = _session_totals(conn)
         shape_col = "shape" if "shape" in {r[1] for r in conn.execute("PRAGMA table_info(sessions)")} else "NULL"
-        rows = conn.execute(f"""SELECT session_id, COALESCE(date(first_timestamp, 'localtime'), substr(first_timestamp, 1, 10)), {shape_col} FROM sessions
-                               WHERE project_name = ? AND COALESCE(agent, 'claude') = 'claude'
-                               AND first_timestamp IS NOT NULL""", (fix["project"],)).fetchall()
+        rows = conn.execute(f"""SELECT project_name, session_id, COALESCE(date(first_timestamp, 'localtime'), substr(first_timestamp, 1, 10)), {shape_col} FROM sessions
+                               WHERE COALESCE(agent, 'claude') = 'claude'
+                               AND first_timestamp IS NOT NULL""").fetchall()
     finally:
         conn.close()
     cause_usd = {}
     for f in waste.report(db_path, min_share=0, min_usd=0):
-        if f["cause"] == fix["cause"]:
-            cause_usd[f["session_id"]] = f["usd"]
+        cause_usd.setdefault(f["cause"], {})[f["session_id"]] = f["usd"]
     return totals, rows, cause_usd
+
+
+def _slice(everything, fix):
+    totals, rows, cause_usd = everything
+    return totals, [r[1:] for r in rows if r[0] == fix["project"]], cause_usd.get(fix["cause"], {})
+
+
+def _gather(db_path, fix):
+    """What verify measures for one fix: per-session spend, the project's sessions (id, start day, shape)
+    and the cause's attributed dollars per session."""
+    return _slice(_gather_all(db_path), fix)
 
 
 def verify(db_path, fix, data=None):
@@ -170,9 +181,13 @@ def verify(db_path, fix, data=None):
                          f"(before {before['sessions']}, after {after['sessions']})")
         return out
     delta = before["pct"] - after["pct"]
-    material = abs(delta) >= MIN_DELTA_PP and abs(delta) >= MIN_DELTA_REL * before["pct"]
+    # rounded for the floor only: 0.03 - 0.02 is a hair under 0.01 in floats
+    material = round(abs(delta), 9) >= MIN_DELTA_PP and abs(delta) >= MIN_DELTA_REL * before["pct"]
     out["status"] = "no material change" if not material else ("reduced" if delta > 0 else "increased")
-    if out["status"] == "reduced":
+    if fix["cause"] in waste.UNCOUNTED:  # an observation is never priced: share comparison only
+        out["saving_usd"] = None
+        out["note"] = f"{CAUSE_LABELS.get(fix['cause'], fix['cause'])} is a baseline cost, left out of the overhead total: the share is compared, no dollar figure."
+    elif out["status"] == "reduced":
         out["saving_usd"] = delta * after["usd"]  # after-period spend at the old share, minus the actual
     return out
 
@@ -222,12 +237,12 @@ def _mix(data, fix):
     return out
 
 
-def change_view(db_path, fix, today=None):
+def change_view(db_path, fix, today=None, everything=None):
     """verify() plus what the Changes tab shows. ``state`` is one of waiting / no_history / reduced /
     no_change / increased. A verdict state needs MIN_SESSIONS on both sides (verify's rule, unchanged);
     otherwise ``interim`` is true and the numbers are a preview, never a result."""
     today = today or date.today()
-    data = _gather(db_path, fix)
+    data = _slice(everything, fix) if everything else _gather(db_path, fix)
     r = verify(db_path, fix, data)
     r["mix"] = _mix(data, fix)
     b, a = r["before"]["sessions"], r["after"]["sessions"]
@@ -252,7 +267,9 @@ def format_result(r):
     for name, s in (("before", b), ("after", a)):
         lines.append(f"  {name:<6} {s['sessions']:>4} sessions  ${s['cause_usd']:.2f} of ${s['usd']:.2f}  = {s['pct'] * 100:.1f}%")
     lines.append(f"  {r['status']}" + (f": {r['reason']}" if r.get("reason") else ""))
-    if r["status"] == "reduced":
+    if r["status"] == "reduced" and r["saving_usd"] is None:
+        lines.append(f"  share fell {(b['pct'] - a['pct']) * 100:.1f} points; {r['note']}")
+    elif r["status"] == "reduced":
         lines.append(f"  share fell {(b['pct'] - a['pct']) * 100:.1f} points; about ${r['saving_usd']:.2f} less over the after period ({r['basis']})")
     lines.append(f"  caveat: {r['caveat']}")
     return "\n".join(lines)

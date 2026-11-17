@@ -111,7 +111,7 @@ class TestNavigation(unittest.TestCase):
     def test_session_list_filters_do_not_skew_overview_totals(self):
         body = APP_JS[APP_JS.index("function aggregate()"):APP_JS.index("lastFilteredSessions = sortSessions")]
         # filteredSessions feeds only Sessions-screen data (list, signals); Overview totals,
-        # model session counts, project tables and the cost breakdown read rangeFilteredSessions.
+        # model session counts and project tables read rangeFilteredSessions; the cost cards read the per-day rows.
         leaks = re.findall(r"of filteredSessions\b|\bfilteredSessions\.length|aggregateCostBreakdown\(filteredSessions", body)
         self.assertEqual(leaks, [], "an Overview aggregate reads the session-list-filtered sessions")
 

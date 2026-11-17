@@ -1376,6 +1376,19 @@ class TestEffortBackfill(unittest.TestCase):
         conn.close()
         self.assertIn("idx_turns_message_id", plan, f"full scan? plan was: {plan}")
 
+    def test_every_turns_lookup_by_message_id_restates_the_index_predicate(self):
+        # Same trap, whole codebase: any statement on turns keyed by `message_id = ?`
+        # must carry the partial index's predicate or it scans the table per call.
+        import re
+        root = Path(scanner.__file__).parent
+        bad = []
+        for f in [*root.glob("*.py"), *root.glob("sources/*.py")]:
+            src = re.sub(r'"\s*\n\s*f?"', "", f.read_text(encoding="utf-8"))  # join adjacent literals
+            for m in re.finditer(r'(?:FROM turns|UPDATE turns)[^"]*message_id = \?[^"]*', src):
+                if "message_id != ''" not in m.group(0):
+                    bad.append(f"{f.name}: {m.group(0)[:70]}")
+        self.assertEqual(bad, [])
+
     def test_missing_dir_leaves_marker_unset(self):
         from sources import ClaudeSource, scan_all
         missing = str(Path(self.tmpdir) / "gone")
@@ -1870,3 +1883,65 @@ class TestMidStreamTallies(unittest.TestCase):
             self.assertEqual(total, 342)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def _scan(self, files):
+        """Scan {name: [lines]} twice; returns (rows of (message_id, tool_calls), reported error paths)."""
+        import sources
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            projects = tmp / "projects"; projects.mkdir()
+            for name, lines in files.items():
+                (projects / name).write_text("\n".join(lines) + "\n", encoding="utf-8")
+                os.utime(projects / name, (1_000_000, 1_000_000))
+            sources.PROGRESS["errors"] = []
+            for _ in range(2):  # the second scan must not lose or re-raise anything either
+                sources.scan_all(db_path=tmp / "u.db", verbose=False, extensions=[],
+                                 sources=[sources.ClaudeSource(projects_dirs=[str(projects)])])
+            conn = get_db(tmp / "u.db")
+            rows = conn.execute("SELECT message_id, tool_calls FROM turns ORDER BY message_id").fetchall()
+            conn.close()
+            return [tuple(r) for r in rows], {Path(e["path"]).name for e in sources.PROGRESS["errors"]}
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_final_record_brings_its_tool_calls(self):
+        final = json.loads(_make_assistant_record(message_id="msg-1", output_tokens=342))
+        final["message"]["content"] = [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/a"}}]
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            projects = tmp / "projects"; projects.mkdir()
+            fp = projects / "s.jsonl"
+            fp.write_text(_make_assistant_record(message_id="msg-1", output_tokens=3) + "\n", encoding="utf-8")
+            os.utime(fp, (1_000_000, 1_000_000))
+            from sources import ClaudeSource, scan_all
+            run = lambda: scan_all(db_path=tmp / "u.db", verbose=False, extensions=[],
+                                   sources=[ClaudeSource(projects_dirs=[str(projects)])])
+            run()
+            with open(fp, "a", encoding="utf-8") as f:
+                f.write(json.dumps(final) + "\n")
+            os.utime(fp, (1_000_100, 1_000_100))
+            run()
+            conn = get_db(tmp / "u.db")
+            calls = conn.execute("SELECT tool_calls FROM turns").fetchone()[0]
+            conn.close()
+            self.assertIn("Read", calls or "")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_wrong_shaped_line_does_not_drop_the_rest_of_the_file(self):
+        null_usage = json.loads(_make_assistant_record(message_id="msg-null"))
+        null_usage["message"]["usage"] = None
+        null_msg = json.loads(_make_assistant_record(message_id="msg-x"))
+        null_msg["message"] = None
+        rows, errors = self._scan({"s.jsonl": ["[1, 2]", json.dumps(null_usage), json.dumps(null_msg),
+                                               _make_assistant_record(message_id="msg-after")]})
+        self.assertIn("msg-after", [r[0] for r in rows])
+        self.assertEqual(errors, set())
+
+    def test_one_unwritable_record_does_not_stop_the_scan(self):
+        bad = _make_assistant_record(session_id="bad", message_id="msg-bad",
+                                     effort={"level": "high"})  # sqlite cannot bind a dict
+        rows, errors = self._scan({"a.jsonl": [bad],
+                                   "b.jsonl": [_make_assistant_record(session_id="good", message_id="msg-good")]})
+        self.assertEqual([r[0] for r in rows], ["msg-good"])
+        self.assertEqual(errors, {"a.jsonl"})

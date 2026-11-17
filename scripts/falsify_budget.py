@@ -4,18 +4,29 @@ check the tests go red. A mutant that stays green is a hole in the tests.
     python scripts/falsify_budget.py        # exit 1 if any mutant is MISSED or STALE
 """
 
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+WORKERS = min(4, os.cpu_count() or 1)
 BUD, WHAT, PRICE, API, CLI = "budget.py", "whatif.py", "pricing.py", "api.py", "cli.py"
 BJS, WJS, APP, HTML = "static/modules/budget.js", "static/modules/whatif.js", "static/modules/app.js", "static/index.html"
 LEAK = '__import__("whatif").reprice("next_tier", db_path=db_path)["delta_usd"]'
 
 MUTANTS = [
+    ("static/styles.css", "@media (min-width: 1700px) { .stats-row { grid-template-columns: repeat(8, minmax(0, 1fr)); } }",
+     "@media (min-width: 1700px) { .stats-row { grid-template-columns: repeat(7, minmax(0, 1fr)); } }"),
+    (APP, "if (!isBudgetShown()) {", "if (false) {"),  # the show/hide setting ignored
+    (APP, "budgetShown ?? store.get(BUDGET_SHOW_KEY) !== '0';", "budgetShown ?? store.get(BUDGET_SHOW_KEY) === '0';"),  # shown by default
+    (APP, '<td class="branch-cell" colspan="8"><table class="sub-table">', '<td class="branch-cell" colspan="12"><table class="sub-table">'),  # detail wider than the list
+    (APP, "['Input', 'Output', 'Cache Read', 'Cache Creation'].map(h => `<th data-prov=\"official\">${h}</th>`).join('') +", "'<th></th><th></th><th></th><th></th>' +"),  # detail columns unnamed
+    (APP, "const stale = () => expandGen.get(sessionId) !== gen || btn", "const stale = () => btn"),  # an older expand response overwrites a newer one
+    (APP, "if (!stale()) sessionBreakdownCache.set(sessionId, payload);", "sessionBreakdownCache.set(sessionId, payload);"),  # a late answer cached over the newer one
     # month_status
     (BUD, "start=(first - timedelta(days=1)).isoformat(),", "start=(today - timedelta(days=7)).isoformat(),"),  # a range filter, not the calendar month
     (BUD, "except (OSError, ValueError, KeyError, TypeError):\n        return None", "except (OSError, ValueError, KeyError, TypeError):\n        return 0.0"),  # unset budget read as zero
@@ -78,7 +89,7 @@ MUTANTS = [
     ("whatif.py", "(a.agent_type IS NOT NULL OR {side} = 1)", "(a.agent_type IS NOT NULL)"),
     ("whatif.py", "(a.agent_type IS NULL AND {side} = 0)", "(a.agent_type IS NULL)"),
     ("budget.py", "    except OverflowError:", "    except KeyError:"),
-    ("budget.py", "    path.parent.mkdir(parents=True, exist_ok=True)\n", ""),
+    ("budget.py", "        path.parent.mkdir(parents=True, exist_ok=True)\n        deadline", "        deadline"),
     ("budget.py", 'fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")  # one temp file per writer',
      'tmp = str(path) + ".tmp"; fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)'),
     ("whatif.py", 'if tz == "local"\n               else "substr', 'if False\n               else "substr'),
@@ -86,6 +97,7 @@ MUTANTS = [
     (APP, "    sessionLanes.clear();  // a rescan", "    //  // a rescan"),
     (APP, "if (sessionLanes.get(sessionId) === p)", "if (true)"),
     (APP, "{ to: 'next_tier', start, end, tz: displayTZ }", "{ to: 'next_tier', start, end }"),
+    ("static/modules/app.js", "month.set('tz', displayTZ);", "if (displayTZ === 'utc') month.set('tz', 'utc');"),
 ]
 TESTS = ["tests.test_budget", "tests.test_whatif", "tests.test_budget_ui", "tests.test_drilldown", "tests.test_server_hardening"]
 
@@ -95,29 +107,39 @@ def run(tree):
                           cwd=tree, capture_output=True, text=True).returncode
 
 
+def check(tree, mutant):
+    fname, orig, mut = mutant
+    path = tree / fname
+    src = path.read_text(encoding="utf-8")
+    if src.count(orig) != 1:
+        return "STALE", f"STALE  {fname}: pattern not found once: {orig[:60]!r}"
+    path.write_text(src.replace(orig, mut), encoding="utf-8")
+    red = run(tree) != 0
+    path.write_text(src, encoding="utf-8")
+    return ("caught" if red else "MISSED"), f"{'caught' if red else 'MISSED'} {fname}: {orig.strip()[:60]}"
+
+
 def main():
-    caught = missed = stale = 0
+    # each mutant is ~8s of tests, so ~67 of them in series is minutes: one tree copy per worker
+    workers = min(WORKERS, len(MUTANTS))
+    counts = {"caught": 0, "MISSED": 0, "STALE": 0}
     with tempfile.TemporaryDirectory() as tmp:
-        tree = Path(tmp) / "repo"
-        shutil.copytree(ROOT, tree, ignore=shutil.ignore_patterns(
-            ".git", "__pycache__", "*.db", "build", "*.egg-info", ".claude", ".local-delegate"))
-        if run(tree) != 0:
+        trees = []
+        for i in range(workers):
+            tree = Path(tmp) / f"repo{i}"
+            shutil.copytree(ROOT, tree, ignore=shutil.ignore_patterns(
+                ".git", "__pycache__", "*.db", "build", "*.egg-info", ".claude", ".local-delegate"))
+            trees.append(tree)
+        if run(trees[0]) != 0:
             sys.exit("baseline suite is red; fix that first")
-        for fname, orig, mutant in MUTANTS:
-            path = tree / fname
-            src = path.read_text(encoding="utf-8")
-            if src.count(orig) != 1:
-                print(f"STALE  {fname}: pattern not found once: {orig[:60]!r}")
-                stale += 1
-                continue
-            path.write_text(src.replace(orig, mutant), encoding="utf-8")
-            red = run(tree) != 0
-            path.write_text(src, encoding="utf-8")
-            print(f"{'caught' if red else 'MISSED'} {fname}: {orig.strip()[:60]}")
-            caught += red
-            missed += not red
-    print(f"caught {caught}, MISSED {missed}, STALE {stale}")
-    sys.exit(1 if missed or stale else 0)
+        jobs = [MUTANTS[i::workers] for i in range(workers)]
+        with ThreadPoolExecutor(workers) as pool:
+            for results in pool.map(lambda a: [check(a[0], m) for m in a[1]], zip(trees, jobs)):
+                for kind, line in results:
+                    print(line)
+                    counts[kind] += 1
+    print(f"caught {counts['caught']}, MISSED {counts['MISSED']}, STALE {counts['STALE']}")
+    sys.exit(1 if counts["MISSED"] or counts["STALE"] else 0)
 
 
 if __name__ == "__main__":

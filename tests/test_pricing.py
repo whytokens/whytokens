@@ -517,17 +517,25 @@ class TestFallbackSignal(unittest.TestCase):
             self.assertEqual(pricing.fallbacks_in_db(db), [])  # no DB yet: nothing to report
             conn = sqlite3.connect(db)
             self.assertEqual(pricing.fallbacks_in_db(db), [])  # no turns table yet
-            conn.execute("CREATE TABLE turns (model TEXT)")
-            conn.executemany("INSERT INTO turns VALUES (?)", [
+            conn.execute("CREATE TABLE turns (model TEXT, output_tokens INT DEFAULT 5, input_tokens INT DEFAULT 0, "
+                         "cache_read_tokens INT DEFAULT 0, cache_creation_tokens INT DEFAULT 0)")
+            conn.executemany("INSERT INTO turns (model) VALUES (?)", [
                 ("claude-fable-5-2",), ("claude-fable-5-3",), ("claude-fable-5-3",),
                 ("claude-sonnet-6",), ("qwen3.6-27b",), (None,), ("",)])
+            conn.execute("INSERT INTO turns (model, output_tokens) VALUES ('<synthetic>', 0)")  # nothing to price
             conn.commit()
             conn.close()
             self.assertEqual(pricing.fallbacks_in_db(db), [
                 {"model": "claude-fable-5-3", "priced_as": "claude-fable-5", "how": "prefix", "turns": 2},
-                {"model": "claude-sonnet-6", "priced_as": "claude-sonnet-4-6", "how": "keyword", "turns": 1}])
+                {"model": "claude-sonnet-6", "priced_as": "claude-sonnet-4-6", "how": "keyword", "turns": 1},
+                # no row matches: $0, and said so rather than left out of the report
+                {"model": "qwen3.6-27b", "priced_as": None, "how": "unpriced", "turns": 1}])
             text = pricing.format_fallbacks(pricing.fallbacks_in_db(db))
             self.assertIn("claude-fable-5-3", text)
             self.assertIn("claude-fable-5", text)
-            self.assertNotIn("qwen", text)
+            self.assertIn("qwen3.6-27b (1 turns)", text)
+            self.assertIn("count as $0", text)
+            self.assertNotIn("synthetic", text)
+            only_unpriced = pricing.format_fallbacks([{"model": "new-family-1", "priced_as": None, "how": "unpriced", "turns": 3}])
+            self.assertNotIn("own price row", only_unpriced)
         self.assertIn("own price row", pricing.format_fallbacks([]))

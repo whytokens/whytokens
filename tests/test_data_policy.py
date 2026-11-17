@@ -199,7 +199,8 @@ class TestMigration(PolicyCase):
 
     def test_standalone_scan_also_migrates(self):
         self.seed_raw()
-        self.scan()
+        import scanner   # the standalone entry point, not scan_all
+        scanner.scan(projects_dir=self.proj.parent, db_path=self.db, verbose=False)
         self.assertNotIn(SECRET, "".join(self.stored()))
 
     def test_blocked_purge_is_retried_not_marked_done(self):
@@ -223,6 +224,73 @@ class TestMigration(PolicyCase):
         n = len(self.stored())
         self.run_scan_all()
         self.assertEqual(len(self.stored()), n)
+
+
+class TestPromptTopicsCleared(PolicyCase):
+    """Older versions kept a Projects thread's trigger message as the session topic."""
+    TOPIC = "PASTED-KEY-"
+
+    def seed(self):
+        with closing(scanner.get_db(self.db)) as c:
+            scanner.init_db(c)
+            # many rows: a single small one is overwritten in place and hides a missing purge
+            c.executemany("INSERT INTO sessions (session_id, topic, topic_source) VALUES (?, ?, 'prompt')",
+                          [(f"old{i}", f"{self.TOPIC}{i:04d}-" + "x" * 50) for i in range(300)])
+            c.execute("INSERT INTO sessions (session_id, topic, topic_source) VALUES ('kept', 'AI guess', 'ai')")
+            c.commit()
+        self.assertIn(self.TOPIC.encode(), self.db_bytes())
+
+    def run_scan_all(self):
+        proj = self.proj.parent
+        sources.scan_all(db_path=self.db, projects_dir=proj, verbose=False, extensions=[],
+                         sources=[sources.ClaudeSource(projects_dirs=[proj])])
+
+    def state(self):
+        with closing(sqlite3.connect(self.db)) as c:
+            marker = c.execute("SELECT value FROM schema_meta WHERE key = ?", (policy.PROMPT_TOPICS_KEY,)).fetchone()
+            left = c.execute("SELECT COUNT(*) FROM sessions WHERE topic_source = 'prompt' OR topic LIKE ?",
+                             (self.TOPIC + "%",)).fetchone()[0]
+            kept = c.execute("SELECT topic, topic_source FROM sessions WHERE session_id = 'kept'").fetchone()
+        return (marker and marker[0]), left, tuple(kept)
+
+    def test_cleared_and_purged_from_the_file(self):
+        self.seed()
+        self.run_scan_all()
+        self.assertEqual(self.state(), ("1", 0, ("AI guess", "ai")))
+        self.assertNotIn(self.TOPIC.encode(), self.db_bytes())   # VACUUMed, not just set to NULL
+
+    def test_blocked_purge_is_retried_not_marked_done(self):
+        self.seed()
+        holder = sqlite3.connect(self.db)
+        holder.execute("BEGIN")
+        holder.execute("SELECT COUNT(*) FROM sessions").fetchone()   # open read txn blocks VACUUM
+        try:
+            self.run_scan_all()
+        finally:
+            holder.close()
+        self.assertEqual(self.state()[:2], ("purge", 0))
+        self.run_scan_all()                                           # retry succeeds
+        self.assertEqual(self.state()[0], "1")
+        self.assertNotIn(self.TOPIC.encode(), self.db_bytes())
+
+    def test_retry_purges_again_though_the_rows_are_already_cleared(self):
+        # the scan-level retry above also passes on the tool-call migration's VACUUM alone
+        self.seed()
+        with closing(scanner.get_db(self.db)) as c:
+            run = lambda: policy.clear_prompt_topics(c, scanner._meta_get, scanner._meta_set)
+            with mock.patch.object(policy, "_purged", return_value=False):
+                self.assertEqual(run(), 300)
+            with mock.patch.object(policy, "_purged", return_value=True) as purge:
+                self.assertEqual(run(), 0)
+                purge.assert_called_once()
+            self.assertEqual(scanner._meta_get(c, policy.PROMPT_TOPICS_KEY), "1")
+
+    def test_a_db_with_nothing_to_clear_is_marked_without_a_vacuum(self):
+        with mock.patch.object(policy, "_purged", side_effect=AssertionError("vacuumed")):
+            with closing(scanner.get_db(self.db)) as c:
+                scanner.init_db(c)
+                self.assertEqual(policy.clear_prompt_topics(c, scanner._meta_get, scanner._meta_set), 0)
+                self.assertEqual(scanner._meta_get(c, policy.PROMPT_TOPICS_KEY), "1")
 
 
 class TestCodexEndToEnd(PolicyCase):

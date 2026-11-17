@@ -187,6 +187,18 @@ class ApiTests(unittest.TestCase):
         c.close()
         return out
 
+    def test_project_picker_leaves_out_projects_too_small_to_verify(self):
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        conn.execute("INSERT INTO sessions (session_id, project_name) VALUES ('one-off', 'Temp/scratch')")
+        conn.commit()
+        try:
+            self.assertEqual(self.call("GET", "/api/changes")[1]["projects"], ["acme/app"])
+        finally:
+            conn.execute("DELETE FROM sessions WHERE session_id = 'one-off'")
+            conn.commit()
+            conn.close()
+
     def test_lifecycle(self):
         st, d = self.call("GET", "/api/changes")
         self.assertEqual((st, d["changes"], d["projects"]), (200, [], ["acme/app"]))
@@ -201,6 +213,73 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.call("POST", "/api/fixes/delete", {"id": fid}, token=None)[0], 403)
         self.assertEqual(self.call("POST", "/api/fixes/delete", {"id": fid})[0], 200)
         self.assertEqual(self.call("GET", "/api/changes")[1]["changes"], [])
+
+    def test_malformed_bodies_get_an_http_answer_not_a_dropped_connection(self):
+        cases = [("/api/fixes/edit", {"id": 10 ** 22}), ("/api/fixes/delete", {"id": 10 ** 22})]
+        if api.HAS_LLM:
+            cases.append(("/api/llm/preview", {"kind": ["x"]}))
+        for path, body in cases:
+            st, r = self.call("POST", path, body)
+            self.assertEqual(st, 400, path)
+            self.assertTrue(r["error"], path)
+
+    def test_a_build_without_model_help_has_no_adapter_routes_or_page_flag(self):
+        with mock.patch.object(api, "HAS_LLM", False):
+            self.assertEqual(self.raw("GET", "/api/llm")[0], 404)
+            for path in ("/api/llm/preview", "/api/llm/run"):
+                self.assertEqual(self.raw("POST", path, {"confirm": "x"})[0], 404, path)
+            page = self.raw("GET", "/")[1]
+        self.assertIn('name="whytokens-token"', page)
+        self.assertNotIn("whytokens-llm", page)
+        with mock.patch.object(api, "HAS_LLM", True):
+            self.assertIn('<meta name="whytokens-llm" content="1">', self.raw("GET", "/")[1])
+
+    def raw(self, method, path, body=None):
+        c = http.client.HTTPConnection("127.0.0.1", self.port)
+        c.request(method, path, None if body is None else json.dumps(body),
+                  {"Content-Type": "application/json", api.TOKEN_HEADER: self.TOKEN})
+        r = c.getresponse()
+        out = (r.status, r.read().decode("utf-8", "replace"))
+        c.close()
+        return out
+
+    def test_help_lists_llm_only_in_a_build_that_has_it(self):
+        without, full = cli.usage(has_llm=False), cli.usage(has_llm=True)
+        self.assertIn("whytokens llm", full)
+        self.assertNotIn("llm", without)
+        # only the llm entry goes: every other line survives, neighbours included
+        gone = [l for l in full.splitlines() if l not in without.splitlines()]
+        self.assertEqual(len(gone), 3)
+        self.assertTrue(gone[0].startswith("  whytokens llm "))
+        self.assertEqual(len(full.splitlines()) - len(without.splitlines()), 3)
+        self.assertIn("whytokens verify [FIX_ID]", without)
+        self.assertIn("whytokens pricing check", without)
+
+    def test_page_loads_model_help_only_when_the_server_flags_it(self):
+        app = (Path(api.__file__).parent / "static" / "modules" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn("from './llm.js'", app)  # a static import fails the whole page in a public build
+        self.assertIn("""document.querySelector('meta[name="whytokens-llm"]') ? import('./llm.js')""", app)
+
+    def test_cli_without_model_help_says_so_and_exits_2(self):
+        out = io.StringIO()
+        with mock.patch.object(cli.config, "HAS_LLM", False), contextlib.redirect_stdout(out), \
+                self.assertRaises(SystemExit) as e:
+            cli.cmd_llm(["label", "s1"])
+        self.assertEqual(e.exception.code, 2)
+        self.assertIn("not part of this build", out.getvalue())
+
+    def test_budget_post_answers_503_when_its_settings_file_is_locked(self):
+        import budget
+        with mock.patch.object(budget, "set_budget", side_effect=OSError("settings file is locked")):
+            st, r = self.call("POST", "/api/budget", {"monthly_usd": 50})
+        self.assertEqual(st, 503)
+        self.assertIn("settings file is locked", r["error"])
+
+    def test_a_locked_database_answers_503_with_the_reason(self):
+        with mock.patch.object(api, "post_fix_delete", side_effect=sqlite3.OperationalError("database is locked")):
+            st, r = self.call("POST", "/api/fixes/delete", {"id": 1})
+        self.assertEqual(st, 503)
+        self.assertIn("database is locked", r["error"])
 
     def test_rejections(self):
         future = (date.today() + timedelta(days=1)).isoformat()
@@ -280,6 +359,12 @@ class RenderTests(unittest.TestCase):
         for state in ("no_change", "increased"):
             self.assertNotIn("less over the after period", self.render(_change(state, saving_usd=2.0))["row"])
 
+    def test_observation_verdict_shows_its_note_and_no_dollar_figure(self):
+        row = self.render(_change("reduced", saving_usd=None, note="X is an observation, not priced."))["row"]
+        self.assertIn("is an observation", row)
+        self.assertNotIn("less over the after period", row)
+        self.assertNotIn("null", row)
+
     def test_empty_state_teaches_and_links_to_waste(self):
         e = self.render(_change("reduced"))["empty"]
         self.assertEqual(e.count("<li>"), 3)
@@ -318,3 +403,73 @@ class RenderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OneGatherPerRequestTests(_Db):
+    CAUSES = ("resident_output", "repeated_reads", "idle_gap", "uncached_input")
+
+    def several(self):
+        self.build([True] * 12, [False] * 12)
+        for c in self.CAUSES[1:]:
+            fixes.record_fix(self.conn, "acme/app", c, "n", FIX_DATE)
+        self.conn.commit()
+
+    def report_calls(self, fn):
+        with mock.patch.object(fixes.waste, "report", wraps=fixes.waste.report) as m:
+            out = fn()
+        return m.call_count, out
+
+    def test_changes_computes_the_waste_report_once_for_all_changes(self):
+        self.several()
+        n, out = self.report_calls(lambda: api.get_changes(self.db))
+        self.assertEqual((n, len(out["changes"])), (1, len(self.CAUSES)))
+        for c in out["changes"]:  # identical to the per-change path
+            self.assertEqual(c, fixes.change_view(self.db, c["fix"], today=date.today()))
+
+    def test_fixes_computes_the_waste_report_once_for_all_fixes(self):
+        self.several()
+        n, out = self.report_calls(lambda: api.get_fixes(self.db))
+        self.assertEqual((n, len(out["results"])), (1, len(self.CAUSES)))
+        for r in out["results"]:
+            self.assertEqual(r, fixes.verify(self.db, r["fix"]))
+
+
+class ObservationCauseTests(unittest.TestCase):
+    def test_observation_cause_compares_shares_without_a_dollar_figure(self):
+        rows = [(f"b{i}", "2026-08-01", None) for i in range(12)] + [(f"a{i}", "2026-09-05", None) for i in range(12)]
+        data = ({s: 10.0 for s, _, _ in rows}, rows, {f"b{i}": 4.0 for i in range(12)})
+        fix = {"id": 1, "project": "p", "cause": "large_context", "fix_date": "2026-09-01", "note": "n"}
+        r = fixes.verify(None, fix, data)
+        self.assertEqual((r["status"], r["before"]["pct"], r["after"]["pct"]), ("reduced", 0.4, 0.0))
+        self.assertIsNone(r["saving_usd"])
+        self.assertIn("baseline cost", r["note"])
+        self.assertNotIn("$", r["note"])
+        self.assertNotIn("$", fixes.format_result(r).split("\n")[-2])  # the verdict line
+        self.assertIsNotNone(fixes.verify(None, {**fix, "cause": "resident_output"}, data)["saving_usd"])
+
+    def test_every_waste_cause_has_a_label(self):
+        self.assertEqual([c for c in fixes.waste.CAUSES if c not in fixes.CAUSE_LABELS], [])
+
+
+class PickerTests(unittest.TestCase):
+    def test_a_new_install_still_gets_a_project_to_record_against(self):
+        tmp, db = _build([True] * 2, [False] * 1)  # below the 10-session picker threshold
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.assertEqual(api.get_changes(db)["projects"], ["acme/app"])
+
+
+@unittest.skipUnless(NODE, "node not installed")
+class PrefillTests(unittest.TestCase):
+    def test_a_prefilled_project_outside_the_picker_is_added_and_selected(self):
+        src = (ROOT / "static" / "modules" / "changes.js").read_text(encoding="utf-8")
+        a = src.index("  const pre = PREFILL.get('project');")
+        body = src[a:src.index("\n  }", src.index("f.project.value = pre;")) + 4]
+        out = subprocess.run([NODE, "--input-type=module", "-e", f"""
+globalThis.Option = class {{ constructor(t, v) {{ this.text = t; this.value = v; }} }};
+const f = {{ project: {{ options: [], value: 'acme', add(o) {{ this.options.push(o); }} }} }};
+const PREFILL = new URLSearchParams('project=tiny'), d = {{ projects: ['acme'] }};
+{body}
+console.log(JSON.stringify([f.project.value, f.project.options.map(o => o.value)]));
+"""], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), ["tiny", ["tiny"]])

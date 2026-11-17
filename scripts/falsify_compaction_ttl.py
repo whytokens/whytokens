@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # (file, original, mutant) - each must turn the suite red on its own.
 MUTANTS = [
     ("scanner.py", "pending_compact[session_id] = None", "pass"),
-    ("sources/claude.py", "WHERE message_id = ? AND is_compact_summary = 0", "WHERE message_id = ? AND 0"),
+    ("sources/claude.py", "message_id != '' AND is_compact_summary = 0", "message_id != '' AND 0"),
     ("waste.py", "if 0 < read < prefix and gap is not None", "if False and gap is not None"),
     # combined review: partial expiry checked before the majority cutoff, and only when something was lost
     ("waste.py", "if 0 < read < prefix and gap is not None", "if 0 < read < prefix and read * 2 < prefix and gap is not None"),

@@ -74,8 +74,17 @@ def load(dirs=None):
     return out
 
 
+def unsafe_rel(rel):
+    """True for a static path that must never reach Path.resolve(): on Windows a leading
+    // or \\\\ makes it a network path (resolving it contacts that host), and a colon is a
+    drive or a file stream."""
+    return rel.startswith("/") or "\\" in rel or ":" in rel
+
+
 def static_file(ext, rel):
     """Map /ext/<name>/<rel> to a file inside the extension's static dirs, else None."""
+    if unsafe_rel(rel):
+        return None
     for t in ext["tabs"]:
         root = (ext["dir"] / t["static_dir"]).resolve()
         cand = (root / rel).resolve()

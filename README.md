@@ -32,12 +32,12 @@ Requires Python 3.11 or newer. No third-party dependencies.
 
 ```sh
 # one-off, no install
-uvx --from git+https://github.com/whytokens/whytokens@v0.3.0 whytokens dashboard
+uvx --from git+https://github.com/whytokens/whytokens@v0.4.0 whytokens dashboard
 
 # or install the command
-pipx install git+https://github.com/whytokens/whytokens@v0.3.0
+pipx install git+https://github.com/whytokens/whytokens@v0.4.0
 # or, with uv
-uv tool install git+https://github.com/whytokens/whytokens@v0.3.0
+uv tool install git+https://github.com/whytokens/whytokens@v0.4.0
 whytokens dashboard
 
 # or from a clone
@@ -52,14 +52,14 @@ python cli.py dashboard       # python3 on macOS/Linux
 
 | Screen | Shows |
 |---|---|
-| Overview | Totals, daily token usage with estimated cost, hourly distribution, projects, tools |
-| Sessions | Filterable session table with cost, model, tokens; expensive-session signals; CSV export |
+| Overview | Dollar-first cards with each one's share of cost, a monthly budget band (projection, gap, needed daily rate; can be hidden in Settings), daily token usage with estimated cost, hourly distribution, projects, tools |
+| Sessions | Filterable session list with cost, model, overhead and shape; expand a row for tokens, cache share, the peer multiple and who spent what (main thread, each subagent), plus a what-if repricing on cheaper models; expensive-session signals; CSV export |
 | Trace | One session turn by turn; a finding links straight to the turn that caused it |
-| Waste | Spend attributed to avoidable causes by cause, week and project, with observed/inferred badges. Each finding opens a next-step card: the rule to paste, the calls that cost the most, a lower-bound estimate, and an "I made this change" button that records the fix and checks back later |
+| Waste | Spend attributed to avoidable causes by cause, week and project, with observed/inferred badges. Costs every session carries (the fixed prefix re-read each turn, context past 250K) sit in a separate "Baseline cost" group and are not added to the overhead total; retry loops (one failing call repeated in a prompt) are a cause of their own. Each finding opens a next-step card: the rule to paste, the calls that cost the most, a lower-bound estimate, and an "I made this change" button that records the fix and checks back later |
 | Changes | Record a change you made to a habit (project, cause, date, note), then see it wait for 10 sessions and read Reduced, No material change or Increased, with before and after share bars. Edit a date or note, or delete a mistake. Before 10 sessions on each side the numbers are a preview, never a result |
 | Work shape | Every session gets a shape from its tool mix (edit-, read/search-, shell-, web-, connector- or subagent-heavy, mixed, chat). Sessions shows a shape column and a "vs peers" multiple against the median for the same shape in the same project; Overview counts sessions at 2x or more and has a collapsible by-shape table; each project can carry one free-text tag. A shift in the shape mix is flagged next to a Changes verdict, which it never alters |
 | Sources | Which log locations were found and how many sessions came from each |
-| Settings | Editable price table, timezone, theme |
+| Settings | Editable price table, timezone, theme, budget band on or off |
 
 Light and dark themes follow the OS unless you pick one.
 
@@ -83,6 +83,7 @@ Each command below can be run as `whytokens <command>` or `python cli.py <comman
 | `waste [--session ID]` | Avoidable-spend findings with a concrete fix each |
 | `fix record --project P --cause C --note TEXT [--date D] [--file PATH]`, `fix list`, `fix edit ID [--date D] [--note TEXT]`, `fix delete ID` | The terminal twin of the dashboard's **Changes** tab (record a change you made, list, correct, delete; the tab is the main way to do it). `--file` hashes the CLAUDE.md or config file you changed. A date cannot be in the future |
 | `shapes`, `project tag PROJECT [TAG\|--clear]` | Cost by work shape and the count of sessions at 2x or more their peers; set, show or clear a project's display tag |
+| `budget [AMOUNT\|--clear]` | This month's spend against a monthly budget (API list price): projection, gap and the daily rate that meets it |
 | `verify [FIX_ID]` | Attributed share of spend for the fix's project and cause, after versus before, with dollars. Needs 10 sessions on each side or it prints "insufficient data"; the Changes tab shows the same numbers as Waiting, Not enough history before, Reduced, No material change or Increased, and only the last three are results. Quality is not measured |
 | `pricing check [--offline]` | Review diff of the shipped price table against LiteLLM (OpenRouter cross-check). Never applied automatically; `--offline` uses the cache |
 | `dashboard [--projects-dir PATH] [--host HOST] [--port PORT] [--no-browser] [--unsafe-host]` | Scan, then serve the dashboard |

@@ -23,10 +23,12 @@ import { watchProvenance, provBadge, addSplit, orUnknown } from './provenance.js
 import { writeTraceLink, readTraceLink, findTurnRow } from './tracelink.js';
 import { renderChanges } from './changes.js';
 import { verifySlot, fillVerifySlots, resetVerify, recordButton, recordFix } from './verify.js';
-import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchSessionWaste, fetchStatus, fetchBudget, postBudget, fetchWhatif, fetchShapes } from './api.js';
+import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchSessionWaste, fetchStatus, scanLine, fetchBudget, postBudget, fetchWhatif, fetchShapes } from './api.js';
 import { shapeCell, peersCell, peersOf, shapeLabel, shapeOf, shapeKeeps, traceLineHtml, outlierLineHtml, shapeTableHtml, fillShapeFilters, setSelectValue, tagCellHtml, editTag } from './shapes.js';
 import { budgetBandHTML } from './budget.js';
 import { whatifCellHTML, lanesLineHTML } from './whatif.js';
+// The opt-in model-help module (llm.js) is left out of public builds; it is loaded at init if present.
+let llm = null;
 import { readSessionState, writeSessionState, readWasteState, writeWasteState, drillHref, CARD_TARGET, DEFAULT_SORT, overheadIndex, overheadOf, counted } from './drill.js';
 
 // Chart.js is loaded as a classic UMD script before this module (see index.html),
@@ -168,7 +170,7 @@ async function renderPricingFallbacks() {
   try { models = (await fetchJson('/api/pricing/fallbacks')).models || []; } catch (e) { /* older server */ }
   note.hidden = !models.length;
   note.innerHTML = models.length ? 'No price row for: ' + models.map(m =>
-    `<span class="model-tag">${esc(m.model)}</span> billed as ${esc(m.priced_as)} (${fmt(m.turns)} turns)`
+    `<span class="model-tag">${esc(m.model)}</span> ${m.priced_as ? 'billed as ' + esc(m.priced_as) : 'counted as $0'} (${fmt(m.turns)} turns)`
   ).join(', ') + '. A newer model may be over- or under-counted until the table is updated.' : '';
 }
 
@@ -621,6 +623,8 @@ function updateSortIcons() {
   document.querySelectorAll('.sort-icon').forEach(el => el.textContent = '');
   const icon = document.getElementById('sort-icon-' + sessionSortCol);
   if (icon) icon.textContent = sessionSortDir === 'desc' ? ' ▼' : ' ▲';
+  const note = document.getElementById('sessions-sort-note');
+  if (note) note.textContent = icon ? '' : `Sorted by ${sessionSortCol.replace('_', ' ')}, ${sessionSortDir === 'desc' ? 'highest' : 'lowest'} first: a figure in each row's detail.`;
 }
 
 function sortSessions(sessions) {
@@ -655,8 +659,8 @@ function sortSessions(sessions) {
 function aggregateCostBreakdown(rows) {
   return rows.reduce((acc, r) => {
     // Per-model when a session breakdown is present (mixed-model sessions), else
-    // single-model. sessionCostBreakdown handles both.
-    const c = sessionCostBreakdown(r, r.last_date);
+    // single-model. sessionCostBreakdown handles both. A per-day row prices on its own day.
+    const c = sessionCostBreakdown(r, r.day || r.last_date);
     acc.input += c.input;
     acc.output += c.output;
     acc.cache_read += c.cache_read;
@@ -801,7 +805,9 @@ function aggregate() {
     cache_creation_partial: byModel.some(m => isEstimated(m.model)),
     cost:           byModel.reduce((s, m) => s + m.cost, 0),
   };
-  const costTotals = aggregateCostBreakdown(rangeFilteredSessions);
+  // Dollar cards use the same per-day rows as the chart, the model table and their own token
+  // sub-lines. Whole sessions by last day would move a midnight-spanning session's cost onto one day.
+  const costTotals = aggregateCostBreakdown(filteredDaily);
 
   // By tool: aggregate from server-side per-day tool data
   const toolMap = {};
@@ -972,9 +978,9 @@ const CAUSE_AVOID = {
   uncached_input: ['partly avoidable', 'Your newest message is always uncached; repeated material that misses the cache is the part you can cut.'],
   cache_miss_rebuild: ['avoidable', 'The cache broke without an obvious reason. Usually a changed system prompt, tools or model mid-session.'],
   deferred_tool_load: ['mostly avoidable', 'Tool schemas loaded but never called still ride along in every later turn.'],
-  large_context: ['observation', 'Every turn re-reads the whole context. Past 250K, a handoff or /compact is cheaper than carrying it on. Not added to the overhead total.'],
+  large_context: ['baseline', 'Every turn re-reads the whole context. Past 250K, a handoff or /compact is cheaper than carrying it on. Not added to the overhead total.'],
   retry_loop: ['mostly avoidable', 'The same call failed three or more times in a row in one prompt. After the second failure, read the error and change course.'],
-  fixed_prefix: ['observation', 'System prompt, tool schemas and always-loaded instructions are re-read on every turn. Not added to the overhead total.'],
+  fixed_prefix: ['partly avoidable', 'System prompt, tool schemas and always-loaded instructions are re-read on every turn. Some of it is the price of the tool; trimmed instructions and unused connectors are the part you can cut. Not added to the overhead total.'],
 };
 const avoidTag = c => CAUSE_AVOID[c]
   ? `<span class="avoid-tag" title="${esc(CAUSE_AVOID[c][1])}">${esc(CAUSE_AVOID[c][0])}</span>` : '';
@@ -989,7 +995,8 @@ function traceLink(s, ids, why, id, label) {
 }
 const stampOf = at => esc(String(at || '').replace('T', ' ').replace('Z', ''));
 function actionRows(s, a, ids, why) {
-  const link = (c, fallback) => traceLink(s, ids, why, c.message_id, c.prompt_seq ? 'Request ' + esc(c.prompt_seq) : fallback);
+  // The call's own time is the link: several calls of one prompt would all read "Request 1".
+  const link = (c, stamp) => traceLink(s, ids, why, c.message_id, stamp) + (c.prompt_seq ? ` <span class="muted">· prompt ${esc(c.prompt_seq)}</span>` : '');
   if (a.id === 'compact_before_break' || a.id === 'subagent_waits')
     return ['<th>When</th><th>Who</th><th>Gap</th><th>Tokens</th><th>Cost</th>', a.calls.map(c =>
       `<tr><td class="muted">${link(c, stampOf(c.at))}</td><td>${esc(c.side ? (c.agent_type || 'subagent') : 'main thread')}</td><td class="num">${esc(c.minutes)}m</td>` +
@@ -1002,7 +1009,7 @@ function actionRows(s, a, ids, why) {
     return ['<th>When</th><th>Subagent</th><th>Turns</th><th>Cost</th>', a.calls.map(c =>
       `<tr><td class="muted">${link(c, stampOf(c.at))}</td><td>${esc(c.agent_type || 'unknown')}</td><td class="num">${esc(c.turns)}</td>` +
       `<td class="num">${fmtCostBig(c.usd)}</td></tr>`)];
-  return ['<th>Request</th><th>Tool</th><th>File</th><th>Est. tokens</th>', a.calls.map(c =>
+  return ['<th>When</th><th>Tool</th><th>File</th><th>Est. tokens</th>', a.calls.map(c =>
     `<tr><td class="muted">${link(c, stampOf(c.at))}</td><td>${esc(c.tool || '')}</td><td>${esc(c.file || '')}</td>` +
     `<td class="num">${fmt(c.result_tokens)}</td></tr>`)];
 }
@@ -1014,16 +1021,21 @@ function nextStepBody(s, fix, why, open, project, inTrace = false) {
   if (a) {
     const [head, rows] = actionRows(s, a, ids, why);
     return `<details${open ? ' open' : ''}><summary class="muted">Next step</summary>` +
+      // Reading order: what to do, what it cost, the button that records it, then the calls as evidence.
       `<p class="wg-title"><strong>${esc(a.title)}</strong></p>` +
+      `<p class="wg-step">Add this rule to your project's CLAUDE.md:</p>` +
       `<div class="wg-rule"><code>${esc(a.rule)}</code> <button class="filter-btn" onclick="navigator.clipboard && navigator.clipboard.writeText(this.previousElementSibling.textContent)">Copy</button></div>` +
+      `<p class="wg-est">Estimated cost of this habit in this session: about ${fmtCostBig(a.est_usd)}.</p>` +
+      (project ? `<p class="wg-step">${recordButton(project, s.cause, a.title)} <span class="muted">Marks today as the day you changed this, so the Changes tab can compare before and after.</span></p>` : '') +
+      `<details class="wg-evidence"><summary class="muted">The calls behind this (${rows.length} shown)</summary>` +
       `<table><thead><tr>${head}</tr></thead><tbody>${rows.join('')}</tbody></table>` +
-      `<p class="muted wg-est">Estimate: about ${fmtCostBig(a.est_usd)}. ${esc(a.est_basis)}</p>${project ? recordButton(project, s.cause, a.title) + ' ' : ''}${fullTrace}</details>`;
+      `<p class="muted">How the cost is estimated: ${esc(a.est_basis)}</p></details>${fullTrace}</details>`;
   }
   if (!inTrace && (s.cause === 'resident_output' || s.cause === 'subagent_preamble'))
     return `<details${open ? ' open' : ''}><summary class="muted">Next step</summary>` +
       `<p>No single call stands out. This is the cost of the work.</p>${fullTrace}</details>`;
   return `<details${open ? ' open' : ''}><summary class="muted">Evidence: ${ev.length} call${ev.length === 1 ? '' : 's'}</summary>` +
-    `<p>${esc(s.detail)}</p><p class="wg-fix"><strong>Fix:</strong> ${esc(fix)}</p>` +
+    `<p>${esc(s.detail)}</p>` + (fix ? `<p class="wg-fix"><strong>Fix:</strong> ${esc(fix)}</p>` : '') +
     '<table><thead><tr><th>When</th><th>Tool</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>' +
     ev.map(e => `<tr><td class="muted">${traceLink(s, ids, why, e.message_id, stampOf(e.at))}</td><td>${esc(e.tool || '')}</td>` +
       `<td class="num">${fmt(e.tokens)}</td><td class="num">${fmtCostBig(e.usd)}</td></tr>`).join('') +
@@ -1191,7 +1203,7 @@ function wasteHeatmap(findings, sessions) {
     ` aria-label="${esc(CAUSE_LABEL[c] || c)}, week of ${esc(w)}: ${fmtCostBig(usd)}"><span class="hm-fill" style="opacity:${usd && m.max ? (0.12 + 0.88 * usd / m.max).toFixed(2) : 0}"></span></button></td>`;
   return '<div class="hm-scroll"><table class="hm"><thead><tr><th></th>' + m.weeks.map(w => `<th title="Week of ${esc(w)}">${esc(w.slice(5))}</th>`).join('') + '</tr></thead><tbody>' +
     m.rows.map(r => `<tr><th scope="row">${esc(CAUSE_LABEL[r.cause] || r.cause)}</th>` + r.cells.map((u, i) => cellBtn(r.cause, m.weeks[i], u)).join('') + '</tr>').join('') +
-    '</tbody></table></div><div class="muted">Attributed $ per cause and week (Monday start), darker = more. Shade is relative to the biggest cell.</div>';
+    '</tbody></table></div><div class="muted">Attributed $ per cause and week (Monday start); a stronger shade = more, relative to the biggest cell.</div>';
 }
 // Observed vs inferred $ of a cause/habit, as badges (tooltips from /api/provenance).
 const splitBadges = x => ['observed', 'inferred'].filter(k => x[k] > 0)
@@ -1251,17 +1263,21 @@ async function renderWasteTab() {
   }).join('') + '</tbody>' : '';
   el('waste-measure-wrap').classList.toggle('plain', !not.length);  // coverage stays visible; no reasons to expand
 
-  // Cause bars: click one to narrow the habits below; click again to clear.
-  const top = v.causes.length ? v.causes[0].usd : 0;
-  el('waste-bars').innerHTML = v.causes.map(c =>
-    `<div class="waste-bar-row"><button class="waste-bar${wasteCause === c.cause ? ' active' : ''}" data-cause="${esc(c.cause)}" onclick="setWasteCause(this.dataset.cause)"` +
+  // Cause bars: click one to narrow the habits below; click again to clear. Causes left out of the
+  // total sit in their own muted group, scaled among themselves, so they never outgrow a counted cause.
+  const bar = (c, top) =>
+    `<div class="waste-bar-row${c.in_total ? '' : ' wb-baseline'}"><button class="waste-bar${wasteCause === c.cause ? ' active' : ''}" data-cause="${esc(c.cause)}" onclick="setWasteCause(this.dataset.cause)"` +
     ` aria-pressed="${wasteCause === c.cause}" title="Attribution: ${esc(causeSplit(c))}. Click to show only this cause below.">` +
     `<span class="wb-label">${esc(label(c.cause))} ${avoidTag(c.cause)}</span>` +
     `<span class="wb-track"><span class="wb-fill" style="width:${top ? (100 * c.usd / top).toFixed(1) : 0}%"></span></span>` +
-    `<span class="wb-val">${fmtCostBig(c.usd)} <span class="muted">· ${c.share == null ? 'observation, not in total' : fmtPct(c.share)} · ${c.sessions} session${c.sessions === 1 ? '' : 's'}` +
+    `<span class="wb-val">${fmtCostBig(c.usd)} <span class="muted">· ${c.share == null ? 'not in the total' : fmtPct(c.share)} · ${c.sessions} session${c.sessions === 1 ? '' : 's'}` +
     ` · ${splitBadges(c)}</span></span></button>` +
-    `<a data-drill href="${esc(sessionsByCauseHref(c.cause))}" title="Sessions with this cause, biggest attributed overhead first">Top sessions</a></div>`
-  ).join('') || '<p class="muted">Nothing to show.</p>';
+    `<a data-drill href="${esc(sessionsByCauseHref(c.cause))}" title="Sessions with this cause, biggest first">Top sessions</a></div>`;
+  const group = cs => cs.map(c => bar(c, cs[0].usd)).join('');  // v.causes is biggest first
+  const inTotal = v.causes.filter(c => c.in_total), baseline = v.causes.filter(c => !c.in_total);
+  el('waste-bars').innerHTML = (group(inTotal) + (baseline.length
+    ? '<div class="wb-group-head">Baseline cost <span class="muted">· what every session carries; not added to the overhead total</span></div>' + group(baseline) : ''))
+    || '<p class="muted">Nothing to show.</p>';
 
   // Heatmap shows every week; the week filter only narrows the bars and habits.
   el('waste-heatmap').innerHTML = wasteHeatmap(w.findings, lastFilteredSessions) +
@@ -1278,11 +1294,11 @@ async function renderWasteTab() {
     `</summary>` + (CAUSE_AVOID[g.cause] ? `<p class="muted wg-why">${esc(CAUSE_AVOID[g.cause][1])}</p>` : '') +
     `<p class="wg-fix"><strong>Fix:</strong> ${esc(g.fix)} <span class="muted">(${splitBadges(g)})</span></p>` + verifySlot(g.project, g.cause) +
     '<table><thead><tr><th>Last active</th><th>Session</th><th>Attributed</th><th>Of session</th><th>What happened</th></tr></thead><tbody>' +
-    g.sessions.map((s, i) => `<tr><td class="muted">${esc(s.date || '')}</td>` +
-      `<td><button class="link-btn" data-session="${esc(s.id)}" onclick="openSessionDetail(this.dataset.session)" title="Open trace">` +
+    g.sessions.map(s => `<tr><td class="muted wg-date">${esc(s.date || '')}</td>` +
+      `<td><button class="link-btn wg-session" data-session="${esc(s.id)}" onclick="openSessionDetail(this.dataset.session)" title="Open trace">` +
       `${esc(s.title || s.id.slice(0, 8) + '…')}</button></td>` +
       `<td class="num">${fmtCostBig(s.usd)}</td><td class="num muted">${fmtCostBig(s.session_usd)}</td>` +
-      `<td class="muted">${esc(s.detail)}</td></tr>` + nextStepCard(s, s.fix || g.fix, ((CAUSE_LABEL[g.cause] || g.cause) + ': ' + s.detail).slice(0, 200), i === 0, g.project)).join('') +
+      `<td class="muted">${esc(s.detail)}</td></tr>` + nextStepCard(s, s.fix && s.fix !== g.fix ? s.fix : '', ((CAUSE_LABEL[g.cause] || g.cause) + ': ' + s.detail).slice(0, 200), false, g.project)).join('') +
     '</tbody></table></details>'
   ).join('') + (shown.length < v.groups.length
     ? `<button class="filter-btn" onclick="showAllWaste()">Show all ${v.groups.length} habits</button>` : '')
@@ -1474,13 +1490,17 @@ async function renderWhereToAct() {
 // Overview budget band: this calendar month against the monthly budget. Always the current month,
 // whatever range is selected; one fetch per overview render, a stale response is dropped.
 let budgetGen = 0;
+const BUDGET_SHOW_KEY = 'whytokensShowBudget';  // '0' = hidden (Settings checkbox); unset = shown
+let budgetShown = null;  // this page's choice, held in memory so the checkbox works with storage blocked
+const isBudgetShown = () => budgetShown ?? store.get(BUDGET_SHOW_KEY) !== '0';
 async function renderBudgetBand() {
   const gen = ++budgetGen, slot = document.getElementById('budget-band');
+  if (!isBudgetShown()) { if (slot) slot.innerHTML = ''; return; }
   let m = null;
   try { m = await fetchBudget(displayTZ); } catch (e) { /* no band rather than a wrong one */ }
   if (gen !== budgetGen || activeTab !== 'overview' || !slot) return;
   const month = new URLSearchParams({ range: 'month' });
-  if (displayTZ === 'utc') month.set('tz', 'utc');
+  month.set('tz', displayTZ);  // the zone the band was computed in, even when it differs from the saved default
   slot.innerHTML = budgetBandHTML(m, {
     sessions: drillHref(month, { tab: 'sessions', sort: { col: 'cost', dir: 'desc' } }),
     waste: drillHref(month, { tab: 'waste' }),
@@ -1491,6 +1511,7 @@ async function renderBudgetBand() {
 async function renderBudgetSetting() {
   const input = document.getElementById('budget-input');
   if (!input) return;
+  document.getElementById('budget-show-cb').checked = isBudgetShown();
   try { const m = await fetchBudget(displayTZ); input.value = m.budget == null ? '' : String(m.budget); } catch (e) { /* leave empty */ }
 }
 async function saveOrClearBudget(value) {
@@ -1507,6 +1528,7 @@ function saveBudget() {
   return saveOrClearBudget(v);
 }
 function clearBudget() { return saveOrClearBudget(null); }
+function setBudgetShown(on) { budgetShown = on; if (on) store.remove(BUDGET_SHOW_KEY); else store.set(BUDGET_SHOW_KEY, '0'); }
 
 // Model what-if (Cost by Model column, subagent lanes, Trace): the server reprices; figures stay out of every total.
 let modelWhatif = new Map(), whatifGen = 0;
@@ -1808,29 +1830,34 @@ function renderSessionsTable(sessions) {
   const shown = sessions.slice(0, sessionsLimit);
   document.getElementById('sessions-body').innerHTML = shown.map(s => {
     const cell = costCellHTML(s.model, sessionCost(s, s.last_date));
-    const titleCell = s.topic
-      ? `<td class="session-topic">${esc(s.topic)}</td>`
-      : `<td class="session-topic muted">Untitled</td>`;
+    // Level 1 is eight columns; token counts, cache share and vs peers sit in the row's detail (sessionTotalsRowHTML).
+    const sessLabel = llm ? llm.labelHTML(llm.llmState.labels[s.full_session_id]) : '';
     return `<tr class="session-row" data-session-row="${esc(s.full_session_id)}" data-session-day="${esc(s.last_date || '')}">
-      <td class="muted" style="font-family:monospace;white-space:nowrap"><button class="row-toggle" type="button" aria-expanded="false" data-breakdown="${esc(s.full_session_id)}" title="Who spent this session: main thread vs each subagent">&#9656;</button><button class="link-btn" data-session="${esc(s.full_session_id)}" onclick="openSessionDetail(this.dataset.session)">${esc(s.session_id)}&hellip;</button></td>
-      <td title="${esc(s.project)}">${esc(s.project)}</td>
-      ${titleCell}
+      <td class="session-topic"><button class="row-toggle" type="button" aria-expanded="false" data-breakdown="${esc(s.full_session_id)}" title="Tokens, cache share and who spent this session: main thread vs each subagent">&#9656;</button><button class="link-btn session-title${s.topic ? '' : ' muted'}" data-session="${esc(s.full_session_id)}" onclick="openSessionDetail(this.dataset.session)" title="Open trace">${esc(s.topic || 'Untitled')}</button>${sessLabel}
+        <div class="session-sub muted" title="${esc(s.project)}">${esc(s.project)} · <span class="session-id">${esc(s.session_id)}&hellip;</span></div></td>
       <td class="muted">${esc(fmtLocalDateTime(s.last_ts, displayTZ) || s.last)}</td>
       <td class="muted">${esc(s.duration_min)}m</td>
       <td><span class="model-tag">${esc(s.model)}</span></td>
       <td class="num">${s.turns}</td>
-      <td class="num">${fmt(s.input)}</td>
-      <td class="num">${fmt(s.output)}</td>
-      <td class="num">${fmt(s.cache_read)}</td>
-      <td class="num"${isEstimated(s.model) ? ' title="Codex reports no cache-write tokens: unknown, not zero"' : ''}>${orUnknown(s.cache_creation, isEstimated(s.model))}</td>
       ${cell}
-      <td class="num">${fmtPct(cacheShare(s))}</td>
       ${overheadCell(s, idx)}
       ${shapeCell(shapesPayload, s.full_session_id)}
-      ${peersCell(shapesPayload, s.full_session_id)}
     </tr>`;
   }).join('');
   renderTableToggle('sessions-foot', sessions.length, sessionsLimit, 'lessSessionRows', 'moreSessionRows', 'exportSessionsCSV');
+}
+
+// The first detail row of an expanded session: the figures the eight-column list leaves out.
+function sessionTotalsRowHTML(sessionId) {
+  const s = lastFilteredSessions.find(x => x.full_session_id === sessionId);
+  if (!s) return '';
+  const est = isEstimated(s.model), stat = (label, value, prov = 'official') => `<div class="detail-stat"><div class="label"${prov ? ` data-prov="${prov}"` : ''}>${label}</div><div class="value">${value}</div></div>`;
+  return `<tr class="session-totals-subrow" data-parent-session="${esc(sessionId)}"><td class="branch-cell" colspan="8"><div class="detail-stats">` +
+    stat('Input', fmt(s.input)) + stat('Output', fmt(s.output)) + stat('Cache Read', fmt(s.cache_read)) +
+    stat('Cache Creation', est ? '<span title="Codex reports no cache-write tokens: unknown, not zero">' + orUnknown(s.cache_creation, true) + '</span>' : fmt(s.cache_creation)) +
+    stat('Cache Share', fmtPct(cacheShare(s)), '') +
+    stat('vs peers', peersCell(shapesPayload, s.full_session_id).replace('<td', '<span').replace('</td>', '</span>'), '') +
+    '</div></td></tr>';
 }
 
 // ── Session breakdown sub-rows (who spent the session) ────────────────────
@@ -1872,11 +1899,14 @@ function breakdownRowsHTML(sessionId, rows, day, whatifLine = '') {
   const buckets = summarizeBreakdown(rows, day);
   if (!buckets.length) {
     return `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}">
-      <td class="branch-cell muted" colspan="12">No per-actor detail recorded for this session.</td>
+      <td class="branch-cell muted" colspan="8">No per-actor detail recorded for this session.</td>
     </tr>`;
   }
   const total = buckets.reduce((sum, b) => sum + b.cost, 0);
-  return buckets.map(b => {
+  return `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}"><td class="branch-cell" colspan="8"><table class="sub-table">` +
+    '<thead><tr><th>Who</th><th>Model</th><th>Turns</th>' + ['Input', 'Output', 'Cache Read', 'Cache Creation'].map(h => `<th data-prov="official">${h}</th>`).join('') +
+    '<th data-prov="local_estimate">Est. Cost</th></tr></thead><tbody>' +
+    buckets.map(b => {
     const share = total > 0 ? Math.round((b.cost / total) * 100) : 0;
     // A bucket spans models when its agents ran on different ones (several
     // dispatches of the same type, or one that switched mid-run). Break those out
@@ -1885,12 +1915,8 @@ function breakdownRowsHTML(sessionId, rows, day, whatifLine = '') {
     const modelCell = models.length === 1
       ? `<span class="model-tag">${esc(models[0][0])}</span>`
       : `<span class="muted">${models.length} models</span>`;
-    return `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}">
-      <td class="branch-cell">&#8627; ${esc(b.label)}</td>
-      <td class="muted">${b.kind === 'main' ? '' : esc(b.kind)}</td>
-      <td class="muted">${share}% of session</td>
-      <td></td>
-      <td></td>
+    return `<tr>
+      <td>&#8627; ${esc(b.label)} <span class="muted">${b.kind === 'main' ? '' : esc(b.kind) + ' · '}${share}% of session</span></td>
       <td>${modelCell}</td>
       <td class="num">${b.turns}</td>
       <td class="num">${fmt(b.input)}</td>
@@ -1899,18 +1925,14 @@ function breakdownRowsHTML(sessionId, rows, day, whatifLine = '') {
       <td class="num">${fmt(b.cache_creation)}</td>
       <td class="cost">${fmtCost(b.cost)}</td>
     </tr>` + (models.length > 1 ? modelRowsHTML(sessionId, b) : '');
-  }).join('') + (whatifLine ? `<tr class="breakdown-subrow whatif-row" data-parent-session="${esc(sessionId)}">
-      <td class="branch-cell" colspan="12">${whatifLine}</td></tr>` : '');
+  }).join('') + '</tbody></table></td></tr>' + (whatifLine ? `<tr class="breakdown-subrow whatif-row" data-parent-session="${esc(sessionId)}">
+      <td class="branch-cell" colspan="8">${whatifLine}</td></tr>` : '');
 }
 
 /** Per-model rows for one multi-model bucket, costliest first. */
 function modelRowsHTML(sessionId, bucket) {
   return [...bucket.slices].sort((a, c) => c.cost - a.cost).map(sl => `
-    <tr class="breakdown-subrow model-subrow" data-parent-session="${esc(sessionId)}">
-      <td class="branch-cell"></td>
-      <td></td>
-      <td></td>
-      <td></td>
+    <tr class="model-subrow">
       <td></td>
       <td><span class="model-tag">${esc(sl.model)}</span></td>
       <td class="num">${sl.turns}</td>
@@ -1923,6 +1945,7 @@ function modelRowsHTML(sessionId, bucket) {
 }
 
 // One delegated listener for the sessions table, mirroring wireProjectExpand.
+const expandGen = new Map();  // session id -> latest click; an older click's awaits must not touch newer rows
 function wireSessionExpand() {
   const body = document.getElementById('sessions-body');
   if (!body) return;
@@ -1933,37 +1956,42 @@ function wireSessionExpand() {
     if (!sessionId) return;
     const row = btn.closest('tr');
     const willExpand = btn.getAttribute('aria-expanded') !== 'true';
+    const gen = (expandGen.get(sessionId) || 0) + 1;
+    expandGen.set(sessionId, gen);
+    // Collapsed, re-rendered or clicked again while a request was in flight: this click no longer owns the rows.
+    const stale = () => expandGen.get(sessionId) !== gen || btn.getAttribute('aria-expanded') !== 'true' || !row.isConnected;
     btn.setAttribute('aria-expanded', String(willExpand));
     btn.innerHTML = willExpand ? '&#9662;' : '&#9656;';
-    body.querySelectorAll(`tr.breakdown-subrow[data-parent-session="${CSS.escape(sessionId)}"]`)
+    body.querySelectorAll(`tr[data-parent-session="${CSS.escape(sessionId)}"]`)
       .forEach(r => r.remove());
     if (!willExpand || !row) return;
+    row.insertAdjacentHTML('afterend', sessionTotalsRowHTML(sessionId));
+    const anchor = body.querySelector(`tr.session-totals-subrow[data-parent-session="${CSS.escape(sessionId)}"]`) || row;
 
     let payload = sessionBreakdownCache.get(sessionId);
     if (!payload) {
-      row.insertAdjacentHTML('afterend',
+      anchor.insertAdjacentHTML('afterend',
         `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}">
-           <td class="branch-cell muted" colspan="12">Loading&hellip;</td></tr>`);
+           <td class="branch-cell muted" colspan="8">Loading&hellip;</td></tr>`);
       try {
         payload = await fetchSessionBreakdown(sessionId);
-        sessionBreakdownCache.set(sessionId, payload);
+        if (!stale()) sessionBreakdownCache.set(sessionId, payload);  // a late answer must not replace the newer one a reopen will read
       } catch (err) {
         payload = { error: String(err) };
       }
+      if (stale()) return;
       body.querySelectorAll(`tr.breakdown-subrow[data-parent-session="${CSS.escape(sessionId)}"]`)
         .forEach(r => r.remove());
-      // The caret may have been collapsed (or the table re-rendered) while the
-      // request was in flight; don't paint stale rows over a closed row.
-      if (btn.getAttribute('aria-expanded') !== 'true' || !row.isConnected) return;
     }
     const day = /** @type {HTMLElement} */ (row).dataset.sessionDay || undefined;
     const whatifLine = payload.error ? '' : await lanesWhatif(sessionId);
-    if (btn.getAttribute('aria-expanded') !== 'true' || !row.isConnected) return;
+    if (stale()) return;
     const html = payload.error
       ? `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}">
-           <td class="branch-cell muted" colspan="12">${esc(payload.error)}</td></tr>`
-      : breakdownRowsHTML(sessionId, payload.rows || [], day, whatifLine);
-    row.insertAdjacentHTML('afterend', html);
+           <td class="branch-cell muted" colspan="8">${esc(payload.error)}</td></tr>`
+      : breakdownRowsHTML(sessionId, payload.rows || [], day, whatifLine) +
+        (llm ? llm.llmRowHTML(sessionId, (wastePayload?.findings || []).filter(f => f.session_id === sessionId).map(f => f.cause)) : '');
+    anchor.insertAdjacentHTML('afterend', html);
   });
 }
 
@@ -2163,12 +2191,10 @@ function renderSessionDetail(d) {
   document.getElementById('trace-empty').classList.add('hidden');
   document.getElementById('session-detail-view').classList.remove('hidden');
   document.getElementById('session-detail-title').textContent = 'Session Drilldown — ' + s.display_id + '…';
-  document.getElementById('session-detail-subtitle').textContent = s.session_id + ' · ' + s.project;
+  document.getElementById('session-detail-subtitle').textContent = [s.session_id, s.project, s.model].filter(Boolean).join(' · ');
   renderTraceWhatif(d);
   loadShapes().then(p => { if (selectedSessionDetail === d) document.getElementById('session-detail-shape').innerHTML = traceLineHtml(p, s.session_id); });
   document.getElementById('session-detail-stats').innerHTML = [
-    ['Project', s.project],
-    ['Model', s.model],
     ['Duration', s.duration_min + 'm'],
     ['Turns', fmt(s.turns)],
     ['Tokens', fmt(tokens)],
@@ -2841,8 +2867,11 @@ function renderProjectBranchCostTable(rows) {
 
 // ── CSV Export ────────────────────────────────────────────────────────────
 function csvField(val) {
-  const s = String(val);
-  if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+  let s = String(val);
+  // A spreadsheet runs a cell that starts with = + - @ as a formula, and a branch may be named so.
+  // Numbers (-5, +0.5) stay as they are.
+  if (/^[=+\-@\t\r]/.test(s) && !isFinite(Number(s))) s = "'" + s;
+  if (/[",\r\n]/.test(s)) {  // \r too: unquoted, it ends the row and the rest starts a new cell
     return '"' + s.replace(/"/g, '""') + '"';
   }
   return s;
@@ -2940,7 +2969,7 @@ function renderSources() {
   if (!st) return;
   const sc = st.scan || {};
   document.getElementById('sources-scan').textContent =
-    (sc.state === 'running' ? 'Scanning ' + (sc.source || '') + ' (' + sc.done + ' of ' + sc.total + ' files).'
+    (sc.state === 'running' ? scanLine(sc, Date.now() / 1000)
       : sc.state === 'error' ? 'Last scan failed: ' + sc.error
       : 'Idle.') + ' ' + st.sessions.toLocaleString() + ' sessions in the database.' +
     (rawData ? ' Updated: ' + rawData.generated_at : '');
@@ -2950,6 +2979,9 @@ function renderSources() {
   document.getElementById('sources-note').textContent = st.hint || '';
 }
 
+const SCAN_RELOAD_MS = 15000;
+let scanning = false, lastScanReload = Date.now();
+
 /** First-ten-minutes banner: scan progress, file errors, roots, and the empty-state hint. */
 async function refreshStatus() {
   const el = document.getElementById('status-banner');
@@ -2958,26 +2990,33 @@ async function refreshStatus() {
   const sc = st.scan || {};
   const lines = [];
   if (sc.state === 'running') {
-    lines.push('Scanning ' + esc(sc.source || '...') + ' (' + sc.done + ' of ' + sc.total + ' files). Data appears as it lands.');
+    lines.push(esc(scanLine(sc, Date.now() / 1000)));
   }
   if (sc.state === 'error') lines.push('<span class="bad">Scan failed: ' + esc(sc.error) + '</span>');
   if (st.hint) lines.push(esc(st.hint));
   const errs = (sc.file_errors || []).map(e => '<li class="bad">' + esc(e.path) + ': ' + esc(e.error) + '</li>').join('');
-  const showRoots = st.empty || sc.state === 'running' || errs;
+  const showRoots = st.empty || errs;  // where it looked matters when nothing was found or a file failed
   const roots = showRoots ? '<ul>' + st.roots.map(r => '<li>' + esc(r.source) + ': ' + esc(r.path) +
     (r.exists ? '' : ' (not found)') + '</li>').join('') + errs + '</ul>' : '';
   el.innerHTML = lines.join('<br>') + roots;
   el.hidden = !el.innerHTML;
   lastStatus = st;
   if (activeTab === 'sources') renderSources();
-  if (sc.state === 'running') {
-    setTimeout(async () => { await refreshStatus(); await loadData(); }, 1000);
-  }
+  // The banner follows the scan every 2 s; the data (a full reload and redraw, seconds on a big DB) is
+  // refreshed at most every 15 s and once more when the scan ends.
+  const wasScanning = scanning;
+  scanning = sc.state === 'running';
+  if (scanning) {
+    if (Date.now() - lastScanReload >= SCAN_RELOAD_MS) { lastScanReload = Date.now(); loadData(); }
+    setTimeout(refreshStatus, 2000);
+  } else if (wasScanning) loadData();
 }
 
 async function loadData() {
+  const seq = ++loadSeq;
   try {
     const d = await fetchData(displayTZ);
+    if (seq !== loadSeq) return;  // a newer request went out meanwhile (a time zone switch): its response wins
     if (d.error) {
       document.body.innerHTML = '<div class="err-page">' + esc(d.error) + '</div>';
       return;
@@ -3035,6 +3074,7 @@ async function loadData() {
     console.error(e);
   }
 }
+let loadSeq = 0;
 
 let autoRefreshTimer = null;
 /** Auto-refresh is opt-in: the Settings checkbox is unchecked by default. */
@@ -3078,6 +3118,7 @@ Object.assign(window, {
 window.setTheme = setThemePref;
 window.recordFix = recordFix;
 window.saveBudget = saveBudget;
+window.setBudgetShown = setBudgetShown;
 window.clearBudget = clearBudget;
 
 // ── Init ─────────────────────────────────────────────────────────────────
@@ -3115,6 +3156,12 @@ async function init() {
   wireTabs();
   wireProjectExpand();
   wireSessionExpand();
+  const sessionsBody = document.getElementById('sessions-body');
+  (document.querySelector('meta[name="whytokens-llm"]') ? import('./llm.js') : Promise.reject()).then(m => {
+    llm = m;
+    if (sessionsBody) m.wireLLM(sessionsBody);
+    return m.loadLLM();
+  }).then(() => { if (activeTab === 'sessions') renderSessionsTable(lastFilteredSessions); }).catch(() => {});
   // Pinned table headers sit under the filter bar, whose height changes when its controls wrap.
   const bar = document.getElementById('filter-bar');
   if (bar && 'ResizeObserver' in window) new ResizeObserver(() =>

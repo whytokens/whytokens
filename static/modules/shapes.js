@@ -30,7 +30,7 @@ export function baselineSentence(entry, labels) {
 export function shapeKeeps(d, s, f) {
   if (!d) return true;
   const e = shapeOf(d, s.full_session_id);
-  if (f.shape && !(e && e.shape === f.shape)) return false;
+  if (f.shape && !(f.shape === 'unknown' ? e && (!e.shape || e.shape === 'unknown') : e && e.shape === f.shape)) return false;  // 'unknown' = the NULL-shape sessions the By shape row counts
   if (f.tag && (d.tags || {})[s.project] !== f.tag) return false;
   if (f.minX && !(e && e.x != null && e.x >= f.minX)) return false;
   return true;

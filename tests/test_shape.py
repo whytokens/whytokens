@@ -444,5 +444,42 @@ class CliTests(Base):
         self.assertIn("[exit 2]", self.run_cli(db, cli.cmd_project, []))
 
 
+@unittest.skipUnless(__import__("shutil").which("node"), "node not installed")
+class UnknownShapeRowTests(unittest.TestCase):
+    def test_the_not_derived_row_lists_exactly_the_sessions_it_counts(self):
+        import subprocess
+        url = (Path(__file__).resolve().parent.parent / "static" / "modules" / "shapes.js").as_uri()
+        out = subprocess.run([__import__("shutil").which("node"), "--input-type=module", "-e", f"""
+import {{ shapeKeeps }} from '{url}';
+const d = {{ sessions: {{ a: {{ shape: null }}, b: {{ shape: 'edit' }}, c: {{ shape: 'unknown' }} }} }};
+const keep = id => shapeKeeps(d, {{ full_session_id: id, project: 'p' }}, {{ shape: 'unknown' }});
+console.log(JSON.stringify(['a', 'b', 'c'].filter(keep)));
+"""], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), ["a", "c"])
+
+
+
+class TestTagDbPathIsNotParsedAsAUri(unittest.TestCase):
+    def test_a_path_with_uri_characters_is_read_not_reported_empty(self):
+        import shutil
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        import api
+        import scanner
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        db = tmp / "data#1.db"
+        conn = sqlite3.connect(db)
+        scanner.init_db(conn)
+        conn.execute("INSERT INTO sessions (session_id, project_name, first_timestamp, agent) VALUES ('s', 'p', '2026-11-01T00:00:00Z', 'claude')")
+        conn.commit()
+        conn.close()
+        got = api.post_project_tag({"project": "p", "tag": "client"}, db)  # raised "no such table" on the file "data"
+        self.assertEqual(got["project"], "p")
+        self.assertFalse((tmp / "data").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

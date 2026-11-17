@@ -12,7 +12,8 @@ class PackagingTest(unittest.TestCase):
 
     def test_every_top_level_module_is_listed(self):
         listed = set(re.findall(r'"(\w+)"', re.search(r"py-modules = \[(.*?)\]", self.toml).group(1)))
-        on_disk = {p.stem for p in ROOT.glob("*.py")} - {"setup"}
+        # llm.py, the opt-in model help, is never packaged: it is left out of public builds.
+        on_disk = {p.stem for p in ROOT.glob("*.py")} - {"setup", "llm"}
         self.assertEqual(on_disk, listed)
 
     def test_every_package_dir_is_listed(self):

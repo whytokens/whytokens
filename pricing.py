@@ -226,29 +226,40 @@ def get_pricing(model, timestamp=None):
 
 
 def fallbacks_in_db(db_path):
-    """Models in the DB priced by a guess (see match): [{model, priced_as, how, turns}].
+    """Models in the DB priced by a guess (see match), or not priced at all:
+    [{model, priced_as, how, turns}]. how "unpriced" (priced_as None) means no row matched,
+    so its tokens count as $0: right for a local model, a silent gap for a new model family.
     Empty when there is no DB or no turns table yet. Reads only."""
     if not Path(db_path).exists():
         return []
     conn = sqlite3.connect(f"file:{quote(Path(db_path).resolve().as_posix(), safe='/:')}?mode=ro", uri=True)
     try:
-        rows = conn.execute("SELECT model, COUNT(*) FROM turns WHERE model IS NOT NULL "
+        rows = conn.execute("SELECT model, COUNT(*), SUM(input_tokens + output_tokens + cache_read_tokens"
+                            " + cache_creation_tokens) FROM turns WHERE model IS NOT NULL "
                             "GROUP BY model ORDER BY model").fetchall()
     except sqlite3.OperationalError:
         return []
     finally:
         conn.close()
-    return [{"model": model, "priced_as": key, "how": how, "turns": turns}
-            for model, turns in rows for key, how in [match(model)] if how in ("prefix", "keyword")]
+    # A zero-token id (<synthetic>) has nothing to price, so it is not reported as unpriced.
+    return [{"model": model, "priced_as": key, "how": how or "unpriced", "turns": turns}
+            for model, turns, tokens in rows for key, how in [match(model)]
+            if how in ("prefix", "keyword") or (how is None and model and tokens)]
 
 
 def format_fallbacks(found):
-    if not found:
-        return "Pricing: every priced model in the DB has its own price row."
-    return "\n".join(
-        [f"Pricing: {len(found)} model id(s) have no price row of their own and are billed at "
-         "another row's rates (a newer model may be over- or under-counted):"] +
-        [f"  {f['model']} -> {f['priced_as']} ({f['how']} match, {f['turns']:,} turns)" for f in found])
+    guessed = [f for f in found if f["priced_as"]]
+    unpriced = [f for f in found if not f["priced_as"]]
+    lines = []
+    if guessed:
+        lines += [f"Pricing: {len(guessed)} model id(s) have no price row of their own and are billed at "
+                  "another row's rates (a newer model may be over- or under-counted):"]
+        lines += [f"  {f['model']} -> {f['priced_as']} ({f['how']} match, {f['turns']:,} turns)" for f in guessed]
+    if unpriced:
+        lines += [f"Pricing: {len(unpriced)} model id(s) match no price row and count as $0 "
+                  "(expected for a local model; a new model family needs a row):"]
+        lines += [f"  {f['model']} ({f['turns']:,} turns)" for f in unpriced]
+    return "\n".join(lines) or "Pricing: every model in the DB has its own price row."
 
 
 def calc_cost(model, inp, out, cache_read, cache_creation, timestamp=None,

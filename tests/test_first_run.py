@@ -133,15 +133,93 @@ class OddPaths(unittest.TestCase):
                                extensions=[], verbose=False)
         self.assertEqual(res["claude"]["turns"], 3)
 
+    def test_port_still_held_by_a_stopping_instance_is_waited_for(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        self.addCleanup(s.close)
+        threading.Timer(0.4, s.close).start()  # the old dashboard finishes exiting a moment after the new one starts
+
+        class Stop(Exception):
+            pass
+        with mock.patch.object(api, "DB_PATH", self.tmp / "u.db"), mock.patch("builtins.print"), \
+             mock.patch.object(api._Server, "serve_forever", side_effect=Stop), self.assertRaises(Stop):
+            api.serve(host="127.0.0.1", port=s.getsockname()[1])  # exited "Cannot listen" at once before
+
     def test_occupied_port_gives_actionable_exit(self):
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
         s.listen(1)
         self.addCleanup(s.close)
-        with mock.patch.object(api, "DB_PATH", self.tmp / "u.db"), \
+        with mock.patch.object(api, "DB_PATH", self.tmp / "u.db"), mock.patch.object(api, "BIND_WAIT_S", 0.3), \
              self.assertRaises(SystemExit) as cm:
             api.serve(host="127.0.0.1", port=s.getsockname()[1])
         self.assertIn("--port", str(cm.exception))
+
+    def test_serve_without_scan_migrates_an_older_db(self):
+        from scanner import get_db, init_db
+        db = self.tmp / "old.db"
+        conn = get_db(db)
+        init_db(conn)
+        conn.execute("ALTER TABLE sessions DROP COLUMN shape")  # a DB from before the column existed
+        conn.commit()
+        conn.close()
+
+        class FakeServer:
+            def __init__(self, *a): pass
+            def serve_forever(self): raise KeyboardInterrupt
+
+        with mock.patch.object(api, "DB_PATH", db), \
+             mock.patch.object(api, "_Server", FakeServer), \
+             mock.patch("builtins.print"):
+            api.serve(host="127.0.0.1", port=0)
+            api.get_shapes(db)  # raised "no such column: shape" before serve migrated
+
+
+class ScanBannerSaysWhatIsHappening(unittest.TestCase):
+    def test_status_reports_the_stage_of_the_scan(self):
+        seen = []
+
+        class Src:
+            name = "fake"
+            def backfill_topics(self, conn): seen.append(("before the walk", scanrun.status()["phase"]))
+            def discover_files(self): return []
+            def sync_agents(self, conn): seen.append(("after the walk", scanrun.status()["phase"]))
+        tmp = Path(tempfile.mkdtemp())
+        sources.scan_all(db_path=tmp / "u.db", verbose=False, sources=[Src()])
+        self.assertEqual(seen, [("before the walk", "prepare"), ("after the walk", "finish")])
+        self.assertEqual(sources.PROGRESS["phase"], "finish")
+        with mock.patch.object(sources, "scan_all", return_value={}):
+            scanrun.start(tmp / "u.db", wait=True)
+        self.assertIsNone(sources.PROGRESS["phase"])  # a new run starts with no stale stage
+
+    @unittest.skipUnless(__import__("shutil").which("node"), "node not installed")
+    def test_banner_line_per_stage(self):
+        import subprocess
+        mod = (Path(__file__).resolve().parent.parent / "static" / "modules" / "api.js").as_uri()
+        code = f"""import {{ scanLine }} from {json.dumps(mod)};
+        const at = 1000, sc = o => ({{ state: 'running', started: at, source: 'claude', done: 0, total: 0, ...o }});
+        console.log(JSON.stringify([
+          scanLine(sc({{ phase: 'prepare' }}), at + 75),
+          scanLine(sc({{ phase: 'walk', done: 1200, total: 8327 }}), at + 9),
+          scanLine(sc({{ phase: 'walk', source: 'coordinator' }}), at + 9),
+          scanLine(sc({{ phase: 'finish', source: 'coordinator' }}), at + 9)]));"""
+        out = subprocess.run(["node", "--input-type=module", "-e", code], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        prepare, walk, empty, finish = json.loads(out.stdout)
+        self.assertIn("1m 15s", prepare)
+        self.assertIn("re-read once", prepare)
+        self.assertIn("1,200 of 8,327", walk)
+        self.assertIn("9s", walk)
+        for line in (prepare, empty, finish):
+            self.assertNotIn("0 of 0", line)  # a count that says nothing is not shown
+        self.assertIn("session totals", finish)
+
+    def test_page_does_not_reload_all_data_every_second_while_scanning(self):
+        src = (Path(__file__).resolve().parent.parent / "static" / "modules" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn("await refreshStatus(); await loadData(); }, 1000)", src)
+        self.assertIn("SCAN_RELOAD_MS = 15000", src)
+        self.assertIn("else if (wasScanning) loadData();", src)  # the final numbers, once, when the scan ends
 
 
 class RescanSerialization(unittest.TestCase):
@@ -235,6 +313,85 @@ class PerformanceBudget(unittest.TestCase):
         over = perf_budget.check({"turns": 100_000, "cold_scan": 999, "warm_scan": 999,
                                   "page_load": 999, "sessions_page": 999, "waste": 999, "shapes": 999})
         self.assertEqual(len(over), 6)
+
+
+class MistypedCommands(unittest.TestCase):
+    def exit_code(self, *argv):
+        import cli, contextlib, io
+        with mock.patch.object(sys, "argv", ["whytokens", *argv]), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as e:
+                cli.main()
+        return e.exception.code
+
+    def test_unknown_command_is_an_error_and_help_is_not(self):
+        self.assertEqual(self.exit_code("scna"), 2)
+        for ok in ([], ["--help"], ["-h"], ["help"]):
+            self.assertEqual(self.exit_code(*ok), 0, ok)
+
+    def test_export_without_json_is_an_error(self):
+        import cli, contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e:
+            cli.cmd_export(as_json=False)
+        self.assertEqual(e.exception.code, 2)
+
+    def test_a_flag_is_never_taken_as_another_flags_value(self):
+        import cli, contextlib, io
+        self.assertEqual(cli.parse_named_arg(["--note", "trim output", "--date", "2026-10-01"], "--note"), "trim output")
+        self.assertEqual(cli.parse_named_arg(["--offset", "-5"], "--offset"), "-5")   # one dash is a value
+        self.assertIsNone(cli.parse_named_arg(["--date", "2026-10-01"], "--note"))
+        for bad in (["--note", "--date", "2026-10-01"], ["--date", "2026-10-01", "--note"]):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e:
+                cli.parse_named_arg(bad, "--note")
+            self.assertEqual(e.exception.code, 2, bad)
+
+
+@unittest.skipUnless(__import__("shutil").which("node"), "node not installed")
+class PageOddities(unittest.TestCase):
+    APP = (Path(__file__).resolve().parent.parent / "static" / "modules" / "app.js").read_text(encoding="utf-8")
+
+    def node(self, code):
+        import subprocess
+        out = subprocess.run(["node", "-e", code], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def cut(self, a, b):
+        return self.APP[self.APP.index(a):self.APP.index(b, self.APP.index(a))]
+
+    def test_csv_cells_cannot_start_a_formula(self):
+        self.node(self.cut("function csvField(", "function csvTimestamp(") + r"""
+const assert = require('node:assert/strict');
+for (const bad of ['=1+1', '+cmd|calc!A0', '-2+3', '@SUM(A1)', '\tx'])
+  assert.equal(csvField(bad).replace(/^"/, '')[0], "'", bad);
+assert.equal(csvField('+cmd|calc!A0,"x" y'), `"'+cmd|calc!A0,""x"" y"`);   // still quoted as CSV
+assert.equal(csvField('safe\r=1+1'), '"safe\r=1+1"');      // a carriage return stays inside one quoted cell
+assert.equal(csvField('\r=1+1'), `"'\r=1+1"`);
+for (const ok of [-5, '-0.25', '+3', 12, 'main', 'feat/a-b', ''])
+  assert.equal(csvField(ok), String(ok), String(ok));
+""")
+
+    def test_a_late_response_does_not_replace_a_newer_one(self):
+        # Local refresh in flight, then a click on UTC whose response lands first
+        self.node(r"""
+const waiting = [];
+const fetchData = tz => new Promise(done => waiting.push(() => done({tz, all_models: ['m']})));
+let rawData = {all_models: ['m']}, displayTZ = 'local', wastePayload, shapesPayload, shapesFetch, wasteGen = 0, draws = 0;
+const sessionFindings = new Map(), sessionLanes = new Map();
+const document = {body: {classList: {remove() {}}}};
+const renderMeta = () => {}, applyFilter = () => { draws++; };
+""" + self.cut("async function loadData(", "let autoRefreshTimer") + r"""
+const assert = require('node:assert/strict');
+(async () => {
+  const older = loadData();
+  displayTZ = 'utc';
+  const newer = loadData();
+  waiting[1](); await newer;
+  waiting[0](); await older;
+  assert.equal(rawData.tz, 'utc');
+  assert.equal(draws, 1);
+  const alone = loadData(); waiting[2](); await alone;   // a request with nothing after it still lands
+  assert.equal(draws, 2);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
 
 
 if __name__ == "__main__":

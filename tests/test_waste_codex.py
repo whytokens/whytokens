@@ -61,6 +61,11 @@ class TestCodexResident(unittest.TestCase):
         c.commit(); c.close()
         f = waste.report(copy, session_id="codex-waste-resident")
         self.assertEqual([(x["cause"], x["tier"]) for x in f], [("resident_output", "inferred"), ("uncached_input", "observation")])
+        self.assertEqual([x["in_total"] for x in f], [True, False])  # an observation is shown, never summed
+
+    def test_every_observation_cause_is_left_out_of_totals(self):
+        self.assertEqual(set(waste.UNCOUNTED), {c for c, t in waste.TIERS.items() if t == "observation"})
+        self.assertIn("uncached_input", waste.UNCOUNTED)
 
     def test_measurement_cell_is_inferred_not_unmeasurable(self):
         cell = waste.measurement(self.db)["causes"]["resident_output"]["codex"]

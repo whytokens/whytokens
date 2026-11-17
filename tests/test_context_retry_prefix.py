@@ -64,6 +64,24 @@ def _streamed_edit(sid):
     return lines
 
 
+def _streamed_failure(sid):
+    """Fail, then one message streamed as two records (another command failing, then a Read: the stored
+    turn keeps only the Read), then fail twice more. Another failure sits between the attempts."""
+    lines = _retry(sid, [(*_bash("pytest -q"), True)])[:-1]
+    first = _rec(sid, 3, _ts(3), read=20_400, create=400, tools=[_bash("ls /nope")])
+    second = _rec(sid, 3, _ts(3), read=20_400, create=400, tools=[("Read", {"file_path": "/src/b.py"})]).replace(
+        f"tu-{sid}-3-0", f"tu-{sid}-3-1")
+    lines += [first, _result(sid, 3, True), second, _result(sid, 3, False, i=1)]
+    for k in (4, 5):
+        lines += _call(sid, k, *_bash("pytest -q"), True, 20_400 + 400 * k)
+    return lines
+
+
+def _big_results(lines, size=60_000):
+    """The same session with every tool result ``size`` bytes long, so resident_output claims cache writes too."""
+    return [x.replace('"content": ""', '"content": "%s"' % ("x" * size)) for x in lines]
+
+
 def _chain(sid, contexts, compact_at=(), side=None):
     """Main-lane turns whose context (input 200 + read + write) follows ``contexts``."""
     lines, prev = [], 0
@@ -91,6 +109,9 @@ FIXTURES = {
     "rt_read_between": _retry("rt_read_between", [(*_bash("make"), True), ("Read", {"file_path": "/src/log"}, False),
                                                   (*_bash("make"), True), (*_bash("make"), True)]),
     "rt_streamed": _streamed_edit("rt_streamed"),
+    "rt_streamed_failure": _streamed_failure("rt_streamed_failure"),
+    "rt_unpriced": [x.replace(MODEL, "local-model-without-a-price") for x in _retry("rt_unpriced", [(*_bash("make"), True)] * 4)],
+    "rt_big": _big_results(_retry("rt_big", [(*_bash("make"), True)] * 4)),
     # a subagent lane has no prompt boundaries (prompt_seq is NULL): not measured, never one big run
     "rt_side": [_prompt("rt_side", 0), _rec("rt_side", 1, _ts(1), read=0, create=20_000)] + [
         x for k in (2, 3, 4) for x in _call("rt_side", k, *_bash("pytest -q"), True, 20_000, side=True, agent="ag1")],
@@ -175,6 +196,27 @@ class TestRetryLoop(_Scan):
 
     def test_an_edit_lost_from_a_streamed_message_still_breaks_the_run(self):
         self.assertEqual(self.find("rt_streamed", "retry_loop"), [])
+
+    def test_a_failure_lost_from_a_streamed_message_still_breaks_the_run(self):
+        self.assertEqual(self.find("rt_streamed_failure", "retry_loop"), [])
+
+    def test_a_run_on_a_model_without_a_price_is_no_finding_and_no_crash(self):
+        self.assertEqual(self.find("rt_unpriced", "retry_loop"), [])
+        self.assertIsInstance(waste.report(self.db, min_share=0, min_usd=0), list)  # the whole-DB report verify uses
+
+    def test_cache_write_another_cause_claimed_is_not_priced_again(self):
+        found = waste.report(self.db, session_id="rt_big", min_share=0, min_usd=0)
+        [retry] = [f for f in found if f["cause"] == "retry_loop"]
+        claimed = {}
+        for f in found:
+            if f["cause"] in ("resident_output", "retry_loop"):
+                for e in f["evidence"]:
+                    claimed.setdefault(e["message_id"], {})[f["cause"]] = e["tokens"]
+        shared = [m for m, c in claimed.items() if len(c) == 2]
+        self.assertTrue(shared)  # the fixture really has both causes on one turn
+        for m in shared:  # output 300 + write 400 is all the turn has to attribute
+            self.assertLessEqual(sum(claimed[m].values()), 700, m)
+        self.assertLess(retry["usd"], sum(pricing.calc_cost(MODEL, 0, 300, 0, 400, _ts(n)) for n in (3, 4, 5)))
 
     def test_subagent_turns_without_prompt_boundaries_are_not_a_run(self):
         self.assertEqual(self.find("rt_side", "retry_loop"), [])
@@ -287,6 +329,8 @@ class TestRetryInputsBackfill(unittest.TestCase):
         self.proj.mkdir(parents=True)
         for sid in ("bf_keep", "bf_gone"):
             (self.proj / f"{sid}.jsonl").write_text("\n".join(_retry(sid, [(*_bash("pytest -q"), True)] * 4)) + "\n", encoding="utf-8")
+        (self.proj / "bf_path.jsonl").write_text(  # a path-keyed loop: its calls need only their ids back
+            "\n".join(_retry("bf_path", [("Read", {"file_path": "/src/missing.py"}, True)] * 3)) + "\n", encoding="utf-8")
         self.db = str(Path(self.tmp) / "usage.db")
         self.scan()
         c = sqlite3.connect(self.db)
@@ -295,6 +339,8 @@ class TestRetryInputsBackfill(unittest.TestCase):
         c.execute("UPDATE tool_results SET is_error = NULL")
         for mid, calls in c.execute("SELECT message_id, tool_calls FROM turns WHERE tool_calls IS NOT NULL").fetchall():
             stripped = [{**x, "input": {k: v for k, v in x["input"].items() if k != "command_hash"}} for x in json.loads(calls)]
+            if mid.endswith("-3") or "bf_path" in mid:  # rows from before call ids were stored have no id to match on
+                stripped = [{k: v for k, v in x.items() if k != "id"} for x in stripped]
             c.execute("UPDATE turns SET tool_calls = ? WHERE message_id = ?", (json.dumps(stripped), mid))
         # values that are already there must survive the backfill untouched
         c.execute("UPDATE tool_results SET is_error = 7 WHERE call_id = 'tu-bf_keep-2-0'")
@@ -334,15 +380,111 @@ class TestRetryInputsBackfill(unittest.TestCase):
         for cid, flag in got["flags"].items():
             if cid == "tu-bf_keep-2-0":
                 self.assertEqual(flag, 7)  # already set: never overwritten
-            elif "bf_keep" in cid:
+            elif "bf_keep" in cid or "bf_path" in cid:
                 self.assertEqual(flag, self.flags[cid], cid)
             else:
                 self.assertIsNone(flag, cid)  # transcript gone: unmeasured, never read as success
         self.assertIn('"keepme"', got["calls"]["msg-bf_keep-2"])
         self.assertIn(policy.command_hash("pytest -q"), got["calls"]["msg-bf_keep-4"])
+        self.assertIn(policy.command_hash("pytest -q"), got["calls"]["msg-bf_keep-3"])  # no stored id: matched by position
+        self.assertIn('"id"', got["calls"]["msg-bf_keep-3"])  # restored too: the detector joins on it
         self.assertNotIn("command_hash", got["calls"]["msg-bf_gone-3"])
         for key in ("tokens", "counts", "sessions"):
             self.assertEqual(got[key], self.before[key], key)  # no row added, removed or re-priced
+
+    def rewrite(self, mid, fn):
+        import sqlite3
+        c = sqlite3.connect(self.db)
+        calls = json.loads(c.execute("SELECT tool_calls FROM turns WHERE message_id = ?", (mid,)).fetchone()[0])
+        c.execute("UPDATE turns SET tool_calls = ? WHERE message_id = ?", (json.dumps([fn(x) for x in calls]), mid))
+        c.commit()
+        c.close()
+
+    def test_row_without_id_is_not_paired_with_a_call_of_another_length(self):
+        # same tool at the same position, but the stored metadata describes a different command
+        self.rewrite("msg-bf_keep-3", lambda x: {**x, "input": {**x["input"], "command_len": x["input"]["command_len"] + 14}})
+        self.scan()
+        got = self.after()["calls"]["msg-bf_keep-3"]
+        self.assertNotIn("command_hash", got)
+        self.assertNotIn('"id"', got)
+
+    def test_row_without_id_that_already_has_its_hash_gets_the_id_back(self):
+        h = policy.command_hash("pytest -q")
+        self.rewrite("msg-bf_keep-3", lambda x: {**x, "input": {**x["input"], "command_hash": h}})
+        self.scan()
+        self.assertIn('"id"', self.after()["calls"]["msg-bf_keep-3"])
+        self.rewrite("msg-bf_keep-3", lambda x: {**{k: v for k, v in x.items() if k != "id"},
+                                               "input": {**x["input"], "command_hash": "0" * 16}})
+        import sqlite3
+        from sources.claude import RETRY_INPUTS_MARKER
+        c = sqlite3.connect(self.db)
+        c.execute("DELETE FROM schema_meta WHERE key = ?", (RETRY_INPUTS_MARKER,))
+        c.commit()
+        c.close()
+        self.scan()
+        self.assertNotIn('"id"', self.after()["calls"]["msg-bf_keep-3"])  # another command's hash: not this call
+
+    def test_path_keyed_calls_without_ids_get_them_back_and_their_loop_is_found(self):
+        self.scan()
+        self.assertTrue([f for f in waste.report(self.db, session_id="bf_path", min_share=0, min_usd=0)
+                         if f["cause"] == "retry_loop"])
+
+    def test_db_that_finished_the_older_backfill_still_gets_path_ids(self):
+        import sqlite3
+        c = sqlite3.connect(self.db)
+        c.execute("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('retry_inputs_backfill_v2_done_claude', '1')")
+        c.commit()
+        c.close()
+        self.scan()
+        self.assertIn('"id"', self.after()["calls"]["msg-bf_path-3"])
+
+    def test_db_missing_only_path_call_ids_is_not_marked_done_unread(self):
+        import sqlite3
+        c = sqlite3.connect(self.db)
+        c.execute("UPDATE tool_results SET is_error = 0 WHERE is_error IS NULL")
+        c.execute("DELETE FROM turns WHERE tool_calls LIKE '%\"Bash\"%'")
+        c.commit()
+        c.close()
+        self.scan()
+        self.assertIn('"id"', self.after()["calls"]["msg-bf_path-3"])
+
+    def test_call_without_id_beside_one_that_kept_its_id_still_starts_the_backfill(self):
+        import json
+        import sqlite3
+        c = sqlite3.connect(self.db)
+        c.execute("UPDATE tool_results SET is_error = 0 WHERE is_error IS NULL")
+        c.execute("DELETE FROM turns WHERE tool_calls LIKE '%\"Bash\"%'")
+        raw = c.execute("SELECT tool_calls FROM turns WHERE message_id = 'msg-bf_path-3'").fetchone()[0]
+        mixed = json.loads(raw) + [{"name": "Glob", "id": "toolu_kept", "input": {"pattern": "*.py"}}]
+        kept = json.dumps([{"name": "Glob", "id": "toolu_kept", "input": {}}])
+        c.execute("UPDATE turns SET tool_calls = ? WHERE tool_calls LIKE '%\"name\"%'", (kept,))  # no other row lacks an id
+        self.assertTrue(any(not x.get("id") for x in mixed) and any(x.get("id") for x in mixed))
+        c.execute("UPDATE turns SET tool_calls = ? WHERE message_id = 'msg-bf_path-3'", (json.dumps(mixed),))
+        c.commit()
+        from sources.claude import _stores_a_call_without_id
+        self.assertTrue(_stores_a_call_without_id(c))
+        c.execute("UPDATE turns SET tool_calls = ? WHERE tool_calls LIKE '%\"name\"%'", (kept,))
+        self.assertFalse(_stores_a_call_without_id(c))  # every call has its id: nothing to read
+        c.rollback()
+        c.close()
+
+    def test_path_keyed_call_with_another_input_keeps_no_id(self):
+        self.rewrite("msg-bf_path-3", lambda x: {**x, "input": {**x["input"], "file_path": "/src/other.py"}})
+        self.scan()
+        self.assertNotIn('"id"', self.after()["calls"]["msg-bf_path-3"])
+
+    def test_raw_input_opt_in_leaves_the_backfill_for_a_later_scan(self):
+        import sqlite3
+        from unittest import mock
+        from sources.claude import RETRY_INPUTS_MARKER
+        with mock.patch.dict("os.environ", {policy.RAW_ENV: "1"}):
+            self.scan()
+        c = sqlite3.connect(self.db)
+        marker = c.execute("SELECT value FROM schema_meta WHERE key = ?", (RETRY_INPUTS_MARKER,)).fetchone()
+        c.close()
+        self.assertIsNone(marker)  # not "done": the hashes are still missing
+        self.scan()
+        self.assertIn(policy.command_hash("pytest -q"), self.after()["calls"]["msg-bf_keep-4"])
 
     def test_second_run_changes_nothing(self):
         self.scan()
@@ -361,7 +503,7 @@ class TestRetryInputsBackfill(unittest.TestCase):
         self.assertIn("next `whytokens scan`", cell["reason"])  # before the backfill ran
         self.scan()
         cell = waste.measurement(self.db)["causes"]["retry_loop"]["claude"]
-        self.assertEqual((cell["status"], cell["measured"], cell["unmeasured"]), ("partial", 1, 1))
+        self.assertEqual((cell["status"], cell["measured"], cell["unmeasured"]), ("partial", 2, 1))
         self.assertIn("no longer on disk", cell["reason"])
         self.assertTrue([f for f in waste.report(self.db, session_id="bf_keep", min_share=0, min_usd=0)
                          if f["cause"] == "retry_loop"])

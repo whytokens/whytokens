@@ -80,6 +80,15 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(rep.call_args.kwargs.get("min_usd"), 0)
         self.assertEqual(r["status"], "no material change")
 
+    def test_exactly_one_point_is_material(self):
+        # 3% to 2%: 0.03 - 0.02 is 0.00999... in floats and read as under the 1-point floor
+        n = fixes.MIN_SESSIONS
+        rows = [(f"b{i}", "2026-01-01", None) for i in range(n)] + [(f"a{i}", "2026-03-01", None) for i in range(n)]
+        cause = {s: (3.0 if s.startswith("b") else 2.0) for s, _, _ in rows}
+        fix = {"id": 1, "project": "p", "cause": "resident_output", "note": "", "fix_date": "2026-02-01"}
+        r = fixes.verify(None, fix, ({s: 100.0 for s, _, _ in rows}, rows, cause))
+        self.assertEqual((r["before"]["pct"], r["after"]["pct"], r["status"]), (0.03, 0.02, "reduced"))
+
     def test_zero_spend_sessions_are_not_evidence(self):
         self.assertEqual(fixes._side([("a", 0.0)] * 10, {})["sessions"], 0)
 

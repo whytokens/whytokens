@@ -16,3 +16,9 @@ AGENTS.md export-ignore
 CLAUDE.md export-ignore
 DESIGN.md export-ignore
 scripts/falsify_nightly*.ps1 export-ignore
+# Opt-in model help (claude -p) stays private for now; the app runs without it.
+llm.py export-ignore
+static/modules/llm.js export-ignore
+tests/test_llm.py export-ignore
+tests/fixtures/llm/ export-ignore
+scripts/falsify_llm.py export-ignore

@@ -118,6 +118,7 @@ class TestAppLogic(unittest.TestCase):
 import {{ drillHref }} from '{DRILL_URL}';
 {_HAS}
 let displayTZ = 'utc', activeTab = 'overview', pending = [];
+const store = {{ get: () => null }};
 const fetchBudget = () => new Promise(res => pending.push(res));
 const budgetBandHTML = (m, links) => JSON.stringify({{ tag: m && m.tag, links }});
 const slot = {{ innerHTML: '' }}; globalThis.document = {{ getElementById: () => slot }};
@@ -132,12 +133,28 @@ const eq = (g, w, m) => {{ if (g !== w) throw new Error(m + ': got ' + g + ', wa
   has(got.links.sessions, 'sort=cost&dir=desc', 'by cost'); has(got.links.settings, 'tab=settings', 'settings');
   has(got.links.waste, 'tab=waste', 'waste');
   slot.innerHTML = ''; activeTab = 'sessions'; const c = renderBudgetBand(); pending[2]({{ tag: 'x' }}); await c; eq(slot.innerHTML, '', 'only the Overview shows the band');
+  slot.innerHTML = 'stale'; activeTab = 'overview'; budgetShown = false; await renderBudgetBand(); eq(slot.innerHTML, '', 'the Settings checkbox hides the band'); eq(pending.length, 3, 'a hidden band fetches nothing'); budgetShown = null;
   activeTab = 'overview'; const d = renderBudgetBand(); pending[3] && 0;
   console.log('ok');
 }})();
 """)
         self.assertEqual(out, "ok")
         self.assertIn("sessionLanes.clear()", _slice("async function loadData", "let autoRefreshTimer"))  # a rescan drops cached lanes
+
+    def test_band_session_link_carries_the_zone_it_was_computed_in(self):
+        src = _slice("let budgetGen = 0;", "async function renderBudgetSetting")
+        for tz in ("local", "utc"):
+            out = _node(f"""
+import {{ drillHref }} from '{DRILL_URL}';
+let displayTZ = '{tz}', activeTab = 'overview';
+const store = {{ get: () => null }};
+const fetchBudget = async () => ({{}});
+const budgetBandHTML = (m, links) => links.sessions;
+const slot = {{ innerHTML: '' }}; globalThis.document = {{ getElementById: () => slot }};
+{src}
+await renderBudgetBand(); console.log(slot.innerHTML);
+""")
+            self.assertIn(f"tz={tz}", out)
 
     def test_save_validates_before_posting_and_clear_sends_null(self):
         src = _slice("async function saveOrClearBudget", "// Model what-if")
@@ -175,6 +192,42 @@ console.log('ok');
         self.assertEqual(out, "ok")
         self.assertIn("sessionLanes.clear()", _slice("async function loadData", "let autoRefreshTimer"))  # a rescan drops cached lanes
 
+    def test_an_older_expand_response_leaves_a_newer_expand_alone(self):
+        src = _slice("const expandGen = new Map();", "function renderToolCostTable")
+        out = _node(f"""
+globalThis.CSS = {{ escape: s => s }};
+let rows = [], click, pending = [];
+const mk = html => {{ const r = {{ html, live: true, remove() {{ r.live = false; rows = rows.filter(x => x !== r); }},
+  insertAdjacentHTML(_, h) {{ if (r.live && h) rows.push(mk(h)); }} }}; return r; }};
+const row = {{ isConnected: true, dataset: {{}}, insertAdjacentHTML(_, h) {{ if (h) rows.push(mk(h)); }} }};
+const attrs = {{ 'aria-expanded': 'false' }};
+const btn = {{ dataset: {{ breakdown: 's1' }}, innerHTML: '', closest: q => q === 'tr' ? row : btn, getAttribute: k => attrs[k], setAttribute: (k, v) => {{ attrs[k] = v; }} }};
+const body = {{ addEventListener: (_, fn) => {{ click = fn; }},
+  querySelectorAll: q => rows.filter(r => q.startsWith('tr.breakdown-subrow') ? r.html.includes('breakdown-subrow') : true),
+  querySelector: () => rows.find(r => r.html.includes('session-totals-subrow')) || null }};
+globalThis.document = {{ getElementById: () => body }};
+const esc = s => String(s), sessionBreakdownCache = new Map(), wastePayload = null;
+const fetchSessionBreakdown = () => new Promise(res => pending.push(res));
+const sessionTotalsRowHTML = () => '<tr class="session-totals-subrow">', lanesWhatif = async () => '', llm = null;
+const breakdownRowsHTML = (id, r) => '<tr class="breakdown-subrow">ACTORS ' + r[0];
+{src}
+wireSessionExpand();
+const count = n => rows.filter(r => r.html.includes(n)).length;
+(async () => {{
+  const first = click({{ target: btn }});              // open: request 1 in flight
+  await click({{ target: btn }});                      // collapse
+  const second = click({{ target: btn }});             // reopen: request 2 in flight
+  pending[1]({{ rows: ['new'] }}); await second;
+  pending[0]({{ rows: ['old'] }}); await first;        // the older response lands last
+  if (count('ACTORS new') !== 1 || count('ACTORS old') !== 0) throw new Error('stale response changed the open rows: ' + rows.map(r => r.html));
+  if (count('session-totals-subrow') !== 1 || count('Loading') !== 0) throw new Error('leftover rows: ' + rows.map(r => r.html));
+  await click({{ target: btn }}); await click({{ target: btn }});   // collapse, reopen: served from the cache
+  if (count('ACTORS new') !== 1 || count('ACTORS old') !== 0) throw new Error('the stale response reached the cache: ' + rows.map(r => r.html));
+  console.log('ok');
+}})();
+""")
+        self.assertEqual(out, "ok")
+
     def test_lane_line_is_appended_to_the_breakdown_rows(self):
         src = _slice("function breakdownRowsHTML", "/** Per-model rows")
         out = _node(f"""
@@ -185,6 +238,11 @@ const modelRowsHTML = () => '';
 {src}
 has(breakdownRowsHTML('s1', [1], 'd', 'LANE LINE'), 'whatif-row', 'extra row'); has(breakdownRowsHTML('s1', [1], 'd', 'LANE LINE'), 'LANE LINE', 'text');
 lacks(breakdownRowsHTML('s1', [1], 'd'), 'whatif-row', 'no line without a figure');
+const rows = breakdownRowsHTML('s1', [1], 'd');
+has(rows, '<td class="branch-cell" colspan="8"><table class="sub-table">', 'actors sit in one detail row as wide as the list');
+for (const h of ['Who', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost']) has(rows, '>' + h + '</th>', 'the detail table names its columns');
+if (rows.split('data-parent-session').length !== 2) throw new Error('one removable detail row, not one per actor');
+lacks(rows, 'colspan="12"', 'no cell wider than the eight-column list');
 console.log('ok');
 """)
         self.assertEqual(out, "ok")
@@ -225,6 +283,22 @@ class TestWiring(unittest.TestCase):
         body = api_js[api_js.index("export async function postBudget"):]
         self.assertIn("'X-Whytokens-Token'", body)
         self.assertIn("JSON.stringify({ monthly_usd: monthlyUsd })", body)
+
+
+
+class TestStatCardsFillWholeRows(unittest.TestCase):
+    def test_every_column_count_divides_the_number_of_cards(self):
+        import re
+        root = Path(__file__).resolve().parent.parent / "static"
+        css = (root / "styles.css").read_text(encoding="utf-8")
+        js = (root / "modules" / "app.js").read_text(encoding="utf-8")
+        cards = js[js.index("const stats = ["):js.index("document.getElementById('stats-row').innerHTML")].count("{ label: ")
+        cols = [int(n) for n in re.findall(r"\.stats-row \{[^}]*?repeat\((\d+),", css)]
+        self.assertEqual(cards, 8)
+        self.assertEqual(sorted(cols), [2, 4, 8])  # phone, normal, wide
+        for n in cols:
+            self.assertEqual(cards % n, 0, n)  # no card left alone on a last row
+        self.assertNotRegex(css, r"\.stats-row \{[^}]*auto-fit")  # auto-fit put 7 in a row and 1 below
 
 
 if __name__ == "__main__":

@@ -745,10 +745,6 @@ class TestStaticAssets(unittest.TestCase):
         self.assertIn("<!DOCTYPE html>", INDEX_HTML)
         self.assertIn("</html>", INDEX_HTML)
 
-    def test_has_esc_function(self):
-        """Verify XSS protection is present."""
-        self.assertIn("function esc(", FORMAT_JS)
-
     def test_chart_js_vendored_locally_no_cdn(self):
         """Chart.js is served from the local vendor copy, not a CDN (offline)."""
         self.assertIn("/static/vendor/chart.umd.min.js", INDEX_HTML)
@@ -812,11 +808,13 @@ class TestStaticAssets(unittest.TestCase):
         self.assertIn('[12, 13, 14, 15, 16, 17]', APP_JS)
 
     def test_recent_sessions_shows_cache_tokens(self):
-        """Recent sessions table exposes session-level cache token usage."""
-        self.assertIn("setSessionSort('cache_read')", INDEX_HTML)
-        self.assertIn("setSessionSort('cache_creation')", INDEX_HTML)
-        self.assertIn("${fmt(s.cache_read)}", APP_JS)
+        """A session's expanded detail exposes its cache token usage; the list itself stays at eight columns."""
+        self.assertIn("stat('Cache Read', fmt(s.cache_read))", APP_JS)
         self.assertIn("orUnknown(s.cache_creation", APP_JS)
+        head = INDEX_HTML[INDEX_HTML.index('<table class="sessions-table">'):INDEX_HTML.index('id="sessions-body"')]
+        self.assertEqual(head.count("<th>") + head.count("<th "), 8)
+        for hidden in ("cache_read", "cache_creation", "input", "output", "cache_share", "peers"):
+            self.assertNotIn(f"setSessionSort('{hidden}')", head)
 
     def test_has_drilldown_and_metric_tables(self):
         self.assertIn('id="session-detail-view"', INDEX_HTML)

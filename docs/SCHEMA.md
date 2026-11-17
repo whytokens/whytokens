@@ -42,6 +42,7 @@ knows its own model) then summed.
 | `reasoning_tokens` | INTEGER | informational; reasoning is already inside `output_tokens` and never billed separately (Codex) |
 | `agent_id` | TEXT | dispatched-subagent id (matches `agents.agent_id`); NULL on main-chain turns |
 | `effort` | TEXT | reasoning effort of the turn (`high`/`medium`/`low`/`xhigh`); `''` when the source didn't report one — Claude Code only writes it from 2.1.215 |
+| `speed` | TEXT | `usage.speed` as the source reported it; `fast` bills every token class at 2x (`pricing.price_mult`). Older rows are filled once by `ClaudeSource.backfill_speed` |
 | `skill` | TEXT | skill active when the turn was produced (`next-task`, `local-delegate`, …), from the record's top-level `attributionSkill`; `''` outside any skill |
 | `mcp_server` | TEXT | MCP server whose tool result this turn consumed (`github`, `Claude Browser`, or a claude.ai connector UUID), from `attributionMcpServer`; `''` otherwise. Orthogonal to the agent/skill/main split — do not sum across both |
 | `mcp_tool` | TEXT | that MCP tool (`workitem`, `get_equity_quotes`, …), from `attributionMcpTool`; `''` otherwise |
@@ -75,7 +76,7 @@ NULL AND message_id != ''` — this enforces the dedup invariant in the DB.
 | `turn_count` | INTEGER | recomputed from `turns` |
 | `agent` | TEXT | source coding agent: `claude` (default), `codex`, or `coordinator` (partial; see below) |
 | `topic` | TEXT | session title, or NULL |
-| `topic_source` | TEXT | where `topic` came from. Higher rank wins: `custom` (user rename) > `thread` (Claude Projects thread title) > `ai` (ai-title record) > `prompt` (the Projects thread's trigger message, used when the title is no longer cached) |
+| `topic_source` | TEXT | where `topic` came from. Higher rank wins: `custom` (user rename) > `thread` (Claude Projects thread title) > `ai` (ai-title record). A thread whose title is no longer cached stays untitled: its trigger message is a prompt, and prompt text is not stored (rows an older version stored as `prompt` are cleared on the next scan) |
 | `shape` | TEXT | work shape from the tool-call mix (see Work shape): `edit`, `read_search`, `shell`, `web`, `connector`, `subagent`, `mixed` or `chat`; NULL until derived |
 | `shape_detail` | TEXT | the top connector server for a `connector` session, else NULL |
 | `shape_version` | INTEGER | `shape.SHAPE_VERSION` of the rule that derived `shape`; a different value re-derives it |
@@ -139,7 +140,7 @@ disk, once. Consumed by the `deferred_tool_load` waste cause (`waste.py`; Claude
 `is_error` (INTEGER, additive): the `tool_result` block's `is_error` flag, 1 or 0 (an absent flag is 0).
 NULL = the result was not seen by a scanner that records it. Bash calls in `turns.tool_calls` also carry
 `command_hash` (docs/DATA_POLICY.md) from the same version. Rows scanned earlier are filled once, on the next
-scan, by `ClaudeSource.backfill_retry_inputs` (marker `retry_inputs_backfill_done_claude`): it re-reads
+scan, by `ClaudeSource.backfill_retry_inputs` (marker `retry_inputs_backfill_v2_done_claude`; a row stored without call ids is matched to the re-parsed calls by position, only when both name the same tools in order, and gets its call id back with the hash): it re-reads
 transcripts still on disk and UPDATEs only NULL `is_error` / absent `command_hash`, matched by call id; no
 row is inserted, deleted or re-priced, and an interrupted run repeats. Sessions whose transcript is gone stay
 NULL: **unmeasured**, never read as success. Consumed by the `retry_loop` waste cause;
@@ -157,12 +158,50 @@ NULL: **unmeasured**, never read as success. Consumed by the `retry_loop` waste 
 
 Observation findings carry `in_total: false`: they overlap the attributed causes, so `total_usd`, the
 overhead headline, the Sessions Overhead column and the Overview "where to act" strip skip them.
-`uncached_input`, also an observation, is still summed in (`in_total: true`), as before.
+That is every observation-tier cause: `uncached_input`, `large_context` and `fixed_prefix`
+(`uncached_input` was summed in until 2026-11-13).
+
+### `agents` — one row per subagent dispatch (Claude only)
+
+Keyed by the `agentId` Claude Code writes on both the subagent's turns (`turns.agent_id`) and
+the parent's closing tool_result. Every write is a COALESCE upsert, so a record that knows only
+part of an agent never erases what another record supplied.
+
+| column | type | notes |
+|---|---|---|
+| `agent_id` | TEXT PK | the subagent's `agentId` |
+| `agent_type` | TEXT | subagent type (`Explore`, a custom agent name, ...): from the parent's tool_result, the subagent's `.meta.json` sidecar or `attributionAgent` in its own transcript; NULL when none of them says (shown as untyped) |
+| `dispatched_in_session` | TEXT | `session_id` of the parent session that dispatched it |
+| `completed_at` | TEXT | ISO-8601 timestamp of the closing tool_result |
+| `status` | TEXT | the tool_result's reported status (e.g. `completed`), NULL when absent |
+| `total_tokens` | INTEGER | the parent tool_result's own total, as reported (not recomputed from `turns`) |
+| `total_duration_ms` | INTEGER | wall-clock duration as reported |
+| `tool_use_count` | INTEGER | tool calls the subagent made, as reported |
+
+### `fixes` — recorded waste fixes (`whytokens fix record`, Changes tab)
+
+`verify` compares a (project, cause)'s attributed share of spend before and after `fix_date`.
+
+| column | type | notes |
+|---|---|---|
+| `id` | INTEGER PK | autoincrement |
+| `fix_date` | TEXT | YYYY-MM-DD the change took effect; sessions on or after it count as "after". Editable |
+| `project` | TEXT | a `sessions.project_name` that exists when recorded |
+| `cause` | TEXT | one of `waste.CAUSES` |
+| `note` | TEXT | free text, `''` when none. Editable |
+| `file_hash` | TEXT | sha256 of the file named with `--file` at record time (e.g. the CLAUDE.md you changed); NULL when none |
+| `recorded_at` | TEXT | local ISO-8601 time the row was written |
 
 ### `processed_files` — incremental-scan bookkeeping
 
-`(path PK, mtime REAL, lines INTEGER)`. Lets a rescan skip unchanged files and
-re-parse only the appended tail of a grown file.
+`(`path` TEXT PK, `mtime` REAL, `lines` INTEGER, `source` TEXT)`. Lets a rescan skip unchanged files and
+re-parse only the appended tail of a grown file. `source` is the `Source.name` that owns the file
+(`claude`, `codex`, `coordinator`).
+
+### `schema_meta` — key/value markers
+
+`(`key` TEXT PK, `value` TEXT)`. One-time migrations and backfills record that they ran here
+(`scanner._meta_get` / `_meta_set`), so each runs once per database.
 
 ### `measures` — engine `session.measure` readings (cost-band sidecar)
 

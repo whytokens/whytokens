@@ -17,7 +17,7 @@ _state = {"state": "idle", "started": None, "finished": None, "result": None, "e
 
 def status():
     p = sources.PROGRESS
-    return dict(_state, source=p["source"], done=p["done"], total=p["total"],
+    return dict(_state, source=p["source"], done=p["done"], total=p["total"], phase=p["phase"],
                 file_errors=list(p["errors"]))
 
 
@@ -43,7 +43,7 @@ def start(db_path, root=None, wait=False):
     if not _lock.acquire(blocking=False):
         return None
     projects_dir = root or projects_dir
-    sources.PROGRESS.update(source=None, done=0, total=0, errors=[])
+    sources.PROGRESS.update(source=None, done=0, total=0, errors=[], phase=None)
     _state.update(state="running", started=time.time(), finished=None, result=None, error=None)
     out = []
     t = threading.Thread(target=_run, args=(db_path, projects_dir, out), daemon=True)

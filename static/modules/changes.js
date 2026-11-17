@@ -63,7 +63,8 @@ export function detailHtml(c) {
     `<p class="muted chg-share">Share of this project's spend attributed to ${esc(c.cause_label)}.</p>` +
     bar('Before', c.before, max, interim) + bar('After', c.after, max, interim);
   if (interim) h += '<p class="chg-early">Too early to call. These numbers are a preview, not a result.</p>';
-  if (c.state === 'reduced') h += `<p>About <strong>${fmtCostBig(c.saving_usd)}</strong> less over the after period <span class="muted">(${esc(c.basis)})</span>.</p>`;
+  if (c.state === 'reduced') h += c.saving_usd == null ? `<p class="muted">${esc(c.note)}</p>`
+    : `<p>About <strong>${fmtCostBig(c.saving_usd)}</strong> less over the after period <span class="muted">(${esc(c.basis)})</span>.</p>`;
   h += `<p class="muted chg-caveat">${esc(c.caveat)}</p>`;
   if (c.mix) h += mixHtml(c.mix, interim);
   h += `<div class="chg-actions"><button class="filter-btn" data-act="edit" data-id="${c.fix.id}">Edit</button> ` +
@@ -144,7 +145,11 @@ export async function renderChanges(panel) {
     (d.changes.length ? d.changes.map(rowHtml).join('') : emptyHtml()) + '</div>';
   panel.querySelectorAll('.chg-row').forEach(e => { if (open.has(e.dataset.id)) e.open = true; });
   const f = panel.querySelector('#chg-form');
-  if (PREFILL.get('project') && d.projects.includes(PREFILL.get('project'))) f.project.value = PREFILL.get('project');
+  const pre = PREFILL.get('project');
+  if (pre) {  // a project under the picker's session threshold still has to be selectable, or Record files the wrong one
+    if (!d.projects.includes(pre)) f.project.add(new Option(pre, pre));
+    f.project.value = pre;
+  }
   if (PREFILL.get('cause') && d.causes.some(c => c.id === PREFILL.get('cause'))) f.cause.value = PREFILL.get('cause');
   if (PREFILL.get('note')) f.note.value = PREFILL.get('note');
   for (const [k, v] of Object.entries(draft)) if (v && f[k] && (k !== 'project' && k !== 'cause' || [...f[k].options].some(o => o.value === v))) f[k].value = v;

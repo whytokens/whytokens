@@ -11,6 +11,7 @@ Commands:
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from datetime import datetime, date, timedelta
@@ -94,7 +95,10 @@ def cmd_scan(projects_dir=None):
     import sources
     # Scan every registered source (Claude Code + Codex) into config.DB_PATH.
     # `--projects-dir` overrides only the Claude location; Codex uses CODEX_PATH.
-    sources.scan_all(db_path=DB_PATH, projects_dir=projects_dir)
+    try:
+        sources.scan_all(db_path=DB_PATH, projects_dir=projects_dir)
+    except sources.ScanBusy as e:
+        raise SystemExit(f"whytokens: {e}")
 
 
 def cmd_doctor(projects_dir=None):
@@ -438,7 +442,7 @@ def cmd_export(as_json=False):
     """Versioned JSON of sessions, waste and totals (docs/SCHEMA.md "Export document")."""
     if not as_json:
         print("usage: whytokens export --json")
-        return
+        sys.exit(2)
     import api
     print(json.dumps(api.get_export(DB_PATH), indent=2))
 
@@ -523,11 +527,21 @@ Usage:
   whytokens project tag PROJECT [TAG|--clear]   Show, set or clear a project's display tag
   whytokens verify [FIX_ID]              Attributed share of spend for the fix's (project, cause),
                                              after vs before; needs 10 sessions each side
+  whytokens llm [label|judge SESSION | draft SESSION CAUSE]
+                                         Opt-in model help (claude -p): shows exactly what would be
+                                             sent and its estimated cost, sends only on y; no args: spend
   whytokens pricing check [--offline]    Review diff of the shipped price table vs LiteLLM (OpenRouter
                                              cross-check). Network call only here; --offline uses the cache
   whytokens dashboard [--projects-dir PATH] [--host HOST] [--unsafe-host] [--port PORT] [--no-browser]
                                              Scan + start dashboard (opens a browser unless --no-browser)
 """
+
+
+def usage(has_llm=None):
+    """USAGE, without the `llm` command in a build that leaves model help out (public builds)."""
+    if has_llm is None:
+        has_llm = config.HAS_LLM
+    return USAGE if has_llm else re.sub(r"  whytokens llm .*?\n(?=  whytokens )", "", USAGE, flags=re.S)
 
 def cmd_fix(rest):
     import fixes
@@ -624,6 +638,54 @@ def cmd_verify(fix_id=None):
         print(fixes.format_result(fixes.verify(DB_PATH, f)))
 
 
+def cmd_llm(rest, ask=input, interactive=None):
+    if not config.HAS_LLM:  # left out of public builds
+        print("whytokens llm: model help is not part of this build")
+        sys.exit(2)
+    import llm
+    if not rest:
+        t = llm.totals(DB_PATH)
+        print(f"LLM adapter: {t['calls']} calls, ${t['total_usd']:.4f} ({t['basis']})")
+        return
+    kind, args = rest[0], rest[1:]
+    if kind not in llm.MODELS or len(args) != (2 if kind == "draft" else 1):
+        print("usage: whytokens llm label|judge SESSION  |  whytokens llm draft SESSION CAUSE")
+        sys.exit(2)
+    try:
+        p = llm.preview(kind, args[0], args[1] if kind == "draft" else None, DB_PATH)
+    except ValueError as e:
+        print(f"error: {e}")
+        sys.exit(2)
+    print(f"Would run: {' '.join(a if a else repr(a) for a in p['argv'])}")
+    print(f"Estimated cost: ${p['estimate_usd']:.4f} ({p['estimate_basis']})")
+    print("Exactly this goes on stdin:\n" + "-" * 60 + "\n" + p["stdin"] + "\n" + "-" * 60)
+    if not (sys.stdin.isatty() if interactive is None else interactive):
+        print("Not sent: confirming needs an interactive terminal.")
+        sys.exit(1)
+    if ask("Send exactly this? [y/N] ").strip().lower() != "y":
+        print("Not sent.")
+        return
+    r = llm.run(p["confirm"], DB_PATH)
+    if r.get("cost_usd") is not None:
+        print(f"Cost: ${r['cost_usd']:.4f}  adapter total: ${r['total_usd']:.4f}")
+    if not r["ok"]:
+        print(f"error: {r['error']}")
+        fb = (r.get("fallback") or {}).get("deterministic_fix")
+        if fb:
+            print(f"Deterministic fix: {fb}")
+        sys.exit(1)
+    res = r["result"]
+    print(f"[model-generated, {r['model']}]")
+    if kind == "label":
+        print(f"{res['label']}  ({res['outcome']})")
+    elif kind == "judge":
+        print(f"Observation: {res['mechanical']} of {res['of']} sampled turns looked mechanical "
+              f"({res['share']:.0%}). Not a saving; not in any total.")
+    else:
+        print("Draft for CLAUDE.md (not written anywhere; copy it if you want it):")
+        print(res["diff"])
+
+
 def cmd_shapes():
     import api
     import shape
@@ -666,6 +728,7 @@ COMMANDS = {
     "pricing": cmd_pricing,
     "budget": cmd_budget,
     "shapes": cmd_shapes,
+    "llm": cmd_llm,
     "project": cmd_project,
     "export": cmd_export,
     "dashboard": cmd_dashboard,
@@ -674,7 +737,11 @@ COMMANDS = {
 def parse_named_arg(args, flag):
     """Extract a --flag VALUE pair from an argument list."""
     for i, arg in enumerate(args):
-        if arg == flag and i + 1 < len(args):
+        if arg == flag:
+            # `--note --date 2026-10-01` must not store the note "--date"
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                print(f"error: {flag} needs a value")
+                sys.exit(2)
             return args[i + 1]
     return None
 
@@ -684,12 +751,16 @@ def main():
             print(version.line())
             sys.exit(0)
         if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
-            print(USAGE)
-            sys.exit(0)
+            print(usage())
+            # a mistyped command is an error to a script; asking for help is not
+            sys.exit(0 if len(sys.argv) < 2 or sys.argv[1] in ("help", "--help", "-h") else 2)
 
         command = sys.argv[1]
         rest = sys.argv[2:]
         projects_dir = parse_named_arg(rest, "--projects-dir")
+
+        if command not in ("dashboard", "scan", "doctor", "live", "pricing") and DB_PATH.exists():
+            require_db().close()  # a DB from an older version gets its additive columns before any command reads it
 
         if command == "dashboard":
             cmd_dashboard(
@@ -723,6 +794,8 @@ def main():
             cmd_budget(rest)
         elif command == "project":
             cmd_project(rest)
+        elif command == "llm":
+            cmd_llm(rest)
         elif command == "verify":
             cmd_verify(rest[0] if rest else None)
         else:

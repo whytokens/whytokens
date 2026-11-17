@@ -5,6 +5,7 @@ cache-write, not cache-reads carried by later turns. Their dollars therefore
 under-report absolute cost and are useful for ranking, not totals.
 """
 
+import functools
 import json
 import re
 import sqlite3
@@ -29,8 +30,8 @@ TIERS = {"resident_output": "attributed cause", "repeated_reads": "attributed ca
          "fixed_prefix": "observation"}
 # Observations that overlap the attributed causes (they price reads other causes may also touch), so
 # their dollars are shown, filterable and linkable but never summed into a total: each finding carries
-# in_total=False. uncached_input is also an observation but is still summed in, as it always was.
-UNCOUNTED = ("large_context", "fixed_prefix")
+# in_total=False. One rule, no exception: every observation-tier cause is uncounted.
+UNCOUNTED = tuple(c for c in CAUSES if TIERS[c] == "observation")
 LARGE_CONTEXT_TOKENS = 250_000  # main-lane context (input + cache read + cache write) past this is "large"
 # fixed_prefix fires only when the opening prefix is at least this big: a lean prefix is the cost of
 # running at all, so a lean session scores zero. ponytail: one flat default, tune against real starts.
@@ -104,12 +105,18 @@ def measurement(db_path):
     return {"sources": sources, "causes": {c: {s: cell(s, c) for s in sources} for c in CAUSES}}
 
 
-def _calls(row):
+@functools.lru_cache(maxsize=8192)
+def _parse_calls(raw):
+    # each turn's JSON is read ~6 times by the detectors in a row; callers only read the list
     try:
-        calls = json.loads(row["tool_calls"] or "[]")
+        calls = json.loads(raw or "[]")
     except (TypeError, ValueError):
         return []
     return calls if isinstance(calls, list) else []
+
+
+def _calls(row):
+    return _parse_calls(row["tool_calls"])
 
 
 _WRITERS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
@@ -529,7 +536,7 @@ def _split_action(evidence):
             "calls": [{"message_id": e["message_id"], "at": e["at"], "context": e["context"],
                        "tokens": e["tokens"], "usd": e["usd"]} for e in cross[:5]],
             "est_usd": sum(e["usd"] for e in evidence),
-            "est_basis": f"Observation: cache-read cost of the context above {k}K on {len(evidence)} turns. "
+            "est_basis": f"Baseline cost: cache-read cost of the context above {k}K on {len(evidence)} turns. "
                          "It overlaps other causes, so it is not added to the overhead total. Not a saving."}
 
 
@@ -586,7 +593,8 @@ def _retry_loop(turns, errs, claims, trcalls=None):
     issued the 2nd and later failures; the first attempt's turn is never priced.
     Conservative where data is missing: a turn with no prompt boundary (subagent turns carry no
     prompt_seq) ends the run and starts none, and so does a turn whose tool_results rows show a
-    writer call its tool_calls lost (a streamed message keeps only its last record's calls)."""
+    writer call or a failed call its tool_calls lost (a streamed message keeps only its last record's
+    calls). A run that prices to nothing (a model without a price) is no finding."""
     trcalls = trcalls or {}
     taken = {}  # message_id -> cache-write tokens already claimed by a write-based cause
     for cause in ("resident_output", "repeated_reads", "subagent_preamble", "idle_gap", "cache_miss_rebuild"):
@@ -605,7 +613,7 @@ def _retry_loop(turns, errs, claims, trcalls=None):
         if lane in state and state[lane][0] != t["prompt_seq"]:
             close(lane)
         seen = {c.get("id") for c in _calls(t) if isinstance(c, dict)}
-        if t["prompt_seq"] is None or any(cid not in seen and name in _WRITERS
+        if t["prompt_seq"] is None or any(cid not in seen and (name in _WRITERS or errs.get(cid) == 1)
                                           for cid, name in trcalls.get(t["message_id"], ())):
             close(lane)
             continue
@@ -630,7 +638,7 @@ def _retry_loop(turns, errs, claims, trcalls=None):
         close(lane)
     c, priced = claims["retry_loop"], set()
     for _, (tool, ident), run in runs:
-        usd = 0.0
+        usd, evs = 0.0, []
         for t in run:
             if t["id"] in priced or t["id"] == run[0]["id"]:  # also a parallel call in the first attempt's turn
                 continue
@@ -639,9 +647,10 @@ def _retry_loop(turns, errs, claims, trcalls=None):
             out = t["output_tokens"] or 0
             u = _cost(t, creation=write) + pricing.calc_cost(t["model"], 0, out, 0, 0, t["timestamp"]) * t["mult"]
             usd += u
-            c[2].append(_ev(t, write + out, u, tool))
+            evs.append(_ev(t, write + out, u, tool))
         if usd:
             c[0] += usd
+            c[2].extend(evs)
             c[1].append({"tool": tool, "ident": ident, "failures": len(run)})
 
 
@@ -890,8 +899,8 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                 detail = (f"Carrying the fixed prefix cost ${usd:.2f} over {d['turns']:,} turns: an opening prefix of "
                           f"{d['prefix']:,} tokens (system prompt, tool schemas, always-loaded instructions and the "
                           "first prompt; transcripts do not split them) re-read on every main-thread turn.")
-                fix = ("Trim always-loaded instructions (CLAUDE.md and its imports) and disable connectors and MCP "
-                       "servers this project does not use.")
+                fix = ("Run /context to see what the prefix holds. Trim always-loaded instructions (CLAUDE.md and its imports) "
+                       "and disable connectors and MCP servers this project does not use.")
                 if claims["deferred_tool_load"][2]:
                     fix += " This session also has a deferred tool load finding: load tools with select:<name>."
             else:

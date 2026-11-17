@@ -21,8 +21,9 @@ MUTANTS = [
     ("fixes.py", "MIN_SESSIONS = 10", "MIN_SESSIONS = 0"),
     ("fixes.py", 'if min(before["sessions"], after["sessions"]) < MIN_SESSIONS', 'if max(before["sessions"], after["sessions"]) < MIN_SESSIONS'),
     ("fixes.py", 'out["saving_usd"] = delta * after["usd"]', 'out["saving_usd"] = before["cause_usd"]'),
-    ("fixes.py", 'if f["cause"] == fix["cause"]:', "if True:"),
-    ("fixes.py", "material = abs(delta) >= MIN_DELTA_PP and abs(delta) >= MIN_DELTA_REL * before[\"pct\"]", "material = True"),
+    ("fixes.py", 'cause_usd.get(fix["cause"], {})', '{k: v for d in cause_usd.values() for k, v in d.items()}'),
+    ("fixes.py", "material = round(abs(delta), 9) >= MIN_DELTA_PP and abs(delta) >= MIN_DELTA_REL * before[\"pct\"]", "material = True"),
+    ("fixes.py", "round(abs(delta), 9) >= MIN_DELTA_PP", "abs(delta) >= MIN_DELTA_PP"),  # exactly one point
     ("fixes.py", "needs at least", "needs about"),
     ("fixes.py", "if d < fix[\"fix_date\"]]", "if d < \"0000\"]"),
     ("scanner.py", '"tool_results", "fixes")', '"tool_results")'),

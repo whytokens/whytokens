@@ -13,10 +13,10 @@ title, and fills ``sessions.topic`` for the matching local transcripts.
 The local join keys come from the thread's first user record: its ``<wake>``
 envelope names the trigger ``<message id="cmsg_...">`` and the worktree cwd may
 carry ``bridge-cse_<id>``. When the cache has evicted a thread's spawn (it is a
-rolling window), the trigger message body is used instead (topic_source
-'prompt'), so a Projects thread is never left Untitled.
+rolling window), the session keeps whatever title it had, or none: the trigger
+message is a prompt, and prompt text is never stored (docs/DATA_POLICY.md).
 
-Precedence (higher wins, equal may refresh): custom > thread > ai > prompt.
+Precedence (higher wins, equal may refresh): custom > thread > ai.
 Read-only against the cache; a missing or undecodable blob is skipped quietly.
 """
 
@@ -321,16 +321,15 @@ def load_thread_titles(blob_dir):
 _WAKE_MSG = re.compile(r'<message\b([^>]*)>(.*?)</message>', re.S)
 _MSG_ID = re.compile(r'\bid="(cmsg_\w+)"')
 _BRIDGE_CSE = re.compile(r"bridge-(cse_[A-Za-z0-9]+)")
-_TAGS = re.compile(r"<[^>]+>")
 
 
 def thread_keys(jsonl_path, max_lines=200):
-    """(join keys, prompt_title) for a Projects thread transcript, or None when the
+    """Join keys for a Projects thread transcript, or None when the
     session isn't one. Reads only the head: the coordinator's spawn relay (a meta
     user record or queued prompt) and the first real user record, a ``<wake>``.
     Keys, best first: trigger cmsg_, bridge cse_ from the cwd, spawn note (text,
     so the weakest: two spawns can share it)."""
-    keys, prompt, note = [], None, None
+    keys, note = [], None
     try:
         with open(jsonl_path, encoding="utf-8", errors="replace") as f:
             for n, line in enumerate(f):
@@ -368,8 +367,6 @@ def thread_keys(jsonl_path, max_lines=200):
                 trig = next((x for x in msgs if 'trigger="true"' in x[0]), msgs[-1] if msgs else None)
                 if trig:
                     keys.append(_MSG_ID.search(trig[0]).group(1))
-                    body = " ".join(html.unescape(_TAGS.sub(" ", trig[1])).split())
-                    prompt = (body[:77] + "...") if len(body) > 80 else body or None
                 cse = _BRIDGE_CSE.search(str(r.get("cwd") or "") + " " + str(r.get("gitBranch") or ""))
                 if cse:
                     keys.append(cse.group(1))
@@ -378,20 +375,19 @@ def thread_keys(jsonl_path, max_lines=200):
         return None
     if note:
         keys.append(note)
-    return (keys, prompt) if keys else None
+    return keys or None
 
 
-_RANK = {"prompt": 1, "ai": 2, "thread": 3, "custom": 4}
+_RANK = {"ai": 2, "thread": 3, "custom": 4}
 
 
 def apply_thread_titles(conn, jsonl_files, blob_dir):
     """Fill sessions.topic for Projects thread sessions. Returns rows updated.
 
     A session is touched when its current topic ranks below the new one, or when
-    it already has a thread title and the thread was renamed. A 'prompt' fallback
-    never replaces an ai-title, and nothing beats a custom title. A title that has
-    dropped out of the cache keeps whatever was captured earlier (no update
-    without a source)."""
+    it already has a thread title and the thread was renamed. Nothing beats a
+    custom title. A title that has dropped out of the cache keeps whatever was
+    captured earlier (no update without a source)."""
     rows = conn.execute(
         "SELECT session_id, topic, topic_source FROM sessions "
         "WHERE COALESCE(topic_source, '') <> 'custom' "
@@ -411,12 +407,10 @@ def apply_thread_titles(conn, jsonl_files, blob_dir):
             keys = None
         if not keys:
             continue
-        keys, prompt = keys
         if titles is None:
             titles = load_thread_titles(blob_dir) if blob_dir else {}
         title = next((titles[k] for k in keys if k in titles), None)
-        source = "thread" if title else "prompt"
-        title = title or prompt
+        source = "thread"
         rank, current = want[sid]
         renamed = source == "thread" and rank == _RANK["thread"] and title != current
         if not title or (_RANK[source] <= rank and not renamed):

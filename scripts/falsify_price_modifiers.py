@@ -27,7 +27,7 @@ MUTANTS = [
     ("api.py", "* pricing.price_mult(t.get(\"speed\")", "* pricing.price_mult(\"\""),
     ("api.py", "                pricing.surcharge_cost(r[\"model\"], r, r[\"day\"]))", "                0)"),
     ("cli.py", "            surcharge_cost(r[\"model\"], r, timestamp))", "            0)"),
-    ("waste.py", "row[\"cache_creation_1h_tokens\"] if creation else 0) * row[\"mult\"]", "row[\"cache_creation_1h_tokens\"] if creation else 0)"),
+    ("waste.py", "row[\"timestamp\"], h1) * row[\"mult\"]", "row[\"timestamp\"], h1)"),
     ("static/modules/pricing.js", "  if (!x) return c;", "  return c;"),
     # Haiku 5.5 long prompts (5x over 100K)
     ("pricing.py", "THEN {LONG_PROMPT_MULT} ELSE 1.0 END\"", "THEN 1.0 ELSE 1.0 END\""),

@@ -24,8 +24,8 @@ MUTANTS = [
     ("static/modules/verify.js", "--cause ${cause} --note", "--cause X --note"),
     ("static/index.html", """<th data-prov="local_estimate" class="sortable" onclick="setSessionSort('cost')">""",
      """<th class="sortable" onclick="setSessionSort('cost')">"""),
-    ("static/index.html", """<th data-prov="official" class="sortable" onclick="setSessionSort('cache_read')">""",
-     """<th data-prov="local_estimate" class="sortable" onclick="setSessionSort('cache_read')">"""),
+    ("static/index.html", """<th data-prov="local_estimate" class="sortable" onclick="setSessionSort('cost')">""",
+     """<th data-prov="official" class="sortable" onclick="setSessionSort('cost')">"""),
 ]
 
 TESTS = ["tests.test_provenance"]

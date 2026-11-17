@@ -259,7 +259,7 @@ has(sessionFindingsHTML(null, 'proj'), 'unavailable', 'failed load');
 const a = sessionFindingsHTML({ findings: [{ ...base, cause: 'repeated_reads', action: act }] }, 'proj');
 has(a, 'Repeated file reads', 'cause label'); has(a, '$2.50', 'cause usd'); has(a, 'lower bound', 'basis');
 has(a, 'RULE TEXT', 'rule'); has(a, 'Copy', 'copy'); has(a, 'big.py', 'call file');
-has(a, 'data-session="s1"', 'call session'); has(a, 'data-turn="m1"', 'call deep link'); has(a, 'Request 7', 'call label');
+has(a, 'data-session="s1"', 'call session'); has(a, 'data-turn="m1"', 'call deep link'); has(a, 'prompt 7', 'call label');
 has(a, 'I made this change', 'record button'); has(a, 'wg-verify', 'verify slot');
 lacks(a, 'Open full trace', 'already in the trace');
 // no action: the fix text and the evidence turns, even for the causes the Waste tab calls "no single call"
@@ -373,7 +373,7 @@ const open = id => {{ selectedSessionDetail = {{ session: {{ session_id: id, pro
 class TestWiring(unittest.TestCase):
     def test_markup_and_listeners(self):
         for needle in ('id="where-to-act"', 'id="session-findings"', 'id="session-cause-filter"',
-                       "setSessionSort('overhead')", "setSessionSort('cache_share')"):
+                       "setSessionSort('overhead')", 'id="sessions-sort-note"'):
             self.assertIn(needle, HTML)
         self.assertIn("window.addEventListener('popstate', restoreFromURL)", APP)
         self.assertIn("closest('a[data-drill]')", APP)

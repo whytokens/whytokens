@@ -26,6 +26,11 @@ MCP tool inputs, search patterns, prompts, file contents and shell commands are 
 Token counts, timestamps, model names, project and branch names, and session titles are
 stored (see `SCHEMA.md`).
 
+Rework labels (`scripts/label_rework.py`, a local tool for validating candidate rework signals)
+are kept in `~/.whytokens/rework-labels.json`: session id -> `fine` or `rework`, nothing else.
+While labelling, the tool shows the first and last prompt read from the transcript on screen; it
+stores no prompt text and sends nothing anywhere.
+
 ## Raw inputs (opt-in)
 
 `WHYTOKENS_STORE_RAW_INPUTS=1` stores full tool inputs. Off by default. It applies to

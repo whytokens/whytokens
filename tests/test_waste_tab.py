@@ -145,7 +145,7 @@ const a1 = { id: 'read_ranges', title: 'Read whole files 2 times', rule: 'RULE T
   calls: [{ message_id: 'm1', at: 't', tool: 'Read', file: 'big.py', result_tokens: 12000, prompt_seq: 7 }] };
 const s1 = nextStepCard({ ...base, cause: 'resident_output', action: a1 }, 'fix', 'why', true);
 has(s1, '<details open>', 'S1 open for the top session'); has(s1, 'RULE TEXT', 'S1 rule'); has(s1, 'big.py', 'S1 file');
-has(s1, 'Request 7', 'S1 request link'); has(s1, 'data-turn="m1"', 'S1 trace link'); has(s1, 'Estimate: about $1.50', 'S1 estimate'); has(s1, 'lower bound', 'S1 tier');
+has(s1, 'prompt 7', 'S1 prompt number'); lacks(s1, 'Request 7', 'the link is the call time, not a repeated request number'); has(s1, 'data-turn="m1"', 'S1 trace link'); has(s1, 'about $1.50', 'S1 estimate'); has(s1, 'lower bound', 'S1 tier');
 lacks(nextStepCard({ ...base, cause: 'resident_output', action: a1 }, 'f', 'w', false), '<details open>', 'S1 closed for other sessions');
 const unk = nextStepCard({ ...base, cause: 'idle_gap', action: { id: 'subagent_waits', title: 'T', rule: 'R', est_usd: 1, est_basis: 'b', calls: [{ message_id: 'm4', at: 't', minutes: 8, tokens: 3, usd: 1, side: true, agent_type: null }] } }, 'f', 'w', true);
 has(unk, '>subagent<', 'unknown subagent type is not main thread'); lacks(unk, 'main thread', 'unknown subagent');
@@ -158,6 +158,10 @@ const sj = nextStepCard({ ...base, cause: 'subagent_preamble', action: { id: 'sm
 has(sj, 'Explore', 'small job type'); has(sj, '>3<', 'small job turns');
 has(nextStepCard({ ...base, cause: 'resident_output', action: a1 }, 'f', 'w', true, 'proj'), 'data-rnote="Read whole files 2 times"', 'S1 record button carries the rule title');
 lacks(s1, 'wg-record', 'no button without a project');
+// reading order: where the rule goes, the rule, its cost, the button, then the calls as collapsed evidence
+const ord = nextStepCard({ ...base, cause: 'resident_output', action: a1 }, 'f', 'w', true, 'proj');
+const at = ['CLAUDE.md', 'RULE TEXT', 'about $1.50', 'wg-record', 'Marks today', '<details class="wg-evidence">', '<table>', 'Estimate, lower bound: x'].map(n => { has(ord, n, 'order'); return ord.indexOf(n); });
+if (at.some((p, i) => i && p < at[i - 1])) throw new Error('next-step card out of reading order: ' + at);
 // S2: no action on resident_output / subagent_preamble: no rule, no table
 for (const c of ['resident_output', 'subagent_preamble']) {
   const h = nextStepCard({ ...base, cause: c }, 'fix', 'why', true);
@@ -168,6 +172,9 @@ const s3 = nextStepCard({ ...base, cause: 'cache_miss_rebuild' }, 'fix', 'why', 
 has(s3, '<table>', 'S3 table'); has(s3, 'data-turn="m1"', 'S3 row link'); has(s3, 'Did you switch model', 'S3 checklist'); has(s3, 'CLAUDE.md or settings', 'S3 checklist');
 // other causes keep the evidence table without a checklist
 lacks(nextStepCard({ ...base, cause: 'repeated_reads' }, 'f', 'w', true), 'Usual causes', 'no checklist elsewhere');
+// the habit prints its fix once: the drawer repeats a Fix line only when handed one of its own
+has(nextStepCard({ ...base, cause: 'repeated_reads' }, 'OWN FIX', 'w', false), 'Fix:</strong> OWN FIX', 'a session fix shows');
+lacks(nextStepCard({ ...base, cause: 'repeated_reads' }, '', 'w', false), 'Fix:', 'no second Fix line');
 console.log('ok');
 """
 
@@ -202,6 +209,9 @@ lacks(s4b, 'Check back', 'before-side shortfall is not S4'); has(s4b, 'needs at 
 const s5 = describe(mk('no material change', 20, 12));
 has(s5, 'before: 20 sessions', 'S5 before'); has(s5, 'after: 12 sessions', 'S5 after'); has(s5, 'try the next call on the list', 'S5 hint'); has(s5, 'CAVEAT', 'S5 caveat');
 lacks(describe(mk('reduced', 20, 12, { saving_usd: 5, basis: 'b' })), 'next call', 'hint only on no change');
+// an observation cause is never priced: its note, no dollar figure
+const obs = describe(mk('reduced', 20, 12, { saving_usd: null, basis: 'b', note: 'OBSERVATION NOTE' }));
+has(obs, 'OBSERVATION NOTE', 'observation note'); lacks(obs, 'about $', 'no dollar amount for an observation'); lacks(obs, 'less over', 'no amount sentence');
 has(recordButton('p', 'c', 'n"x'), 'data-rnote="n"x"', 'button carries the note');
 // the card's button posts the rule title and reads Recorded from the response
 (async () => {
@@ -227,9 +237,48 @@ has(recordButton('p', 'c', 'n"x'), 'data-rnote="n"x"', 'button carries the note'
   await fillVerifySlots(globalThis.document);
   if (!stored.outerHTML.includes('Recorded')) throw new Error('stored fix left its button active');
   if (fresh.outerHTML !== 'keep') throw new Error('a different rule lost its button');
+  // a habit with no recorded fix shows nothing in its slot: no terminal command, no stray link
+  const empty = { dataset: { vproject: 'other', vcause: 'c' }, innerHTML: 'stale' };
+  globalThis.document.querySelectorAll = q => q === '.wg-verify' ? [empty] : [];
+  await fillVerifySlots(globalThis.document);
+  if (empty.innerHTML !== '') throw new Error('empty slot shows: ' + empty.innerHTML);
   console.log('ok');
 })();
 """
+
+
+_BARS = """
+const esc = s => String(s), fmtCostBig = c => '$' + c.toFixed(2), fmtPct = v => (100 * v).toFixed(0) + '%';
+const label = c => c, avoidTag = () => '', causeSplit = () => '', splitBadges = () => '', sessionsByCauseHref = c => '?c=' + c;
+let wasteCause = null, out = '';
+const el = () => ({ set innerHTML(h) { out = h; } });
+const cause = (c, usd, in_total) => ({ cause: c, usd, in_total, share: in_total ? usd / 30 : null, sessions: 1 });
+const v = { causes: [cause('prefix', 400, false), cause('big', 20, true), cause('ctx', 100, false), cause('small', 10, true)] };
+%(SRC)s
+const rows = out.split('<div class="waste-bar-row').slice(1), width = c => rows.find(r => r.includes('data-cause="' + c + '"')).match(/width:([0-9.]+)%/)[1];
+const eq = (g, w, m) => { if (g !== w) throw new Error(m + ': got ' + g + ', want ' + w); };
+eq(width('big'), '100.0', 'the biggest counted cause fills its bar, whatever a baseline cause costs');
+eq(width('small'), '50.0', 'counted causes scale among themselves');
+eq(width('prefix'), '100.0', 'baseline causes scale among themselves'); eq(width('ctx'), '25.0', 'baseline scale');
+const head = out.indexOf('Baseline cost');
+if (head < out.indexOf('data-cause="small"') || head > out.indexOf('data-cause="prefix"')) throw new Error('baseline group must follow every counted cause');
+eq(rows.filter(r => r.startsWith(' wb-baseline')).length, 2, 'baseline rows are marked for the muted style');
+if (out.includes('observation')) throw new Error('the word observation is back');
+v.causes = [cause('big', 20, true)]; render();
+if (out.includes('Baseline cost')) throw new Error('no baseline heading without a baseline cause');
+console.log('ok');
+"""
+
+
+class TestCauseBarGroups(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_baseline_causes_get_their_own_group_and_scale(self):
+        import subprocess
+        app = (Path(__file__).resolve().parent.parent / "static" / "modules" / "app.js").read_text(encoding="utf-8")
+        a = app.index("  const bar = (c, top) =>")
+        src = "function render() {\n" + app[a:app.index("  // Heatmap shows every week", a)] + "}\nrender();"
+        out = subprocess.run(["node", "--input-type=module", "-e", _BARS.replace("%(SRC)s", src)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr[-800:])
 
 
 class TestVerifyWording(unittest.TestCase):
