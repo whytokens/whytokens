@@ -10,13 +10,14 @@
 try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
 </script>
 </head>
-<body>
+<body class="booting">
 <nav id="tab-bar" aria-label="Screens">
   <div class="brand"><span class="brand-icon" role="img" aria-label="whytokens"></span><span class="brand-name">whytokens</span></div>
   <button class="tab-btn" id="tab-overview" data-tab="overview" aria-current="page" aria-controls="panel-overview" aria-label="Overview" title="Overview"><span class="ico" aria-hidden="true">&#9684;</span><span class="lbl">Overview</span></button>
   <button class="tab-btn" id="tab-sessions" data-tab="sessions" aria-controls="panel-sessions" aria-label="Sessions" title="Sessions"><span class="ico" aria-hidden="true">&#9776;</span><span class="lbl">Sessions</span></button>
   <button class="tab-btn" id="tab-trace" data-tab="trace" aria-controls="panel-trace" aria-label="Trace" title="Trace"><span class="ico" aria-hidden="true">&#8767;</span><span class="lbl">Trace</span></button>
   <button class="tab-btn" id="tab-waste" data-tab="waste" aria-controls="panel-waste" aria-label="Waste" title="Waste"><span class="ico" aria-hidden="true">&#9660;</span><span class="lbl">Waste</span></button>
+  <button class="tab-btn" id="tab-changes" data-tab="changes" aria-controls="panel-changes" aria-label="Changes" title="Changes"><span class="ico" aria-hidden="true">&#9998;</span><span class="lbl">Changes</span></button>
   <button class="tab-btn" id="tab-sources" data-tab="sources" aria-controls="panel-sources" aria-label="Sources" title="Sources"><span class="ico" aria-hidden="true">&#9921;</span><span class="lbl">Sources</span></button>
   <button class="tab-btn" id="tab-settings" data-tab="settings" aria-controls="panel-settings" aria-label="Settings" title="Settings"><span class="ico" aria-hidden="true">&#9881;</span><span class="lbl">Settings</span></button>
   <div class="rail-spacer"></div>
@@ -56,7 +57,8 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
   <h1 class="sr-only">whytokens</h1>
 
   <section class="tab-panel" id="panel-overview" data-panel="overview">
-    <div class="stats-row" id="stats-row"></div>
+    <div class="stats-row" id="stats-row"><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div></div>
+    <div class="where-to-act" id="where-to-act"></div>
     <div class="charts-grid">
       <div class="chart-card wide">
         <h2 id="daily-chart-title">Daily Token Usage</h2>
@@ -110,21 +112,6 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <th data-prov="local_estimate">Est. Cost</th>
         </tr></thead>
         <tbody id="effort-cost-body"></tbody>
-      </table>
-    </details>
-    <details class="table-card collapsible">
-      <summary>Cost Breakdown</summary>
-      <table>
-        <thead><tr>
-          <th data-prov="local_estimate">Input</th>
-          <th data-prov="local_estimate">Output</th>
-          <th data-prov="local_estimate">Cache Read</th>
-          <th data-prov="local_estimate">Cache Creation</th>
-          <th data-prov="local_estimate">Total</th>
-          <th data-prov="local_estimate">Est. Cache Savings</th>
-          <th data-prov="local_estimate">Cache Share</th>
-        </tr></thead>
-        <tbody id="cost-breakdown-body"></tbody>
       </table>
     </details>
     <h2 class="sub-section" id="projects">By project</h2>
@@ -238,6 +225,10 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <label for="session-min-cost-filter">Min Cost</label>
           <input id="session-min-cost-filter" type="number" min="0" step="0.01" placeholder="$0" oninput="onSessionFilterChange()">
         </div>
+        <div class="filter-field">
+          <label for="session-cause-filter">Overhead cause</label>
+          <select id="session-cause-filter" onchange="onSessionFilterChange()"><option value="">Any cause</option></select>
+        </div>
         <label class="filter-check"><input id="session-cache-filter" type="checkbox" onchange="onSessionFilterChange()">Cache creation</label>
         <button class="filter-btn" onclick="clearSessionFilters()">Clear</button>
       </div>
@@ -255,6 +246,8 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <th data-prov="official" class="sortable" onclick="setSessionSort('cache_read')">Cache Read&nbsp;<span class="sort-icon" id="sort-icon-cache_read"></span></th>
           <th data-prov="official" class="sortable" onclick="setSessionSort('cache_creation')">Cache Creation&nbsp;<span class="sort-icon" id="sort-icon-cache_creation"></span></th>
           <th data-prov="local_estimate" class="sortable" onclick="setSessionSort('cost')">Est. Cost&nbsp;<span class="sort-icon" id="sort-icon-cost"></span></th>
+          <th class="sortable" onclick="setSessionSort('cache_share')" title="cache read as a share of the prompt">Cache Share&nbsp;<span class="sort-icon" id="sort-icon-cache_share"></span></th>
+          <th class="sortable" onclick="setSessionSort('overhead')" title="Attributed overhead (lower bound, API list rate); the selected cause's share when a cause is chosen">Overhead&nbsp;<span class="sort-icon" id="sort-icon-overhead"></span></th>
         </tr></thead>
         <tbody id="sessions-body"></tbody>
       </table>
@@ -292,6 +285,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
     </div>
   </div>
   <div class="detail-stats" id="session-detail-stats"></div>
+  <div class="table-card session-findings hidden" id="session-findings" aria-live="polite"></div>
   <div class="table-card hidden" id="session-bands-card">
     <div class="section-title">Requests <span class="muted">(click one to filter the tables below)</span></div>
     <div id="session-bands"></div>
@@ -364,10 +358,11 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
     </div>
   </section>
 
+  <section class="tab-panel" id="panel-changes" data-panel="changes" hidden></section>
   <section class="tab-panel" id="panel-waste" data-panel="waste" hidden>
     <div class="table-card">
       <div class="section-title">Waste</div>
-      <div id="waste-scope"></div>
+      <div id="waste-scope" class="skel-stack"><div class="skel" style="width:40%;height:26px"></div><div class="skel" style="width:85%;height:14px"></div><div class="skel" style="width:60%;height:14px"></div><div class="skel" style="width:100%;height:40px"></div></div>
       <p class="muted" id="waste-basis">Priced at API list rate. Amounts are attributed, a lower bound, never savings.</p>
       <details id="waste-measure-wrap" class="waste-measure"><summary id="waste-measure-line" class="muted"></summary>
         <table id="waste-measure"></table>
@@ -375,15 +370,15 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
     </div>
     <div class="table-card">
       <div class="section-title">By cause <span class="muted">(click to filter the habits below)</span></div>
-      <div id="waste-bars"></div>
+      <div id="waste-bars" class="skel-stack"><div class="skel" style="width:90%;height:22px"></div><div class="skel" style="width:70%;height:22px"></div><div class="skel" style="width:45%;height:22px"></div><div class="skel" style="width:25%;height:22px"></div></div>
     </div>
     <div class="table-card">
       <div class="section-title">Cause &times; week <span class="muted">(click a cell to filter the habits below)</span></div>
-      <div id="waste-heatmap"></div>
+      <div id="waste-heatmap"><div class="skel" style="width:100%;height:190px"></div></div>
     </div>
     <div class="table-card">
       <div class="section-title" id="waste-groups-title">Habits: project &times; cause</div>
-      <div id="waste-groups"></div>
+      <div id="waste-groups" class="skel-stack"><div class="skel" style="width:100%;height:56px"></div><div class="skel" style="width:100%;height:56px"></div><div class="skel" style="width:100%;height:56px"></div><div class="skel" style="width:100%;height:56px"></div></div>
     </div>
   </section>
 

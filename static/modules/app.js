@@ -21,8 +21,10 @@ import { store, TZ_KEY, alpha, fillTokens, initTheme, setThemePref } from './the
 import { weekOf, promptBands, turnsOfBand, sessionWaterfall, causeWeekMatrix } from './analytics.js';
 import { watchProvenance, provBadge, addSplit, orUnknown } from './provenance.js';
 import { writeTraceLink, readTraceLink, findTurnRow } from './tracelink.js';
+import { renderChanges } from './changes.js';
 import { verifySlot, fillVerifySlots, resetVerify, recordButton, recordFix } from './verify.js';
-import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchStatus } from './api.js';
+import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchSessionWaste, fetchStatus } from './api.js';
+import { readSessionState, writeSessionState, readWasteState, writeWasteState, drillHref, CARD_TARGET, DEFAULT_SORT, overheadIndex, overheadOf } from './drill.js';
 
 // Chart.js is loaded as a classic UMD script before this module (see index.html),
 // so it lives on window. Aliased here so // @ts-check doesn't flag the global.
@@ -65,7 +67,8 @@ let selectedSessionDetail = null;
 let traceTurn = '', traceWhy = '', traceScrollPending = false;  // deep-link target turn, banner text, scroll once per open
 let traceOpenSeq = 0;  // latest openSessionDetail call; older responses are dropped
 let traceHighlight = new Set();  // message_ids of a finding's evidence calls, marked in the trace table
-let sessionFilters = { project: '', branch: '', tool: '', minCost: 0, hasCacheCreation: false };
+let sessionFilters = { project: '', branch: '', tool: '', minCost: 0, hasCacheCreation: false, cause: '' };
+let lastScopeSessions = [];  // model + range scope, before the Sessions-list filters (the Overview basis)
 let sessionSortDir = 'desc';
 
 // Tables reveal rows in steps: 10 -> 25 -> 50, capped at 50 because rendering
@@ -313,11 +316,12 @@ function readURLRange() {
   return VALID_RANGES.includes(p) ? p : '30d';
 }
 
+function markRange(range) {
+  document.querySelectorAll('.range-btn[data-range]').forEach(btn => btn.classList.toggle('active', btn.dataset.range === range));
+}
 function setRange(range) {
   selectedRange = range;
-  document.querySelectorAll('.range-btn[data-range]').forEach(btn =>
-    btn.classList.toggle('active', btn.dataset.range === range)
-  );
+  markRange(range);
   updateURL();
   applyFilter();
   scheduleAutoRefresh();
@@ -476,6 +480,9 @@ function buildSessionFilterUI(sessions) {
     `<option value="${esc(t)}">${esc(t)}</option>`
   ).join('');
   if ([...toolSelect.options].some(o => o.value === current)) toolSelect.value = current;
+  const causeSelect = document.getElementById('session-cause-filter');
+  causeSelect.innerHTML = '<option value="">Any cause</option>' + Object.entries(CAUSE_LABEL).map(([k, v]) =>
+    `<option value="${esc(k)}">${esc(v)}</option>`).join('');
 }
 
 function readSessionFilters() {
@@ -485,6 +492,7 @@ function readSessionFilters() {
     tool: document.getElementById('session-tool-filter').value,
     minCost: parseFloat(document.getElementById('session-min-cost-filter').value) || 0,
     hasCacheCreation: document.getElementById('session-cache-filter').checked,
+    cause: document.getElementById('session-cause-filter').value,
   };
   renderProjectChip();
 }
@@ -511,6 +519,7 @@ function showProjectSessions(project) {
 
 function onSessionFilterChange() {
   readSessionFilters();
+  updateURL();
   applyFilter();
 }
 
@@ -520,34 +529,61 @@ function clearSessionFilters() {
   document.getElementById('session-tool-filter').value = '';
   document.getElementById('session-min-cost-filter').value = '';
   document.getElementById('session-cache-filter').checked = false;
+  document.getElementById('session-cause-filter').value = '';
   readSessionFilters();
+  updateURL();
   applyFilter();
 }
 
+// Per-session attributed overhead from the server's findings; null until /api/waste has loaded.
+let overheadCache = { payload: null, idx: null };
+function wasteIndex() {
+  if (!wastePayload) return null;
+  if (overheadCache.payload !== wastePayload) overheadCache = { payload: wastePayload, idx: overheadIndex(wastePayload.findings) };
+  return overheadCache.idx;
+}
 function applySessionFilters(sessions) {
+  const idx = wasteIndex();  // a cause filter waits for the findings rather than hiding every row
   return sessions.filter(s => {
     if (sessionFilters.project && !(s.project || '').toLowerCase().includes(sessionFilters.project)) return false;
     if (sessionFilters.branch && !(s.branch || '').toLowerCase().includes(sessionFilters.branch)) return false;
     if (sessionFilters.tool && !(s.tools || []).includes(sessionFilters.tool)) return false;
     if (sessionFilters.hasCacheCreation && !(s.cache_creation > 0)) return false;
+    if (sessionFilters.cause && activeTab === 'sessions' && idx && !(overheadOf(idx, s.full_session_id, sessionFilters.cause) > 0)) return false;
     if (sessionFilters.minCost && sessionCost(s, s.last_date) < sessionFilters.minCost) return false;
     return true;
   });
 }
 
 // ── URL persistence ────────────────────────────────────────────────────────
-function updateURL(hash) {
+// range, tz and models: the filters every screen shares (also the base of every drilldown link).
+function globalParams() {
   const allModels = Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
   const params = new URLSearchParams();
-  if (activeTab !== 'overview') params.set('tab', activeTab);
-  if (activeTab === 'trace' && selectedSessionDetail) params.set('session', selectedSessionDetail.session.session_id);
-  if (activeTab === 'trace' && selectedSessionDetail) writeTraceLink(params, { turn: traceTurn, hl: traceHighlight, why: traceWhy });
   if (selectedRange !== '30d') params.set('range', selectedRange);
   // Omit tz only when it matches the Settings default, so reload restores what is shown.
   if (displayTZ !== (store.get(TZ_KEY) === 'utc' ? 'utc' : 'local')) params.set('tz', displayTZ);
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
+  return params;
+}
+
+// push: a new history entry (a screen change), so Back returns to the screen it came from.
+function updateURL(hash, push = false) {
+  const params = new URLSearchParams();
+  if (activeTab !== 'overview') params.set('tab', activeTab);
+  if (activeTab === 'trace' && selectedSessionDetail) params.set('session', selectedSessionDetail.session.session_id);
+  if (activeTab === 'trace' && selectedSessionDetail) writeTraceLink(params, { turn: traceTurn, hl: traceHighlight, why: traceWhy });
+  // Sessions-list filters and sort ride along on every screen but Trace and extension tabs
+  // (Changes reads ?project=&cause= for itself). The cause key is the Sessions filter on Sessions
+  // and the cause bar on Waste.
+  if (activeTab !== 'trace' && !extTabs.has(activeTab)) {
+    writeSessionState(params, { ...sessionFilters, cause: activeTab === 'sessions' ? sessionFilters.cause : '' },
+      { col: sessionSortCol, dir: sessionSortDir });
+    if (activeTab === 'waste') writeWasteState(params, wasteCause, wasteWeek);
+  }
+  for (const [k, v] of globalParams()) params.set(k, v);
   const search = params.toString() ? '?' + params.toString() : '';
-  history.replaceState(null, '', window.location.pathname + search + (hash ? '#' + hash : ''));
+  history[push ? 'pushState' : 'replaceState'](null, '', window.location.pathname + search + (hash ? '#' + hash : ''));
 }
 
 function readURLSession() {
@@ -563,6 +599,7 @@ function setSessionSort(col) {
     sessionSortDir = 'desc';
   }
   updateSortIcons();
+  updateURL();
   applyFilter();
 }
 
@@ -578,6 +615,11 @@ function sortSessions(sessions) {
     if (sessionSortCol === 'cost') {
       av = sessionCost(a, a.last_date);
       bv = sessionCost(b, b.last_date);
+    } else if (sessionSortCol === 'cache_share') {
+      av = cacheShare(a); bv = cacheShare(b);
+    } else if (sessionSortCol === 'overhead') {
+      const idx = wasteIndex();
+      av = overheadOf(idx, a.full_session_id, sessionFilters.cause); bv = overheadOf(idx, b.full_session_id, sessionFilters.cause);
     } else if (sessionSortCol === 'duration_min') {
       av = parseFloat(a.duration_min) || 0;
       bv = parseFloat(b.duration_min) || 0;
@@ -687,6 +729,7 @@ function aggregate() {
   // Session-list filters (project/branch/tool/...) narrow only the Sessions list; Overview totals
   // and project tables stay on model + range, the same basis as the token charts.
   const filteredSessions = applySessionFilters(rangeFilteredSessions);
+  lastScopeSessions = rangeFilteredSessions;
 
   // Add session counts into modelMap
   for (const s of rangeFilteredSessions) {
@@ -844,20 +887,21 @@ function renderTab(name) {
   if (extTabs.has(name)) { renderExtTab(name); return; }  // own data; not gated on rawData
   if (name === 'settings') { renderPricingEditor(); return; }
   if (name === 'sources') { renderSources(); return; }
+  if (name === 'changes') { renderChanges(document.getElementById('panel-changes')); return; }
   if (name === 'trace') { renderTrace(); return; }
   if (!rawData || !lastTotals) return;
   switch (name) {
     case 'overview':
       document.getElementById('daily-chart-title').textContent = 'Daily Token Usage — ' + RANGE_LABELS[selectedRange];
       document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution — ' + RANGE_LABELS[selectedRange];
-      renderStats(lastTotals);
+      renderStats(lastTotals, lastCostTotals);
+      renderWhereToAct();
       renderDailyChart(lastDaily);
       renderHourlyChart(lastHourlyAgg);
       renderModelChart(lastByModel);
       renderProjectChart(lastByProjectChart);
       renderModelCostTable(lastByModel);
       renderEffortCostTable(lastByEffort);
-      renderCostBreakdown(lastCostTotals);
       renderProjectCostTable(lastByProject);
       renderProjectBranchCostTable(lastByProjectBranch);
       renderToolSection();
@@ -867,6 +911,7 @@ function renderTab(name) {
       // (sessionsLimit) and footer total. Slicing here would cap show-more state
       // and silently collapse an expanded table on a plain tab switch.
       renderSessionsTable(lastFilteredSessions);
+      if (!wastePayload) loadWaste().then(p => { if (p && activeTab === 'sessions') applyFilter(); });  // fills Overhead, applies a cause filter
       renderSessionSignalsTable(lastHotSessions.slice(0, 15));  // fixed top-15, no footer
       break;
     case 'waste':
@@ -930,28 +975,47 @@ function actionRows(s, a, ids, why) {
     `<tr><td class="muted">${link(c, stampOf(c.at))}</td><td>${esc(c.tool || '')}</td><td>${esc(c.file || '')}</td>` +
     `<td class="num">${fmt(c.result_tokens)}</td></tr>`)];
 }
-function nextStepCard(s, fix, why, open, project) {
+// inTrace: the Trace panel shows one session, so no "Open full trace" button and no generic fallback text.
+function nextStepBody(s, fix, why, open, project, inTrace = false) {
   const ev = s.evidence || [], a = s.action, ids = (a ? a.calls : ev).map(e => e.message_id).filter(Boolean);
-  const fullTrace = `<button class="filter-btn" data-session="${esc(s.id)}" data-ids="${esc(ids.join(','))}"` +
+  const fullTrace = inTrace ? '' : `<button class="filter-btn" data-session="${esc(s.id)}" data-ids="${esc(ids.join(','))}"` +
     ` onclick="openSessionDetail(this.dataset.session, this.dataset.ids)">Open full trace</button>`;
   if (a) {
     const [head, rows] = actionRows(s, a, ids, why);
-    return `<tr class="wg-drawer"><td colspan="5"><details${open ? ' open' : ''}><summary class="muted">Next step</summary>` +
+    return `<details${open ? ' open' : ''}><summary class="muted">Next step</summary>` +
       `<p class="wg-title"><strong>${esc(a.title)}</strong></p>` +
       `<div class="wg-rule"><code>${esc(a.rule)}</code> <button class="filter-btn" onclick="navigator.clipboard && navigator.clipboard.writeText(this.previousElementSibling.textContent)">Copy</button></div>` +
       `<table><thead><tr>${head}</tr></thead><tbody>${rows.join('')}</tbody></table>` +
-      `<p class="muted wg-est">Estimate: about ${fmtCostBig(a.est_usd)}. ${esc(a.est_basis)}</p>${project ? recordButton(project, s.cause, a.title) + ' ' : ''}${fullTrace}</details></td></tr>`;
+      `<p class="muted wg-est">Estimate: about ${fmtCostBig(a.est_usd)}. ${esc(a.est_basis)}</p>${project ? recordButton(project, s.cause, a.title) + ' ' : ''}${fullTrace}</details>`;
   }
-  if (s.cause === 'resident_output' || s.cause === 'subagent_preamble')
-    return `<tr class="wg-drawer"><td colspan="5"><details${open ? ' open' : ''}><summary class="muted">Next step</summary>` +
-      `<p>No single call stands out. This is the cost of the work.</p>${fullTrace}</details></td></tr>`;
-  return `<tr class="wg-drawer"><td colspan="5"><details${open ? ' open' : ''}><summary class="muted">Evidence: ${ev.length} call${ev.length === 1 ? '' : 's'}</summary>` +
+  if (!inTrace && (s.cause === 'resident_output' || s.cause === 'subagent_preamble'))
+    return `<details${open ? ' open' : ''}><summary class="muted">Next step</summary>` +
+      `<p>No single call stands out. This is the cost of the work.</p>${fullTrace}</details>`;
+  return `<details${open ? ' open' : ''}><summary class="muted">Evidence: ${ev.length} call${ev.length === 1 ? '' : 's'}</summary>` +
     `<p>${esc(s.detail)}</p><p class="wg-fix"><strong>Fix:</strong> ${esc(fix)}</p>` +
     '<table><thead><tr><th>When</th><th>Tool</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>' +
     ev.map(e => `<tr><td class="muted">${traceLink(s, ids, why, e.message_id, stampOf(e.at))}</td><td>${esc(e.tool || '')}</td>` +
       `<td class="num">${fmt(e.tokens)}</td><td class="num">${fmtCostBig(e.usd)}</td></tr>`).join('') +
     '</tbody></table>' + (s.cause === 'cache_miss_rebuild' ? '<p class="muted">Usual causes:</p><ul>' + CACHE_MISS_CHECKLIST.map(c => `<li>${esc(c)}</li>`).join('') + '</ul>' : '') +
-    `${fullTrace}</details></td></tr>`;
+    `${fullTrace}</details>`;
+}
+function nextStepCard(s, fix, why, open, project) {
+  return `<tr class="wg-drawer"><td colspan="5">${nextStepBody(s, fix, why, open, project)}</td></tr>`;
+}
+// Trace: the causes present in this one session, each with its rule/evidence and calls linking to their turns.
+function sessionFindingsHTML(p, project) {
+  const fs = p && p.findings;
+  if (!fs) return '<p class="muted">Findings unavailable for this session.</p>';
+  if (!fs.length) return '<p class="muted">No attributed overhead found in this session.</p>';
+  const total = fs.reduce((n, f) => n + f.usd, 0);
+  return `<div class="section-title">Findings in this session <span class="muted">· ${fmtCostBig(total)} attributed overhead (lower bound)</span></div>` +
+    fs.map(f => {
+      const label = CAUSE_LABEL[f.cause] || f.cause;
+      return `<div class="finding-block"><div class="finding-head"><span>${esc(label)}</span>${avoidTag(f.cause)}` +
+        `<span class="num">${fmtCostBig(f.usd)}</span><span class="muted">${esc(f.detail)}</span></div>` +
+        (project ? verifySlot(project, f.cause) : '') +
+        nextStepBody({ ...f, id: f.session_id }, f.fix, (label + ': ' + f.detail).slice(0, 200), true, project, true) + '</div>';
+    }).join('');
 }
 
 // Group findings into what a user acts on: a habit = (project, cause), not one session.
@@ -1045,6 +1109,7 @@ const WASTE_PAGE = 25;
 async function setWasteCause(c) {
   wasteCause = wasteCause === c ? null : c;
   wasteShowAll = false;
+  updateURL();
   await renderWasteTab();
   // the bars were re-rendered: put keyboard focus back on the one just activated
   document.querySelector(`.waste-bar[data-cause="${CSS.escape(c)}"]`)?.focus();
@@ -1062,9 +1127,10 @@ let wasteWeek = null;      // heatmap-cell filter: only sessions whose last_date
 async function setWasteCell(c, week) {
   const clear = wasteCause === c && wasteWeek === week;
   wasteCause = clear ? null : c; wasteWeek = clear ? null : week; wasteShowAll = false;
+  updateURL();
   await renderWasteTab();
 }
-function clearWasteWeek() { wasteWeek = null; renderWasteTab(); }
+function clearWasteWeek() { wasteWeek = null; updateURL(); renderWasteTab(); }
 function wasteHeatmap(findings, sessions) {
   const m = causeWeekMatrix(findings, sessions);
   if (m.weeks.length < 1) return '<p class="muted">Nothing to show.</p>';
@@ -1136,12 +1202,13 @@ async function renderWasteTab() {
   // Cause bars: click one to narrow the habits below; click again to clear.
   const top = v.causes.length ? v.causes[0].usd : 0;
   el('waste-bars').innerHTML = v.causes.map(c =>
-    `<button class="waste-bar${wasteCause === c.cause ? ' active' : ''}" data-cause="${esc(c.cause)}" onclick="setWasteCause(this.dataset.cause)"` +
+    `<div class="waste-bar-row"><button class="waste-bar${wasteCause === c.cause ? ' active' : ''}" data-cause="${esc(c.cause)}" onclick="setWasteCause(this.dataset.cause)"` +
     ` aria-pressed="${wasteCause === c.cause}" title="Attribution: ${esc(causeSplit(c))}. Click to show only this cause below.">` +
     `<span class="wb-label">${esc(label(c.cause))} ${avoidTag(c.cause)}</span>` +
     `<span class="wb-track"><span class="wb-fill" style="width:${top ? (100 * c.usd / top).toFixed(1) : 0}%"></span></span>` +
     `<span class="wb-val">${fmtCostBig(c.usd)} <span class="muted">· ${fmtPct(c.share)} · ${c.sessions} session${c.sessions === 1 ? '' : 's'}` +
-    ` · ${splitBadges(c)}</span></span></button>`
+    ` · ${splitBadges(c)}</span></span></button>` +
+    `<a data-drill href="${esc(sessionsByCauseHref(c.cause))}" title="Sessions with this cause, biggest attributed overhead first">Top sessions</a></div>`
   ).join('') || '<p class="muted">Nothing to show.</p>';
 
   // Heatmap shows every week; the week filter only narrows the bars and habits.
@@ -1210,9 +1277,11 @@ function readURLTab() {
 
 function setTab(name, hash) {
   if (!VALID_TABS.includes(name)) name = 'overview';
+  const changed = name !== activeTab;
   activeTab = name;
   applyTabVisibility(name);
-  updateURL(hash);
+  updateURL(hash, changed);
+  if (changed && sessionFilters.cause) aggregate();  // the cause filter narrows Sessions only; other screens re-scope
   renderTab(name);
   gotoSection(hash);
 }
@@ -1224,6 +1293,63 @@ function gotoSection(hash) {
   if (el.tagName === 'DETAILS' && !el.open) { el.open = true; renderTab(activeTab); }
   el.scrollIntoView();
 }
+
+// ── Drilldown navigation ───────────────────────────────────────────────────
+// Sessions filters/sort and the Waste selection live in the URL. A drilldown link is a plain
+// href; a plain click pushes it as a history entry and redraws without a reload, and Back/Forward
+// (popstate) redraw from the URL the same way.
+function setSessionControls(f, sort) {
+  const set = (id, v) => { /** @type {HTMLInputElement} */ (document.getElementById(id)).value = v; };
+  set('session-project-filter', f.project); set('session-branch-filter', f.branch);
+  set('session-tool-filter', f.tool); set('session-min-cost-filter', f.minCost || '');
+  set('session-cause-filter', f.cause);
+  /** @type {HTMLInputElement} */ (document.getElementById('session-cache-filter')).checked = f.hasCacheCreation;
+  sessionSortCol = sort.col; sessionSortDir = sort.dir;
+}
+function applyURLState(tab) {
+  const st = readSessionState(window.location.search), ws = readWasteState(window.location.search);
+  if (tab !== 'sessions') st.filters.cause = '';  // on other screens ?cause= is not a Sessions filter
+  setSessionControls(st.filters, st.sort);
+  readSessionFilters();
+  wasteCause = tab === 'waste' && ws.cause ? ws.cause : null;
+  wasteWeek = tab === 'waste' && ws.week ? ws.week : null;
+  wasteShowAll = false;
+}
+function restoreFromURL() {
+  if (!rawData) return;
+  const { tab, hash } = readURLTab();
+  traceOpenSeq++;  // a trace still loading belongs to the page we are leaving
+  // range, models and time zone too: Back must show what the address bar says
+  selectedRange = readURLRange();
+  markRange(selectedRange);
+  buildFilterUI(rawData.all_models, readURLModels(rawData.all_models));
+  const tz = readURLTZ(), tzChanged = tz !== displayTZ;  // day buckets are server-side: a new zone needs a refetch
+  displayTZ = tz;
+  document.querySelectorAll('.tz-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tz === tz));
+  renderBuildInfo();
+  activeTab = tab;  // before openSessionDetail: its setTab then replaces the entry instead of pushing
+  applyURLState(tab);
+  applyTabVisibility(tab);
+  updateSortIcons();
+  const sessionId = readURLSession();
+  if (tab === 'trace' && sessionId) {
+    const l = readTraceLink(window.location.search);
+    openSessionDetail(sessionId, [...l.hl].join(','), { turn: l.turn, why: l.why });
+    if (tzChanged) loadData();
+    return;
+  }
+  if (tzChanged) loadData(); else applyFilter();
+  gotoSection(hash);
+}
+window.addEventListener('popstate', restoreFromURL);
+document.addEventListener('click', e => {
+  const a = e.target instanceof Element && e.target.closest('a[data-drill]');
+  if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  e.preventDefault();
+  history.pushState(null, '', a.getAttribute('href'));
+  restoreFromURL();
+  window.scrollTo({ top: 0 });
+});
 
 function wireTabs() {
   // Delegated so extension rail items (added before this runs, but still) need no wiring.
@@ -1242,39 +1368,54 @@ function wireTabs() {
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
-function renderStats(t) {
+function renderStats(t, c) {
   const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
+  // Dollars are the first-class metric; token counts ride along in the sub line.
+  const share = v => c.total ? fmtPct(v / c.total) : '0.0%';
+  const cacheShare = c.prompt ? c.cache_tokens / c.prompt : 0;
+  const ccTok = orUnknown(t.cache_creation, t.cache_creation_unknown);
   const stats = [
-    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel },
-    { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
-    { label: 'Input Tokens',   prov: 'official', value: fmt(t.input),                sub: rangeLabel },
-    { label: 'Output Tokens',  prov: 'official', value: fmt(t.output),               sub: rangeLabel },
-    { label: 'Cache Read',     prov: 'official', value: fmt(t.cache_read),           sub: 'from prompt cache' },
-    { label: 'Cache Creation', prov: t.cache_creation_unknown ? 'unknown' : 'official',
-      value: orUnknown(t.cache_creation, t.cache_creation_unknown),
-      sub: t.cache_creation_partial && !t.cache_creation_unknown ? 'writes to prompt cache (Codex not counted)' : 'writes to prompt cache' },
-    { label: 'Est. Cost',      prov: 'local_estimate', value: fmtCostBig(t.cost),          sub: 'API pricing, Nov 2026', color: C.green },
+    { label: 'Est. Cost',      prov: 'local_estimate', value: fmtCostBig(c.total), sub: 'API pricing, Nov 2026 · ' + rangeLabel, color: C.green },
+    { label: 'Input',          prov: 'local_estimate', value: fmtCostBig(c.input),          sub: `${share(c.input)} of cost · ${fmt(t.input)} tok` },
+    { label: 'Output',         prov: 'local_estimate', value: fmtCostBig(c.output),         sub: `${share(c.output)} of cost · ${fmt(t.output)} tok` },
+    { label: 'Cache Read',     prov: 'local_estimate', value: fmtCostBig(c.cache_read),     sub: `${share(c.cache_read)} of cost · ${fmt(t.cache_read)} tok` },
+    { label: 'Cache Creation', prov: 'local_estimate', value: fmtCostBig(c.cache_creation),
+      sub: `${share(c.cache_creation)} of cost · ${ccTok} tok` + (t.cache_creation_partial && !t.cache_creation_unknown ? ' (Codex not counted)' : '') },
+    { label: 'Cache Savings',  prov: 'local_estimate', value: fmtCostBig(c.cache_savings),  hl: fmtPct(cacheShare), sub: 'cache share of prompt' },
+    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: `${fmt(t.turns)} turns · ${rangeLabel}` },
+    { label: 'Attributed overhead', id: 'stat-overhead', prov: 'local_estimate', value: '…', sub: 'lower bound, API list rate',
+      href: drillHref(globalParams(), { tab: 'waste' }) },
   ];
+  // Every card is a link to the view that explains its number, under the same range and model filters.
   document.getElementById('stats-row').innerHTML = stats.map(s => `
-    <div class="stat-card">
+    <a class="stat-card" data-drill${s.id ? ` id="${s.id}"` : ''} href="${esc(s.href || drillHref(globalParams(), { tab: 'sessions', sort: CARD_TARGET[s.label] }))}">
       <div class="label"${s.prov ? ` data-prov="${s.prov}"` : ''}>${s.label}</div>
       <div class="value" style="${s.color ? 'color:' + s.color : ''}">${esc(s.value)}</div>
-      ${s.sub ? `<div class="sub">${esc(s.sub)}</div>` : ''}
-    </div>
+      ${s.sub ? `<div class="sub">${s.hl ? `<span class="hl">${esc(s.hl)}</span> ` : ''}${esc(s.sub)}</div>` : ''}
+    </a>
   `).join('');
 }
 
-function renderCostBreakdown(c) {
-  const cacheShare = c.prompt ? c.cache_tokens / c.prompt : 0;
-  document.getElementById('cost-breakdown-body').innerHTML = `<tr>
-    <td class="cost">${fmtCost(c.input)}</td>
-    <td class="cost">${fmtCost(c.output)}</td>
-    <td class="cost">${fmtCost(c.cache_read)}</td>
-    <td class="cost">${fmtCost(c.cache_creation)}</td>
-    <td class="cost">${fmtCostBig(c.total)}</td>
-    <td class="cost">${fmtCostBig(c.cache_savings)}</td>
-    <td class="num">${fmtPct(cacheShare)}</td>
-  </tr>`;
+const sessionsByCauseHref = cause => drillHref(globalParams(), { tab: 'sessions', filters: { cause }, sort: { col: 'overhead', dir: 'desc' } });
+const wasteCauseHref = cause => drillHref(globalParams(), { tab: 'waste', cause });
+
+// Overview "Where to act": the overhead card and the three biggest causes in scope, from the server's findings.
+async function renderWhereToAct() {
+  const p = await loadWaste();
+  const slot = document.getElementById('where-to-act'), card = document.getElementById('stat-overhead');
+  if (!p || !p.findings || activeTab !== 'overview' || !slot) return;
+  const v = groupWaste(p.findings, lastScopeSessions);
+  const cost = lastScopeSessions.reduce((n, x) => n + sessionCostAtListRates(x, x.last_date), 0);
+  if (card) {
+    card.querySelector('.value').textContent = fmtCostBig(v.total);
+    card.querySelector('.sub').textContent = `${fmtPct(cost ? v.total / cost : 0)} of cost at list rate · lower bound`;
+  }
+  slot.innerHTML = v.causes.length
+    ? '<div class="wta-head">Where to act: top causes of attributed overhead (lower bound, not savings)</div>' +
+      v.causes.slice(0, 3).map(c => `<a class="wta-row" data-drill href="${esc(wasteCauseHref(c.cause))}">` +
+        `<span>${esc(CAUSE_LABEL[c.cause] || c.cause)} ${avoidTag(c.cause)}</span><span class="num">${fmtCostBig(c.usd)}</span>` +
+        `<span class="muted">${c.sessions} session${c.sessions === 1 ? '' : 's'}</span></a>`).join('')
+    : '';
 }
 
 // Bucket rows into 24 hours (display-TZ), summing turns + output, and count
@@ -1538,7 +1679,14 @@ function costCellHTML(model, cost) {
   return `<td class="cost-na">n/a</td>`;
 }
 
+// Attributed overhead of a session (server $, API list rate): the selected cause's share, else all causes.
+function overheadCell(s, idx) {
+  if (!idx) return '<td class="num muted">…</td>';
+  const v = overheadOf(idx, s.full_session_id, sessionFilters.cause);
+  return v ? `<td class="num" title="Attributed overhead, a lower bound at API list rate">${fmtCostBig(v)}</td>` : '<td class="num muted">–</td>';
+}
 function renderSessionsTable(sessions) {
+  const idx = wasteIndex();
   const shown = sessions.slice(0, sessionsLimit);
   document.getElementById('sessions-body').innerHTML = shown.map(s => {
     const cell = costCellHTML(s.model, sessionCost(s, s.last_date));
@@ -1558,6 +1706,8 @@ function renderSessionsTable(sessions) {
       <td class="num">${fmt(s.cache_read)}</td>
       <td class="num"${isEstimated(s.model) ? ' title="Codex reports no cache-write tokens: unknown, not zero"' : ''}>${orUnknown(s.cache_creation, isEstimated(s.model))}</td>
       ${cell}
+      <td class="num">${fmtPct(cacheShare(s))}</td>
+      ${overheadCell(s, idx)}
     </tr>`;
   }).join('');
   renderTableToggle('sessions-foot', sessions.length, sessionsLimit, 'lessSessionRows', 'moreSessionRows', 'exportSessionsCSV');
@@ -1940,6 +2090,23 @@ function renderSessionDetail(d) {
   renderSessionToolBreakdown(turnsOfBand(d.turns, traceBand).map(x => x.t));
   renderSessionWaterfall(d);
   renderSessionTimeline(d.turns);
+  renderSessionFindings(d);
+}
+
+// One request per session per data load; the panel redraws from it when bands or zoom re-render the detail.
+const sessionFindings = new Map();
+async function renderSessionFindings(d) {
+  const box = document.getElementById('session-findings'), id = d.session.session_id;
+  if (box.dataset.session !== id) { box.dataset.session = id; box.classList.add('hidden'); box.innerHTML = ''; }  // never show the last session's buttons
+  if (!sessionFindings.has(id)) sessionFindings.set(id, fetchSessionWaste(id).catch(() => null));
+  const req = sessionFindings.get(id);
+  const p = await req;
+  if (!p && sessionFindings.get(id) === req) sessionFindings.delete(id);
+  if (sessionFindings.get(id) !== req && p) return;  // the data reloaded meanwhile: its own request draws
+  if (!selectedSessionDetail || selectedSessionDetail.session.session_id !== id) return;  // another session opened meanwhile
+  box.classList.remove('hidden');
+  box.innerHTML = sessionFindingsHTML(p, d.session.project);
+  fillVerifySlots(box);
 }
 
 // ── Trace: request bands and cost waterfall ──────────────────
@@ -2690,7 +2857,9 @@ async function loadData() {
       buildFilterUI(d.all_models, new Set(wasAll ? d.all_models : d.all_models.filter(m => selectedModels.has(m))));
     }
     rawData = d;
+    document.body.classList.remove('booting');
     wastePayload = null;  // findings follow the data: refetch on the next Waste render
+    sessionFindings.clear();
     wasteGen++;
     renderMeta();
 
@@ -2702,9 +2871,7 @@ async function loadData() {
       applyTabVisibility(activeTab);
       // Restore range from URL, mark active button
       selectedRange = readURLRange();
-      document.querySelectorAll('.range-btn[data-range]').forEach(btn =>
-        btn.classList.toggle('active', btn.dataset.range === selectedRange)
-      );
+      markRange(selectedRange);
       // Mark the active TZ button (displayTZ was read from the URL pre-fetch)
       document.querySelectorAll('.tz-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.tz === displayTZ)
@@ -2712,7 +2879,9 @@ async function loadData() {
       // Build model filter (reads URL for model selection too)
       buildFilterUI(d.all_models);
       buildSessionFilterUI(d.sessions_all || []);
-      readSessionFilters();
+      applyURLState(activeTab);
+      // a cause filter or an overhead sort needs the findings before the first draw
+      if (sessionFilters.cause || sessionSortCol === 'overhead') await loadWaste();
       updateSortIcons();
       updateModelSortIcons();
       updateProjectSortIcons();
@@ -2811,6 +2980,7 @@ async function init() {
   const bar = document.getElementById('filter-bar');
   if (bar && 'ResizeObserver' in window) new ResizeObserver(() =>
     document.documentElement.style.setProperty('--filter-bar-h', bar.offsetHeight + 'px')).observe(bar);
+  applyTabVisibility(readURLTab().tab);  // show the landing tab's skeleton, not Overview, while data loads
   loadData();
   refreshStatus();
   scheduleAutoRefresh();

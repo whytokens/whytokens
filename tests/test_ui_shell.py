@@ -118,9 +118,9 @@ class TestNavigation(unittest.TestCase):
     def test_tz_omitted_only_when_it_matches_the_default(self):
         self.assertIn("if (displayTZ !== (store.get(TZ_KEY)", APP_JS)
 
-    def test_six_screens_in_rail_order(self):
+    def test_screens_in_rail_order(self):
         ids = re.findall(r"'(\w+)'", re.search(r"VALID_TABS = \[(.*?)\]", NAV_JS).group(1))
-        self.assertEqual(ids, ["overview", "sessions", "trace", "waste", "sources", "settings"])
+        self.assertEqual(ids, ["overview", "sessions", "trace", "waste", "changes", "sources", "settings"])
 
     def test_deep_link_hash_and_session_survive_url_rewrite(self):
         self.assertIn("(hash ? '#' + hash : '')", APP_JS)
@@ -145,7 +145,7 @@ class TestRailAccessibility(unittest.TestCase):
 
     def test_every_rail_item_has_name_and_tooltip(self):
         items = re.findall(r'<button class="tab-btn" id="tab-[^>]*>', HTML)
-        self.assertEqual(len(items), 6)
+        self.assertEqual(len(items), 7)
         for tag in items:
             self.assertRegex(tag, r'aria-label="[^"]+"')
             self.assertRegex(tag, r'title="[^"]+"')

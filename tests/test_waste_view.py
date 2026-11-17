@@ -100,7 +100,7 @@ class TestWasteMarkup(unittest.TestCase):
             self.assertTrue(needle in _HTML, needle)
         self.assertTrue("setWasteCause," in _SRC, "setWasteCause export")  # inline handlers need the window export
         # range buttons only: setRange must not clear the timeline's own toggle buttons
-        self.assertEqual(_SRC.count("querySelectorAll('.range-btn[data-range]')"), 2, "both range toggles scoped")
+        self.assertEqual(_SRC.count("querySelectorAll('.range-btn[data-range]')"), 1, "the one range toggle helper is scoped")
         self.assertFalse("querySelectorAll('.range-btn')" in _SRC, "an unscoped .range-btn toggle remains")
 
 
@@ -114,7 +114,7 @@ class TestWasteCopy(unittest.TestCase):
         block = _SRC[_SRC.index("const CAUSE_AVOID = {"):_SRC.index("const avoidTag")]
         self.assertEqual(set(re.findall(r"^  (\w+): \[", block, re.M)), set(waste.CAUSES))
         self.assertIn("'partly avoidable'", block)
-        self.assertEqual(_SRC.count("avoidTag(g.cause)") + _SRC.count("avoidTag(c.cause)"), 2, "tag on bars and habits")
+        self.assertEqual(_SRC.count("avoidTag(g.cause)") + _SRC.count("avoidTag(c.cause)"), 3, "tag on bars, habits and the Overview strip")
 
     def test_headline(self):
         self.assertNotIn("attributed to waste", _SRC)

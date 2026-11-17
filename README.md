@@ -56,6 +56,7 @@ python cli.py dashboard       # python3 on macOS/Linux
 | Sessions | Filterable session table with cost, model, tokens; expensive-session signals; CSV export |
 | Trace | One session turn by turn; a finding links straight to the turn that caused it |
 | Waste | Spend attributed to avoidable causes by cause, week and project, with observed/inferred badges. Each finding opens a next-step card: the rule to paste, the calls that cost the most, a lower-bound estimate, and an "I made this change" button that records the fix and checks back later |
+| Changes | Record a change you made to a habit (project, cause, date, note), then see it wait for 10 sessions and read Reduced, No material change or Increased, with before and after share bars. Edit a date or note, or delete a mistake. Before 10 sessions on each side the numbers are a preview, never a result |
 | Sources | Which log locations were found and how many sessions came from each |
 | Settings | Editable price table, timezone, theme |
 
@@ -79,8 +80,8 @@ Each command below can be run as `whytokens <command>` or `python cli.py <comman
 | `stats` | All-time statistics |
 | `live [--session ID] [--cwd PATH] [--json]` | Current session's cost, context and tokens straight from its transcript, no database |
 | `waste [--session ID]` | Avoidable-spend findings with a concrete fix each |
-| `fix record --project P --cause C --note TEXT [--date D] [--file PATH]`, `fix list` | Record a waste fix you made (optionally hashing the CLAUDE.md or config file you changed) |
-| `verify [FIX_ID]` | Attributed share of spend for the fix's project and cause, after versus before, with dollars. Needs 10 sessions on each side or it prints "insufficient data". Quality is not measured |
+| `fix record --project P --cause C --note TEXT [--date D] [--file PATH]`, `fix list`, `fix edit ID [--date D] [--note TEXT]`, `fix delete ID` | The terminal twin of the dashboard's **Changes** tab (record a change you made, list, correct, delete; the tab is the main way to do it). `--file` hashes the CLAUDE.md or config file you changed. A date cannot be in the future |
+| `verify [FIX_ID]` | Attributed share of spend for the fix's project and cause, after versus before, with dollars. Needs 10 sessions on each side or it prints "insufficient data"; the Changes tab shows the same numbers as Waiting, Not enough history before, Reduced, No material change or Increased, and only the last three are results. Quality is not measured |
 | `pricing check [--offline]` | Review diff of the shipped price table against LiteLLM (OpenRouter cross-check). Never applied automatically; `--offline` uses the cache |
 | `dashboard [--projects-dir PATH] [--host HOST] [--port PORT] [--no-browser] [--unsafe-host]` | Scan, then serve the dashboard |
 

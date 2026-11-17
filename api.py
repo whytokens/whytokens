@@ -23,13 +23,17 @@ Routes:
   GET  <extension routes>      -> consulted after the core routes above
   GET  /api/live?session_id|cwd -> get_live_session()  (transcript-direct, no DB)
   GET  /api/waste              -> waste findings, rollup, measurement status (API list rate)
+  GET  /api/waste?session_id=  -> that one session's findings (Trace "Findings in this session")
   GET  /api/fixes              -> recorded fixes with before/after verification
   GET  /api/provenance         -> provenance labels + tooltips (provenance.LABELS)
   GET  /api/version            -> version.INFO {version, commit, started_at}
   GET  /api/pricing            -> the single-source pricing table (pricing.PRICING)
   GET  /api/pricing/fallbacks  -> models in the DB with no price row of their own
   GET  /icon.svg               -> resources/icon.svg (header icon)
-  POST /api/fixes              -> record a fix {project, cause, note}; returns its verification
+  POST /api/fixes              -> record a fix {project, cause, note[, date]}; returns its verification
+  GET  /api/changes            -> Changes tab: fixes with status/ETA, project and cause pick-lists
+  POST /api/fixes/edit         -> {id[, date][, note]}
+  POST /api/fixes/delete       -> {id}
   POST /api/rescan             -> incremental sources.scan_all() (non-destructive)
 """
 
@@ -41,7 +45,7 @@ import re
 import sqlite3
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime
 from urllib.parse import parse_qs, urlparse
 
 import config
@@ -686,7 +690,7 @@ def get_session_detail(session_id, db_path=None):
 
 
 def post_fix(payload, db_path=None):
-    """Record a fix dated today (the CLI's `fix record`) and return its verification. An already recorded
+    """Record a fix, dated today unless payload["date"] is given (the CLI's `fix record`), and return its verification. An already recorded
     (project, cause, note) writes nothing and comes back with "duplicate": true.
     Raises ValueError on a bad payload, unknown cause or unknown project; nothing is written then."""
     import fixes
@@ -696,6 +700,11 @@ def post_fix(payload, db_path=None):
     project, cause, note = payload.get("project"), payload.get("cause"), payload.get("note", "")
     if not isinstance(project, str) or not isinstance(cause, str) or not isinstance(note, str):
         raise ValueError("project, cause and note must be strings")
+    when = payload.get("date")
+    if when is not None and not isinstance(when, str):
+        raise ValueError("date must be a string")
+    if not note.strip():
+        raise ValueError("note is required")
     db_path = db_path or DB_PATH
     if not Path(db_path).exists():
         raise ValueError(f"unknown project {project!r}")
@@ -703,7 +712,7 @@ def post_fix(payload, db_path=None):
     conn.row_factory = sqlite3.Row
     try:
         init_db(conn)
-        fid, duplicate = fixes.record_fix_once(conn, project, cause, note)
+        fid, duplicate = fixes.record_fix_once(conn, project, cause, note.strip(), when)
         fix = next(f for f in fixes.list_fixes(conn) if f["id"] == fid)
     finally:
         conn.close()
@@ -726,15 +735,99 @@ def get_fixes(db_path=None):
     return {"results": [fixes.verify(db_path, f) for f in listed]}
 
 
-def get_waste(db_path=None):
-    """Waste tab payload: findings, per-cause rollup, measurement status, one pricing basis."""
+def get_changes(db_path=None):
+    """Changes tab payload: every fix newest first with state/ETA, plus the form's pick-lists."""
+    import fixes
+    db_path = db_path or DB_PATH
+    out = {"changes": [], "projects": [], "causes": [{"id": c, "label": fixes.CAUSE_LABELS.get(c, c)} for c in fixes.waste.CAUSES],
+           "today": date.today().isoformat(), "min_sessions": fixes.MIN_SESSIONS, "caveat": fixes.CAVEAT}
+    if not Path(db_path).exists():
+        return out
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        has = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'fixes'").fetchone()
+        listed = fixes.list_fixes(conn) if has else []
+        out["projects"] = [r[0] for r in conn.execute(
+            "SELECT DISTINCT project_name FROM sessions WHERE project_name IS NOT NULL AND project_name != '' "
+            "AND COALESCE(agent, 'claude') = 'claude' ORDER BY project_name")]
+    finally:
+        conn.close()
+    out["changes"] = [fixes.change_view(db_path, f) for f in sorted(listed, key=lambda f: (f["fix_date"], f["id"]), reverse=True)]
+    return out
+
+
+def _fix_conn(payload, db_path):
+    from scanner import init_db
+    if not isinstance(payload, dict) or isinstance(payload.get("id"), bool) or not isinstance(payload.get("id"), int):
+        raise ValueError("id must be an integer")
+    db_path = db_path or DB_PATH
+    if not Path(db_path).exists():
+        raise ValueError(f"no fix #{payload['id']}")
+    conn = sqlite3.connect(str(db_path))
+    init_db(conn)
+    return conn
+
+
+def post_fix_edit(payload, db_path=None):
+    """Change a recorded fix's date and/or note. ValueError (bad id, date, empty or duplicate note) writes nothing."""
+    import fixes
+    if not isinstance(payload, dict):
+        raise ValueError("body must be a JSON object")
+    when, note = payload.get("date"), payload.get("note")
+    if not (when is None or isinstance(when, str)) or not (note is None or isinstance(note, str)):
+        raise ValueError("date and note must be strings")
+    conn = _fix_conn(payload, db_path)
+    try:
+        fixes.update_fix(conn, payload["id"], when, note)
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+def post_fix_delete(payload, db_path=None):
+    import fixes
+    conn = _fix_conn(payload, db_path)
+    try:
+        fixes.delete_fix(conn, payload["id"])
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+_waste_cache = None  # (db state key, payload)
+
+
+def _stat_or_none(path):
+    try:
+        return path.stat()
+    except OSError:
+        return None
+
+
+def get_waste(db_path=None, session_id=None):
+    """Waste tab payload: findings, per-cause rollup, measurement status, one pricing basis.
+    With ``session_id``: just that session's findings (the Trace panel), uncached."""
     import waste
     if db_path is None:
         db_path = DB_PATH
+    if session_id:
+        found = waste.report(db_path, session_id=session_id) if Path(db_path).exists() else []
+        return {"basis": waste.BASIS, "session_id": session_id, "findings": found,
+                "total_usd": sum(f["usd"] for f in found)}
     if not Path(db_path).exists():
         return {"basis": waste.BASIS, "findings": [], "rollup": [], "total_usd": 0.0,
                 "measurement": {"sources": [], "causes": {}}}
-    # ponytail: whole-DB report per request; add a date filter / cache if a large corpus is slow
+    # A pure function of the DB (list-rate pricing, no overrides), so cache it per DB state.
+    # WAL writes leave the main file untouched until checkpoint, hence the -wal stat too
+    # (an empty -wal counts as absent: a read-only connect creates one).
+    # ponytail: single-entry cache, no lock; two racing first requests both compute, harmless.
+    global _waste_cache
+    key = (str(Path(db_path).resolve()),) + tuple(
+        (st.st_mtime_ns, st.st_size) if (st := _stat_or_none(f)) and st.st_size else None
+        for f in (Path(db_path), Path(str(db_path) + "-wal")))
+    if _waste_cache and _waste_cache[0] == key:
+        return _waste_cache[1]
     findings = waste.report(db_path)
     rollup = {}
     for f in findings:
@@ -745,9 +838,11 @@ def get_waste(db_path=None):
         r[f["attribution"] + "_usd"] += f["usd"]  # a mixed cause keeps both halves
         if r["tier"] != f["tier"]:
             r["tier"] = "inferred"  # mixed sources: the weaker tier, kept for old readers
-    return {"basis": waste.BASIS, "findings": findings, "total_usd": sum(f["usd"] for f in findings),
+    payload = {"basis": waste.BASIS, "findings": findings, "total_usd": sum(f["usd"] for f in findings),
             "rollup": sorted(rollup.values(), key=lambda r: r["usd"], reverse=True),
             "measurement": waste.measurement(db_path)}
+    _waste_cache = (key, payload)
+    return payload
 
 
 EXPORT_SCHEMA_VERSION = 1
@@ -1293,10 +1388,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(get_status())
 
         elif path == "/api/waste":
-            self._send_json(get_waste())
+            self._send_json(get_waste(session_id=_qs1(parse_qs(parsed.query), "session_id")))
 
         elif path == "/api/fixes":
             self._send_json(get_fixes())
+        elif path == "/api/changes":
+            self._send_json(get_changes())
 
         elif path == "/api/provenance":
             self._send_json(provenance.LABELS)  # label vocabulary + tooltips
@@ -1347,7 +1444,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self._guard(post=True):
             return
         path = urlparse(self.path).path
-        if path == "/api/fixes":
+        if path in ("/api/fixes", "/api/fixes/edit", "/api/fixes/delete"):
+            handler = {"/api/fixes": post_fix, "/api/fixes/edit": post_fix_edit, "/api/fixes/delete": post_fix_delete}[path]
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 if not 0 < n <= 65536:
@@ -1355,7 +1453,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 raw = self.rfile.read(n)
                 if len(raw) != n:
                     raise ValueError("incomplete body")
-                self._send_json(post_fix(json.loads(raw)))
+                self._send_json(handler(json.loads(raw)))
             except (ValueError, RecursionError) as e:  # ValueError includes json.JSONDecodeError
                 self._send_json({"error": str(e)}, status=400)
             return

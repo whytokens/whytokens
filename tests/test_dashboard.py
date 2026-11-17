@@ -822,7 +822,7 @@ class TestStaticAssets(unittest.TestCase):
         self.assertIn('id="session-detail-view"', INDEX_HTML)
         self.assertIn('id="chart-session-timeline"', INDEX_HTML)
         self.assertIn('id="session-tool-breakdown-body"', INDEX_HTML)
-        self.assertIn('id="cost-breakdown-body"', INDEX_HTML)
+        self.assertNotIn('id="cost-breakdown-body"', INDEX_HTML)  # folded into stat cards
         self.assertIn('id="tool-cost-body"', INDEX_HTML)
         self.assertIn('id="session-signals-body"', INDEX_HTML)
         self.assertIn("function openSessionDetail(", APP_JS)
@@ -913,10 +913,10 @@ class TestTabbedLayout(unittest.TestCase):
         self.assertIn("VALID_TABS", APP_JS)
 
     def test_secondary_tables_are_collapsible(self):
-        """Cost Breakdown, Session Signals, and Project & Branch are <details>."""
+        """Session Signals and Project & Branch are <details>."""
         self.assertIn('<details class="table-card collapsible">', INDEX_HTML)
         # The collapsibles still carry their original tbody ids.
-        for body in ("cost-breakdown-body", "session-signals-body",
+        for body in ("session-signals-body",
                      "project-branch-cost-body"):
             self.assertIn(f'id="{body}"', INDEX_HTML)
 

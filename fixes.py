@@ -8,7 +8,8 @@ at least MIN_SESSIONS sessions per side. Quality is not measured.
 
 import hashlib
 import sqlite3
-from datetime import date, datetime
+import math
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -22,6 +23,24 @@ CAVEAT = ("Quality is not measured: a lower waste share can also mean less work 
           "mix of work, not only a better habit.")
 
 
+# Human labels for waste.CAUSES, served to the Changes tab (the Waste tab keeps its own copy in JS).
+CAUSE_LABELS = {
+    "resident_output": "Tool output kept in context", "repeated_reads": "Repeated file reads",
+    "subagent_preamble": "Subagent preambles", "idle_gap": "Idle gaps (cache expiry)",
+    "uncached_input": "Uncached input", "cache_miss_rebuild": "Unexpected cache misses",
+    "deferred_tool_load": "Deferred tool schemas kept in context",
+}
+RATE_DAYS = 28  # window for a project's recent session pace
+
+
+def _canon_date(when, today=None):
+    """YYYY-MM-DD, canonical; malformed or future dates raise ValueError."""
+    when = date.fromisoformat(when).isoformat()  # fromisoformat reads 20260901 natively
+    if when > (today or date.today()).isoformat():
+        raise ValueError(f"date {when} is in the future")
+    return when
+
+
 def file_hash(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -30,9 +49,7 @@ def record_fix(conn, project, cause, note, when=None, file_path=None):
     """Store a fix. ``when`` is YYYY-MM-DD (default today). Returns the new id."""
     if cause not in waste.CAUSES:
         raise ValueError(f"unknown cause {cause!r}; one of {', '.join(waste.CAUSES)}")
-    when = when or date.today().isoformat()
-    # Reject malformed, store canonical (compared as text). fromisoformat reads 20260901 natively.
-    when = date.fromisoformat(when).isoformat()
+    when = _canon_date(when or date.today().isoformat())
     if not conn.execute("SELECT 1 FROM sessions WHERE project_name = ? LIMIT 1", (project,)).fetchone():
         raise ValueError(f"unknown project {project!r}")
     cur = conn.execute(
@@ -43,10 +60,12 @@ def record_fix(conn, project, cause, note, when=None, file_path=None):
     return cur.lastrowid
 
 
-def record_fix_once(conn, project, cause, note):
+def record_fix_once(conn, project, cause, note, when=None):
     """record_fix unless this (project, cause, note) is already recorded. Returns (id, duplicate).
     The check and the insert share one write transaction, so concurrent callers record it once."""
     conn.commit()
+    if when is not None:
+        _canon_date(when)  # a bad or future date is an error even when the change already exists
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute("SELECT id FROM fixes WHERE project = ? AND cause = ? AND note = ? ORDER BY id LIMIT 1",
@@ -54,7 +73,7 @@ def record_fix_once(conn, project, cause, note):
         if row:
             conn.rollback()
             return row[0], True
-        return record_fix(conn, project, cause, note), False  # commits
+        return record_fix(conn, project, cause, note, when), False  # commits
     except BaseException:
         conn.rollback()
         raise
@@ -63,6 +82,40 @@ def record_fix_once(conn, project, cause, note):
 def list_fixes(conn):
     return [dict(r) for r in conn.execute(
         "SELECT id, fix_date, project, cause, note, file_hash, recorded_at FROM fixes ORDER BY id")]
+
+
+def update_fix(conn, fid, when=None, note=None):
+    """Change a fix's date and/or note. The note stays required and (project, cause, note) stays unique.
+    Read, duplicate check and write share one write transaction, so concurrent edits cannot both pass."""
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _update_fix(conn, fid, when, note)
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _update_fix(conn, fid, when, note):
+    row = conn.execute("SELECT project, cause, fix_date, note FROM fixes WHERE id = ?", (fid,)).fetchone()
+    if not row:
+        raise ValueError(f"no fix #{fid}")
+    project, cause, old_when, old_note = row
+    when = _canon_date(when) if when is not None else old_when
+    note = old_note if note is None else note.strip()
+    if not note:
+        raise ValueError("note is required")
+    if conn.execute("SELECT 1 FROM fixes WHERE project = ? AND cause = ? AND note = ? AND id != ?",
+                    (project, cause, note, fid)).fetchone():
+        raise ValueError("another change already has this project, cause and note")
+    conn.execute("UPDATE fixes SET fix_date = ?, note = ? WHERE id = ?", (when, note, fid))
+    conn.commit()
+
+
+def delete_fix(conn, fid):
+    if not conn.execute("DELETE FROM fixes WHERE id = ?", (fid,)).rowcount:
+        raise ValueError(f"no fix #{fid}")
+    conn.commit()
 
 
 def _session_totals(conn):
@@ -113,6 +166,41 @@ def verify(db_path, fix):
     if out["status"] == "reduced":
         out["saving_usd"] = delta * after["usd"]  # after-period spend at the old share, minus the actual
     return out
+
+
+def _recent_rate(db_path, project, today):
+    """Sessions per day over the last RATE_DAYS days in this project (claude agent)."""
+    conn = sqlite3.connect(f"file:{quote(Path(db_path).resolve().as_posix(), safe='/:')}?mode=ro", uri=True)
+    try:
+        since = (today - timedelta(days=RATE_DAYS)).isoformat()
+        n = conn.execute("""SELECT COUNT(*) FROM sessions WHERE project_name = ? AND COALESCE(agent, 'claude') = 'claude'
+                            AND first_timestamp IS NOT NULL
+                            AND COALESCE(date(first_timestamp, 'localtime'), substr(first_timestamp, 1, 10)) >= ?""",
+                         (project, since)).fetchone()[0]
+    finally:
+        conn.close()
+    return n / RATE_DAYS
+
+
+def change_view(db_path, fix, today=None):
+    """verify() plus what the Changes tab shows. ``state`` is one of waiting / no_history / reduced /
+    no_change / increased. A verdict state needs MIN_SESSIONS on both sides (verify's rule, unchanged);
+    otherwise ``interim`` is true and the numbers are a preview, never a result."""
+    today = today or date.today()
+    r = verify(db_path, fix)
+    b, a = r["before"]["sessions"], r["after"]["sessions"]
+    r["interim"] = r["status"] == "insufficient data"
+    r["eta_days"] = None
+    if b < MIN_SESSIONS:
+        r["state"] = "no_history"
+    elif a < MIN_SESSIONS:
+        r["state"] = "waiting"
+        rate = _recent_rate(db_path, fix["project"], today)
+        r["eta_days"] = math.ceil((MIN_SESSIONS - a) / rate) if rate > 0 else None
+    else:
+        r["state"] = {"reduced": "reduced", "no material change": "no_change", "increased": "increased"}[r["status"]]
+    r["cause_label"] = CAUSE_LABELS.get(fix["cause"], fix["cause"])
+    return r
 
 
 def format_result(r):

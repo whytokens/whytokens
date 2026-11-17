@@ -14,6 +14,7 @@ export function verifySlot(project, cause) {
   return `<div class="wg-verify muted" data-vproject="${esc(project)}" data-vcause="${esc(cause)}"></div>`;
 }
 
+const SEE_ALL = '<p><a href="?tab=changes">See all changes</a></p>';
 const side = s => `${s.sessions} sessions, ${fmtCostBig(s.cause_usd)} of ${fmtCostBig(s.usd)} = ${(s.pct * 100).toFixed(1)}%`;
 
 /** The card's "I made this change" button; the note recorded is the rule title. */
@@ -47,13 +48,13 @@ export async function recordFix(btn) {
 function describe(r) {
   const f = r.fix, min = r.min_sessions || 10;
   if (r.status === 'insufficient data' && r.after.sessions < min)
-    return `<p><strong>Recorded ${esc(f.fix_date)}:</strong> ${esc(f.note)}. ${r.after.sessions} of ${min} sessions since. Check back.</p>`;
+    return `<p><strong>Recorded ${esc(f.fix_date)}:</strong> ${esc(f.note)}. ${r.after.sessions} of ${min} sessions since. Check back.</p>` + SEE_ALL;
   let h = `<p><strong>Verify</strong> fix #${f.id} (${esc(f.fix_date)}): ${esc(f.note)}<br>` +
     `before: ${side(r.before)}<br>after: ${side(r.after)}<br><em>${esc(r.status)}</em>`;
   if (r.reason) h += `: ${esc(r.reason)}`;
   if (r.status === 'no material change') h += ': try the next call on the list';
   if (r.status === 'reduced') h += `: about ${fmtCostBig(r.saving_usd)} less over the after period (${esc(r.basis)})`;
-  return h + `<br>${esc(r.caveat)}</p>`;
+  return h + `<br>${esc(r.caveat)}</p>` + SEE_ALL;
 }
 
 export async function fillVerifySlots(root) {
@@ -68,6 +69,6 @@ export async function fillVerifySlots(root) {
   for (const slot of slots) {
     const mine = results.filter(r => r.fix.project === slot.dataset.vproject && r.fix.cause === slot.dataset.vcause);
     slot.innerHTML = mine.length ? mine.map(describe).join('')
-      : `<p>No fix recorded yet. From a terminal instead: <code>${esc(recordHint(slot.dataset.vproject, slot.dataset.vcause))}</code></p>`;
+      : `<p>No fix recorded yet. From a terminal instead: <code>${esc(recordHint(slot.dataset.vproject, slot.dataset.vcause))}</code></p>` + SEE_ALL;
   }
 }

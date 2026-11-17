@@ -92,3 +92,9 @@ export async function fetchStatus() {
   const resp = await fetch('/api/status');
   return resp.json();
 }
+
+/** GET /api/waste?session_id= — one session's findings (the Trace "Findings in this session" panel). */
+export async function fetchSessionWaste(sessionId) {
+  const resp = await fetch('/api/waste?session_id=' + encodeURIComponent(sessionId));
+  return resp.json();
+}

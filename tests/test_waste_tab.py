@@ -241,3 +241,25 @@ class TestVerifyWording(unittest.TestCase):
         out = subprocess.run(["node", "-e", _VERIFY % {"SRC": src}], capture_output=True, text=True, timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stdout.strip(), "ok")
+
+
+class TestWasteCache(_Scanned):
+    """/api/waste is ~5s on a real corpus: computed once per DB state, recomputed after a write."""
+
+    def test_cached_until_db_changes(self):
+        calls = []
+        real = waste.report
+        waste.report = lambda *a, **k: calls.append(1) or real(*a, **k)
+        try:
+            first = api.get_waste(db_path=self.db)
+            api.get_waste(db_path=self.db)
+            self.assertEqual(len(calls), 1, "second call with an unchanged DB must hit the cache")
+            conn = sqlite3.connect(self.db)
+            conn.execute("DELETE FROM turns WHERE session_id = ?", (first["findings"][0]["session_id"],))
+            conn.commit()
+            conn.close()
+            after = api.get_waste(db_path=self.db)
+            self.assertEqual(len(calls), 2, "a DB write must invalidate the cache")
+            self.assertLess(len(after["findings"]), len(first["findings"]))
+        finally:
+            waste.report = real

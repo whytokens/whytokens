@@ -510,6 +510,8 @@ Usage:
   whytokens fix record --project P --cause C --note TEXT [--date YYYY-MM-DD] [--file PATH]
                                          Record a waste fix (--file stores a hash of the CLAUDE.md/config changed)
   whytokens fix list                     List recorded fixes
+  whytokens fix edit ID [--date D] [--note TEXT]   Correct a fix's date or note
+  whytokens fix delete ID                Remove a recorded fix
   whytokens verify [FIX_ID]              Attributed share of spend for the fix's (project, cause),
                                              after vs before; needs 10 sessions each side
   whytokens pricing check [--offline]    Review diff of the shipped price table vs LiteLLM (OpenRouter
@@ -538,8 +540,23 @@ def cmd_fix(rest):
         elif sub == "list":
             for f in fixes.list_fixes(conn):
                 print(f"#{f['id']} {f['fix_date']} {f['project']} / {f['cause']}: {f['note']}")
+        elif sub in ("edit", "delete"):
+            try:
+                fid = int(rest[1])
+                if sub == "delete":
+                    fixes.delete_fix(conn, fid)
+                    print(f"deleted fix #{fid}")
+                else:
+                    when, note = parse_named_arg(rest, "--date"), parse_named_arg(rest, "--note")
+                    if when is None and note is None:
+                        raise ValueError("give --date and/or --note")
+                    fixes.update_fix(conn, fid, when, note)
+                    print(f"updated fix #{fid}")
+            except (IndexError, ValueError) as e:
+                print(f"error: {e}" if not isinstance(e, IndexError) else f"usage: whytokens fix {sub} ID ...")
+                sys.exit(2)
         else:
-            print("usage: whytokens fix record|list ...")
+            print("usage: whytokens fix record|list|edit|delete ...")
             sys.exit(2)
     finally:
         conn.close()

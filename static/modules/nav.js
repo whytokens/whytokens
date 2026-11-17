@@ -4,7 +4,7 @@
 import { store, RAIL_KEY } from './theme.js';
 
 // Rail order. Extension tabs are pushed after these by app.js loadExtensionTabs().
-export const VALID_TABS = ['overview', 'sessions', 'trace', 'waste', 'sources', 'settings'];
+export const VALID_TABS = ['overview', 'sessions', 'trace', 'waste', 'changes', 'sources', 'settings'];
 // Folded screens (mapping.md): old ?tab= ids land on a section of a new screen.
 export const LEGACY_TABS = {
   projects: { tab: 'overview', hash: 'projects' },
@@ -12,7 +12,7 @@ export const LEGACY_TABS = {
   pricing: { tab: 'settings', hash: 'pricing' },
 };
 // Screens that ignore the filter bar hide it.
-export const NO_FILTER_TABS = ['settings', 'sources'];
+export const NO_FILTER_TABS = ['settings', 'sources', 'changes'];
 
 /** ?tab= value (+ current hash) -> { tab, hash } with legacy ids redirected. */
 export function resolveTab(param, hash) {
