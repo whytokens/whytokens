@@ -33,6 +33,8 @@ Routes:
   GET  /api/budget             -> budget.month_status(): this calendar month vs the monthly budget
   POST /api/budget             -> {monthly_usd: number|null} set / clear the budget (token-guarded)
   GET  /api/whatif?to&start&end&model&project&actor&session_id -> whatif.reprice(): repricing only
+  GET  /api/shapes             -> work shapes: by-shape table, per-session shape + peer multiple, project tags
+  POST /api/project-tag        -> {project, tag|null} set / clear a project's display tag (token-guarded)
   POST /api/fixes              -> record a fix {project, cause, note[, date]}; returns its verification
   GET  /api/changes            -> Changes tab: fixes with status/ETA, project and cause pick-lists
   POST /api/fixes/edit         -> {id[, date][, note]}
@@ -808,6 +810,71 @@ def _stat_or_none(path):
         return None
 
 
+def _db_state_key(db_path):
+    """Identity of the DB's current contents: path + (mtime, size) of the file and its -wal."""
+    return (str(Path(db_path).resolve()),) + tuple(
+        (st.st_mtime_ns, st.st_size) if (st := _stat_or_none(f)) and st.st_size else None
+        for f in (Path(db_path), Path(str(db_path) + "-wal")))
+
+
+_shapes_cache = None
+
+
+def get_shapes(db_path=None):
+    """Work shapes: the by-shape table, every session's shape and peer multiple, the outlier count
+    and the project tags. The outlier count is an observation: no dollar figure, in no total."""
+    import budget
+    import shape
+    import waste  # noqa: F401  (get_waste imports it too)
+    if db_path is None:
+        db_path = DB_PATH
+    tags = budget.load_tags(db_path)
+    base = {"labels": shape.LABELS,
+            "constants": {"dominant_share": shape.DOMINANT_SHARE, "min_tool_calls": shape.MIN_TOOL_CALLS,
+                          "min_peers": shape.MIN_PEERS, "outlier_x": shape.OUTLIER_X},
+            "tags": tags}
+    if not Path(db_path).exists():
+        return {**base, "rows": [], "sessions": {}, "outliers": 0}
+    # ponytail: single-entry cache keyed on DB state, like the waste payload; tags are read fresh above.
+    global _shapes_cache
+    key = _db_state_key(db_path)
+    if _shapes_cache and _shapes_cache[0] == key:
+        return {**base, **_shapes_cache[1]}
+    rows = shape.session_rows(db_path)
+    peers = shape.peers(rows)
+    sessions = {}
+    for r in rows:
+        p = peers.get(r["session_id"], {})
+        sessions[r["session_id"]] = {"shape": r["shape"], "detail": r["detail"], "x": p.get("x"), "basis": p.get("basis"),
+                                     "n": p.get("n"), "median": p.get("median")}
+    body = {"rows": shape.breakdown(rows, get_waste(db_path)["findings"]), "sessions": sessions,
+            "outliers": sum(1 for p in peers.values() if shape.is_outlier(p["x"]))}
+    _shapes_cache = (key, body)
+    return {**base, **body}
+
+
+def post_project_tag(payload, db_path=None):
+    """Set or clear a project's display tag. ValueError on a bad payload, tag or unknown project."""
+    import budget
+    if not isinstance(payload, dict):
+        raise ValueError("body must be a JSON object")
+    project, tag = payload.get("project"), payload.get("tag")
+    if not isinstance(project, str) or not project:
+        raise ValueError("project is required")
+    if "tag" not in payload:
+        raise ValueError("tag is required (null or blank clears it)")
+    db_path = db_path or DB_PATH
+    conn = sqlite3.connect(f"file:{Path(db_path).resolve().as_posix()}?mode=ro", uri=True) if Path(db_path).exists() else None
+    try:
+        known = conn is not None and conn.execute("SELECT 1 FROM sessions WHERE project_name = ?", (project,)).fetchone()
+    finally:
+        if conn:
+            conn.close()
+    if not known:
+        raise ValueError("unknown project")
+    return {"project": project, "tag": budget.set_tag(project, tag, db_path)}
+
+
 def get_waste(db_path=None, session_id=None):
     """Waste tab payload: findings, per-cause rollup, measurement status, one pricing basis.
     With ``session_id``: just that session's findings (the Trace panel), uncached."""
@@ -826,9 +893,7 @@ def get_waste(db_path=None, session_id=None):
     # (an empty -wal counts as absent: a read-only connect creates one).
     # ponytail: single-entry cache, no lock; two racing first requests both compute, harmless.
     global _waste_cache
-    key = (str(Path(db_path).resolve()),) + tuple(
-        (st.st_mtime_ns, st.st_size) if (st := _stat_or_none(f)) and st.st_size else None
-        for f in (Path(db_path), Path(str(db_path) + "-wal")))
+    key = _db_state_key(db_path)
     if _waste_cache and _waste_cache[0] == key:
         return _waste_cache[1]
     findings = waste.report(db_path)
@@ -1395,6 +1460,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/fixes":
             self._send_json(get_fixes())
+        elif path == "/api/shapes":
+            self._send_json(get_shapes(DB_PATH))
         elif path == "/api/budget":
             import budget
             self._send_json(budget.month_status(DB_PATH, tz=_qs1(parse_qs(parsed.query), "tz") or "local"))
@@ -1458,8 +1525,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self._guard(post=True):
             return
         path = urlparse(self.path).path
-        if path in ("/api/fixes", "/api/fixes/edit", "/api/fixes/delete"):
-            handler = {"/api/fixes": post_fix, "/api/fixes/edit": post_fix_edit, "/api/fixes/delete": post_fix_delete}[path]
+        if path in ("/api/fixes", "/api/fixes/edit", "/api/fixes/delete", "/api/project-tag"):
+            handler = {"/api/fixes": post_fix, "/api/fixes/edit": post_fix_edit, "/api/fixes/delete": post_fix_delete,
+                       "/api/project-tag": post_project_tag}[path]
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 if not 0 < n <= 65536:

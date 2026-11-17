@@ -393,3 +393,19 @@ body.booting .chart-wrap { border-radius: 6px; background: linear-gradient(90deg
 .whatif-cell { white-space: nowrap; }
 .breakdown-subrow.whatif-row td { font-size: 12px; }
 #budget-input { width: 120px; padding: 4px 8px; background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
+
+/* Work shape and peer baselines */
+.shp-line { margin: 0 0 12px; font-size: 13px; }
+.shp-line a { color: var(--amber); text-decoration: none; }
+.shp-line a:hover { text-decoration: underline; }
+.shp-shape { white-space: nowrap; }
+.shp-outlier { color: var(--amber); font-weight: 700; }
+.shp-trace { font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
+.shp-table { width: 100%; }
+.shp-tagcell { white-space: nowrap; }
+.shp-tag-input { width: 9em; max-width: 100%; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 12px; }
+.shp-tag-err { color: var(--red); font-size: 11px; white-space: normal; }
+.shp-mix { margin-top: 8px; font-size: 12px; }
+.shp-mix-line { margin: 2px 0; overflow-wrap: anywhere; }
+.shp-warn { margin: 6px 0; padding: 4px 8px; border-left: 3px solid var(--amber); color: var(--amber); overflow-wrap: anywhere; }
+.shp-same { margin: 4px 0; overflow-wrap: anywhere; }

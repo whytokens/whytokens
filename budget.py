@@ -1,16 +1,20 @@
 """Monthly budget: a number the user sets, and where this calendar month is heading against it.
 
-The budget lives in ``budget.json`` next to the DB (``{"monthly_usd": 500.0}``). An absent
-file means no budget: never a default, never 0. Spend is the dashboard's own costing
+The budget lives in ``budget.json`` next to the DB (``{"monthly_usd": 500.0}``), together with the
+per-project display tags (``"project_tags"``). An absent file or key means no budget: never a default,
+never 0. Spend is the dashboard's own costing
 (``api.get_daily``: API list price, per day), for the current calendar month whatever
 range the dashboard is filtered to.
 """
 
 import calendar
+import contextlib
 import json
 import math
 import os
 import tempfile
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -43,24 +47,117 @@ def _valid(v):
     return math.isfinite(f) and f > 0
 
 
-def set_budget(value, db_path=None):
-    """Store ``value`` (finite, > 0) atomically; ``None`` clears the budget. ValueError otherwise."""
-    path = budget_path(db_path)
-    if value is None:
+_lock = threading.RLock()
+_depth = threading.local()
+
+
+@contextlib.contextmanager
+def _locked(path):
+    """One writer at a time across threads AND processes (the dashboard and the CLI both write
+    this file): an O_EXCL lock file beside it, re-entrant per thread, stale after 10 s."""
+    with _lock:
+        if getattr(_depth, "n", 0):
+            _depth.n += 1
+            try:
+                yield
+            finally:
+                _depth.n -= 1
+            return
+        lock = path.with_name(path.name + ".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.time() + 5
+        while True:
+            try:
+                os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - lock.stat().st_mtime > 10:
+                        lock.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                if time.time() > deadline:
+                    raise OSError("settings file is locked by another process")
+                time.sleep(0.02)
+        _depth.n = 1
+        try:
+            yield
+        finally:
+            _depth.n = 0
+            lock.unlink(missing_ok=True)
+TAG_MAX = 40
+
+
+def _read(path):
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _write(path, d):
+    """Replace the settings file atomically; an empty dict removes it (no file = nothing set)."""
+    if not d:
         path.unlink(missing_ok=True)
-        return None
-    if not _valid(value):
-        raise ValueError("monthly_usd must be a finite number greater than 0")
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")  # one temp file per writer
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"monthly_usd": float(value)}, f)
+            json.dump(d, f)
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
-    return float(value)
+
+
+def set_budget(value, db_path=None):
+    """Store ``value`` (finite, > 0) atomically; ``None`` clears the budget. ValueError otherwise.
+    Other settings in the file (project tags) are kept."""
+    path = budget_path(db_path)
+    if value is not None and not _valid(value):
+        raise ValueError("monthly_usd must be a finite number greater than 0")
+    with _locked(path):
+        d = _read(path)
+        if value is None:
+            d.pop("monthly_usd", None)
+        else:
+            d["monthly_usd"] = float(value)
+        _write(path, d)
+    return None if value is None else float(value)
+
+
+def load_tags(db_path=None):
+    """{project: tag}: one free-text display label per project, set by the user."""
+    t = _read(budget_path(db_path)).get("project_tags")
+    return {k: v for k, v in t.items() if isinstance(k, str) and isinstance(v, str) and v} if isinstance(t, dict) else {}
+
+
+def set_tag(project, tag, db_path=None):
+    """Set (or, with None / blank, clear) a project's display tag. ValueError on a bad tag."""
+    if not isinstance(project, str) or not project:
+        raise ValueError("project is required")
+    if tag is not None and not isinstance(tag, str):
+        raise ValueError("tag must be text")
+    tag = (tag or "").strip()
+    if len(tag) > TAG_MAX or any(ord(c) < 32 for c in tag):
+        raise ValueError(f"tag must be plain text of at most {TAG_MAX} characters")
+    path = budget_path(db_path)
+    with _locked(path):
+        d = _read(path)
+        tags = d.get("project_tags") if isinstance(d.get("project_tags"), dict) else {}
+        if tag:
+            tags[project] = tag
+        else:
+            tags.pop(project, None)
+        if tags:
+            d["project_tags"] = tags
+        else:
+            d.pop("project_tags", None)
+        _write(path, d)
+    return tag or None
 
 
 def month_status(db_path=None, today=None, tz="local"):

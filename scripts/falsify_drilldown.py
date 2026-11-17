@@ -46,7 +46,7 @@ MUTANTS = [
     (APP, "av = overheadOf(idx, a.full_session_id, sessionFilters.cause); bv = overheadOf(idx, b.full_session_id, sessionFilters.cause);",
      "av = overheadOf(idx, a.full_session_id); bv = overheadOf(idx, b.full_session_id);"),
     (APP, "av = cacheShare(a); bv = cacheShare(b);", "av = a.cache_read; bv = b.cache_read;"),
-    (APP, "if (tab !== 'sessions') st.filters.cause = '';", ""),
+    (APP, "if (tab !== 'sessions') Object.assign(st.filters, { cause: '', shape: '', tag: '', minX: 0 });", ""),
     (APP, "wasteCause = tab === 'waste' && ws.cause ? ws.cause : null;", "wasteCause = null;"),
     (APP, "{ col: 'overhead', dir: 'desc' } });", "{ col: 'cost', dir: 'desc' } });"),
     # history

@@ -315,7 +315,8 @@ class TestRetryInputsBackfill(unittest.TestCase):
     def dump(self, c):
         return {"tokens": c.execute(self.TOKENS).fetchall(),
                 "counts": [c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("turns", "tool_results", "sessions")],
-                "sessions": c.execute("SELECT * FROM sessions ORDER BY session_id").fetchall(),
+                "sessions": c.execute("SELECT %s FROM sessions ORDER BY session_id" % ", ".join(  # shape_* re-derive when tool_calls are backfilled
+                    r[1] for r in c.execute("PRAGMA table_info(sessions)") if not r[1].startswith("shape"))).fetchall(),
                 "flags": dict(c.execute("SELECT call_id, is_error FROM tool_results")),
                 "calls": dict(c.execute("SELECT message_id, tool_calls FROM turns"))}
 

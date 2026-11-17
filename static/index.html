@@ -60,6 +60,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
     <div class="budget-band" id="budget-band"></div>
     <div class="stats-row" id="stats-row"><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div></div>
     <div class="where-to-act" id="where-to-act"></div>
+    <div class="shp-line" id="shape-outliers"></div>
     <div class="charts-grid">
       <div class="chart-card wide">
         <h2 id="daily-chart-title">Daily Token Usage</h2>
@@ -116,6 +117,11 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         <tbody id="effort-cost-body"></tbody>
       </table>
     </details>
+    <details class="table-card collapsible" id="shape-table">
+      <summary>By work shape</summary>
+      <div id="shape-table-body"><p class="muted">Loading…</p></div>
+      <p class="table-hint">Overhead share is attributed overhead (a lower bound) as a share of that shape's cost. Shape is derived from the tools a session called. This table covers all recorded sessions, not the selected range; its links open Sessions for that shape over the selected range.</p>
+    </details>
     <h2 class="sub-section" id="projects">By project</h2>
     <div class="table-card">
       <div class="section-header"><div class="section-title">Cost by Project</div><button class="export-btn" onclick="exportProjectsCSV()" title="Export all projects to CSV">&#x2913; CSV</button></div>
@@ -128,6 +134,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <th data-prov="official" class="sortable" onclick="setProjectSort('input')">Input <span class="sort-icon" id="psort-input"></span></th>
           <th data-prov="official" class="sortable" onclick="setProjectSort('output')">Output <span class="sort-icon" id="psort-output"></span></th>
           <th data-prov="local_estimate" class="sortable" onclick="setProjectSort('cost')">Est. Cost <span class="sort-icon" id="psort-cost"></span></th>
+          <th>Tag</th>
         </tr></thead>
         <tbody id="project-cost-body"></tbody>
       </table>
@@ -231,6 +238,14 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <label for="session-cause-filter">Overhead cause</label>
           <select id="session-cause-filter" onchange="onSessionFilterChange()"><option value="">Any cause</option></select>
         </div>
+        <div class="filter-field">
+          <label for="session-shape-filter">Work shape</label>
+          <select id="session-shape-filter" onchange="onSessionFilterChange()"><option value="">Any shape</option></select>
+        </div>
+        <div class="filter-field">
+          <label for="session-tag-filter">Project tag</label>
+          <select id="session-tag-filter" onchange="onSessionFilterChange()"><option value="">Any tag</option></select>
+        </div>
         <label class="filter-check"><input id="session-cache-filter" type="checkbox" onchange="onSessionFilterChange()">Cache creation</label>
         <button class="filter-btn" onclick="clearSessionFilters()">Clear</button>
       </div>
@@ -250,6 +265,8 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <th data-prov="local_estimate" class="sortable" onclick="setSessionSort('cost')">Est. Cost&nbsp;<span class="sort-icon" id="sort-icon-cost"></span></th>
           <th class="sortable" onclick="setSessionSort('cache_share')" title="cache read as a share of the prompt">Cache Share&nbsp;<span class="sort-icon" id="sort-icon-cache_share"></span></th>
           <th class="sortable" onclick="setSessionSort('overhead')" title="Attributed overhead (lower bound, API list rate); the selected cause's share when a cause is chosen">Overhead&nbsp;<span class="sort-icon" id="sort-icon-overhead"></span></th>
+          <th class="sortable" onclick="setSessionSort('shape')" title="What the session mostly did, from the tools it called">Shape&nbsp;<span class="sort-icon" id="sort-icon-shape"></span></th>
+          <th class="sortable" onclick="setSessionSort('peers')" title="Cost per prompt as a multiple of the median for comparable sessions in the same project">vs peers&nbsp;<span class="sort-icon" id="sort-icon-peers"></span></th>
         </tr></thead>
         <tbody id="sessions-body"></tbody>
       </table>
@@ -280,6 +297,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
     <div class="detail-title-group">
       <div class="detail-title" id="session-detail-title">Session Drilldown</div>
       <div class="detail-subtitle" id="session-detail-subtitle"></div>
+      <div id="session-detail-shape"></div>
     </div>
     <div class="detail-actions">
       <button class="export-btn" onclick="closeSessionDetail()" title="Back to Sessions">&larr; Sessions</button>

@@ -27,6 +27,7 @@ import time
 import extensions as _extensions
 import policy
 import scanner
+import shape
 from config import DB_PATH
 from .claude import ClaudeSource
 from .codex import CodexSource
@@ -241,6 +242,7 @@ def scan_all(db_path=DB_PATH, projects_dir=None, verbose=True, sources=None, ext
     if changed:
         scanner.reconcile_session_totals(conn)
         scanner.reconcile_session_models(conn)
+    shape.sync_shapes(conn)  # after the totals: it re-derives sessions whose turn count moved
 
     if verbose:
         print("\nScan complete:")

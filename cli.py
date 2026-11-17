@@ -518,6 +518,9 @@ Usage:
   whytokens fix delete ID                Remove a recorded fix
   whytokens budget [AMOUNT|--clear]      Show this month's spend vs the monthly budget (USD, API list
                                              price); AMOUNT sets it, --clear removes it
+  whytokens shapes                       Cost by work shape (edit-heavy, shell-heavy, ...) and how many
+                                             sessions cost 2x or more their peers
+  whytokens project tag PROJECT [TAG|--clear]   Show, set or clear a project's display tag
   whytokens verify [FIX_ID]              Attributed share of spend for the fix's (project, cause),
                                              after vs before; needs 10 sessions each side
   whytokens pricing check [--offline]    Review diff of the shipped price table vs LiteLLM (OpenRouter
@@ -621,6 +624,35 @@ def cmd_verify(fix_id=None):
         print(fixes.format_result(fixes.verify(DB_PATH, f)))
 
 
+def cmd_shapes():
+    import api
+    import shape
+    d = api.get_shapes(DB_PATH)
+    if not d["rows"]:
+        print("no sessions yet; run `whytokens scan` first")
+        return
+    print(shape.format_breakdown(d["rows"]))
+    print(f"\n{d['outliers']} session{'s' if d['outliers'] != 1 else ''} cost {d['constants']['outlier_x']:g}x or more "
+          "their peers (an observation, not part of any total)")
+
+
+def cmd_project(rest):
+    import api
+    import budget
+    if rest[:1] != ["tag"] or len(rest) < 2:
+        print("usage: whytokens project tag PROJECT [TAG|--clear]")
+        sys.exit(2)
+    project, arg = rest[1], rest[2:]
+    try:
+        if arg:
+            api.post_project_tag({"project": project, "tag": None if arg == ["--clear"] else " ".join(arg)}, DB_PATH)
+        tag = budget.load_tags(DB_PATH).get(project)
+    except ValueError as e:
+        print(f"error: {e}")
+        sys.exit(1)
+    print(f"{project}: {tag}" if tag else f"{project}: no tag")
+
+
 COMMANDS = {
     "scan": cmd_scan,
     "doctor": cmd_doctor,
@@ -633,6 +665,8 @@ COMMANDS = {
     "verify": cmd_verify,
     "pricing": cmd_pricing,
     "budget": cmd_budget,
+    "shapes": cmd_shapes,
+    "project": cmd_project,
     "export": cmd_export,
     "dashboard": cmd_dashboard,
 }
@@ -687,6 +721,8 @@ def main():
             cmd_pricing(rest)
         elif command == "budget":
             cmd_budget(rest)
+        elif command == "project":
+            cmd_project(rest)
         elif command == "verify":
             cmd_verify(rest[0] if rest else None)
         else:

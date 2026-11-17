@@ -40,6 +40,21 @@ function bar(label, s, max, interim) {
     `<span class="chg-bar-n muted">${s.sessions} session${s.sessions === 1 ? '' : 's'}</span></div>`;
 }
 
+const mixList = l => (l || []).map(m => `${esc(m.label)} ${(m.pct * 100).toFixed(0)}%`).join(', ') || 'no sessions';
+
+/** Shape mix before vs after, the server's warning as written, and the same-shape comparison (never the verdict). */
+function mixHtml(m, interim) {
+  let h = `<div class="shp-mix"><p class="shp-mix-line"><strong>Shape mix</strong> <span class="muted">(share of sessions)</span></p>` +
+    `<p class="shp-mix-line"><span class="muted">Before:</span> ${mixList(m.before)}</p>` +
+    `<p class="shp-mix-line"><span class="muted">After:</span> ${mixList(m.after)}</p>`;
+  if (m.warn) h += `<p class="shp-warn" role="note">${esc(m.warning)}</p>`;
+  if (!interim) for (const t of m.same_shape || []) {
+    h += `<p class="muted shp-same">Same-shape comparison (not the verdict): ${esc(t.label)}: ${(t.before.pct * 100).toFixed(1)}% -> ` +
+      `${(t.after.pct * 100).toFixed(1)}% of spend, ${t.before.sessions} vs ${t.after.sessions} sessions</p>`;
+  }
+  return h + '</div>';
+}
+
 /** Expanded body: before/after share bars, $ only when the verdict is in, the quality caveat. */
 export function detailHtml(c) {
   const interim = !!c.interim;
@@ -49,8 +64,9 @@ export function detailHtml(c) {
     bar('Before', c.before, max, interim) + bar('After', c.after, max, interim);
   if (interim) h += '<p class="chg-early">Too early to call. These numbers are a preview, not a result.</p>';
   if (c.state === 'reduced') h += `<p>About <strong>${fmtCostBig(c.saving_usd)}</strong> less over the after period <span class="muted">(${esc(c.basis)})</span>.</p>`;
-  h += `<p class="muted chg-caveat">${esc(c.caveat)}</p>` +
-    `<div class="chg-actions"><button class="filter-btn" data-act="edit" data-id="${c.fix.id}">Edit</button> ` +
+  h += `<p class="muted chg-caveat">${esc(c.caveat)}</p>`;
+  if (c.mix) h += mixHtml(c.mix, interim);
+  h += `<div class="chg-actions"><button class="filter-btn" data-act="edit" data-id="${c.fix.id}">Edit</button> ` +
     `<button class="filter-btn" data-act="delete" data-id="${c.fix.id}">Delete</button></div>` +
     `<form class="chg-edit" data-id="${c.fix.id}" hidden>` +
     `<label>Date <input type="date" name="date" value="${esc(c.fix.fix_date)}" max="${esc(c.today || '')}" required></label> ` +

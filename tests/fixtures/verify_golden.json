@@ -1,0 +1,193 @@
+{
+ "clean_unchanged": {
+  "after": {
+   "cause_usd": 0.0,
+   "pct": 0.0,
+   "sessions": 12,
+   "usd": 2.37384
+  },
+  "basis": "attributed, lower bound, at API list rate; not savings",
+  "before": {
+   "cause_usd": 0.0,
+   "pct": 0.0,
+   "sessions": 12,
+   "usd": 2.37384
+  },
+  "caveat": "Quality is not measured: a lower waste share can also mean less work or a different mix of work, not only a better habit.",
+  "fix": {
+   "cause": "resident_output",
+   "file_hash": null,
+   "fix_date": "2026-09-01",
+   "id": 1,
+   "note": "trim bash output",
+   "project": "acme/app"
+  },
+  "min_sessions": 10,
+  "saving_usd": 0.0,
+  "status": "no material change"
+ },
+ "increase": {
+  "after": {
+   "cause_usd": 2.718,
+   "pct": 0.41270361867278893,
+   "sessions": 12,
+   "usd": 6.585839999999999
+  },
+  "basis": "attributed, lower bound, at API list rate; not savings",
+  "before": {
+   "cause_usd": 0.0,
+   "pct": 0.0,
+   "sessions": 12,
+   "usd": 2.37384
+  },
+  "caveat": "Quality is not measured: a lower waste share can also mean less work or a different mix of work, not only a better habit.",
+  "fix": {
+   "cause": "resident_output",
+   "file_hash": null,
+   "fix_date": "2026-09-01",
+   "id": 1,
+   "note": "trim bash output",
+   "project": "acme/app"
+  },
+  "min_sessions": 10,
+  "saving_usd": 0.0,
+  "status": "increased"
+ },
+ "other_cause": {
+  "after": {
+   "cause_usd": 0.0,
+   "pct": 0.0,
+   "sessions": 12,
+   "usd": 2.37384
+  },
+  "basis": "attributed, lower bound, at API list rate; not savings",
+  "before": {
+   "cause_usd": 0.0,
+   "pct": 0.0,
+   "sessions": 12,
+   "usd": 6.585839999999999
+  },
+  "caveat": "Quality is not measured: a lower waste share can also mean less work or a different mix of work, not only a better habit.",
+  "fix": {
+   "cause": "idle_gap",
+   "file_hash": null,
+   "fix_date": "2026-09-01",
+   "id": 1,
+   "note": "trim bash output",
+   "project": "acme/app"
+  },
+  "min_sessions": 10,
+  "saving_usd": 0.0,
+  "status": "no material change"
+ },
+ "real_drop": {
+  "after": {
+   "cause_usd": 0.0,
+   "pct": 0.0,
+   "sessions": 12,
+   "usd": 2.37384
+  },
+  "basis": "attributed, lower bound, at API list rate; not savings",
+  "before": {
+   "cause_usd": 2.718,
+   "pct": 0.41270361867278893,
+   "sessions": 12,
+   "usd": 6.585839999999999
+  },
+  "caveat": "Quality is not measured: a lower waste share can also mean less work or a different mix of work, not only a better habit.",
+  "fix": {
+   "cause": "resident_output",
+   "file_hash": null,
+   "fix_date": "2026-09-01",
+   "id": 1,
+   "note": "trim bash output",
+   "project": "acme/app"
+  },
+  "min_sessions": 10,
+  "saving_usd": 0.9796923581502133,
+  "status": "reduced"
+ },
+ "short_after": {
+  "after": {
+   "cause_usd": 0.0,
+   "pct": 0.0,
+   "sessions": 9,
+   "usd": 1.78038
+  },
+  "basis": "attributed, lower bound, at API list rate; not savings",
+  "before": {
+   "cause_usd": 2.718,
+   "pct": 0.41270361867278893,
+   "sessions": 12,
+   "usd": 6.585839999999999
+  },
+  "caveat": "Quality is not measured: a lower waste share can also mean less work or a different mix of work, not only a better habit.",
+  "fix": {
+   "cause": "resident_output",
+   "file_hash": null,
+   "fix_date": "2026-09-01",
+   "id": 1,
+   "note": "trim bash output",
+   "project": "acme/app"
+  },
+  "min_sessions": 10,
+  "reason": "needs at least 10 sessions on each side (before 12, after 9)",
+  "saving_usd": 0.0,
+  "status": "insufficient data"
+ },
+ "short_before": {
+  "after": {
+   "cause_usd": 0.0,
+   "pct": 0.0,
+   "sessions": 12,
+   "usd": 2.37384
+  },
+  "basis": "attributed, lower bound, at API list rate; not savings",
+  "before": {
+   "cause_usd": 2.0385,
+   "pct": 0.4127036186727889,
+   "sessions": 9,
+   "usd": 4.93938
+  },
+  "caveat": "Quality is not measured: a lower waste share can also mean less work or a different mix of work, not only a better habit.",
+  "fix": {
+   "cause": "resident_output",
+   "file_hash": null,
+   "fix_date": "2026-09-01",
+   "id": 1,
+   "note": "trim bash output",
+   "project": "acme/app"
+  },
+  "min_sessions": 10,
+  "reason": "needs at least 10 sessions on each side (before 9, after 12)",
+  "saving_usd": 0.0,
+  "status": "insufficient data"
+ },
+ "unchanged_wasteful": {
+  "after": {
+   "cause_usd": 2.718,
+   "pct": 0.41270361867278893,
+   "sessions": 12,
+   "usd": 6.585839999999999
+  },
+  "basis": "attributed, lower bound, at API list rate; not savings",
+  "before": {
+   "cause_usd": 2.718,
+   "pct": 0.41270361867278893,
+   "sessions": 12,
+   "usd": 6.585839999999999
+  },
+  "caveat": "Quality is not measured: a lower waste share can also mean less work or a different mix of work, not only a better habit.",
+  "fix": {
+   "cause": "resident_output",
+   "file_hash": null,
+   "fix_date": "2026-09-01",
+   "id": 1,
+   "note": "trim bash output",
+   "project": "acme/app"
+  },
+  "min_sessions": 10,
+  "saving_usd": 0.0,
+  "status": "no material change"
+ }
+}

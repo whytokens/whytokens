@@ -149,6 +149,8 @@ COLUMN_MIGRATIONS = {
         # Provenance ('custom' / 'ai') so an incrementally appended ai-title can
         # never clobber a user-set custom-title.
         "topic_source": "TEXT",
+        # Work shape derived from the tool-call mix (shape.py); version + turn count say when to re-derive.
+        "shape": "TEXT", "shape_detail": "TEXT", "shape_version": "INTEGER", "shape_turns": "INTEGER",
     },
     # Keyed per (path, source) so two sources that discover the same path don't
     # clobber each other (default 'claude' for legacy rows).

@@ -1,4 +1,4 @@
-"""Performance budget on a synthetic corpus: cold scan, warm scan, page load, waste.
+"""Performance budget on a synthetic corpus: cold scan, warm scan, page load, waste, shapes.
 
     python scripts/perf_budget.py [--sessions N] [--turns N]
 
@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Seconds per 100k turns (page/waste are fixed ceilings: they must not grow with corpus
 # because the UI pages /api/sessions). Set from measured runs with ~3x headroom.
 BUDGET_PER_100K_TURNS = {"cold_scan": 60.0, "warm_scan": 6.0}
-BUDGET_FIXED = {"page_load": 5.0, "sessions_page": 0.5, "waste": 5.0}
+BUDGET_FIXED = {"page_load": 5.0, "sessions_page": 0.5, "waste": 5.0, "shapes": 5.0}
 
 
 def write_corpus(root, sessions, turns):
@@ -66,6 +66,7 @@ def measure(sessions, turns):
         timed("page_load", lambda: api.get_dashboard_data(db_path=db))
         timed("sessions_page", lambda: api.get_sessions_page(limit=50, db_path=db))
         timed("waste", lambda: api.get_waste(db_path=db))
+        timed("shapes", lambda: api.get_shapes(db_path=db))  # waste is cached by now: this is the shape/peer pass itself
         out["turns"] = sessions * turns
         return out
 

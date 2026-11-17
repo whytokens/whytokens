@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pricing
+import shape
 import waste
 
 MIN_SESSIONS = 10
@@ -136,12 +137,14 @@ def _side(sessions, cause_usd):
     return {"sessions": len(sessions), "usd": usd, "cause_usd": cause, "pct": cause / usd if usd else 0.0}
 
 
-def verify(db_path, fix):
-    """Before/after attributed share for one recorded fix (a dict from list_fixes)."""
+def _gather(db_path, fix):
+    """What verify measures: per-session spend, the project's sessions (id, start day, shape) and the
+    cause's attributed dollars per session."""
     conn = sqlite3.connect(f"file:{quote(Path(db_path).resolve().as_posix(), safe='/:')}?mode=ro", uri=True)
     try:
         totals = _session_totals(conn)
-        rows = conn.execute("""SELECT session_id, COALESCE(date(first_timestamp, 'localtime'), substr(first_timestamp, 1, 10)) FROM sessions
+        shape_col = "shape" if "shape" in {r[1] for r in conn.execute("PRAGMA table_info(sessions)")} else "NULL"
+        rows = conn.execute(f"""SELECT session_id, COALESCE(date(first_timestamp, 'localtime'), substr(first_timestamp, 1, 10)), {shape_col} FROM sessions
                                WHERE project_name = ? AND COALESCE(agent, 'claude') = 'claude'
                                AND first_timestamp IS NOT NULL""", (fix["project"],)).fetchall()
     finally:
@@ -150,8 +153,14 @@ def verify(db_path, fix):
     for f in waste.report(db_path, min_share=0, min_usd=0):
         if f["cause"] == fix["cause"]:
             cause_usd[f["session_id"]] = f["usd"]
-    before = _side([(s, totals.get(s, 0.0)) for s, d in rows if d < fix["fix_date"]], cause_usd)
-    after = _side([(s, totals.get(s, 0.0)) for s, d in rows if d >= fix["fix_date"]], cause_usd)
+    return totals, rows, cause_usd
+
+
+def verify(db_path, fix, data=None):
+    """Before/after attributed share for one recorded fix (a dict from list_fixes)."""
+    totals, rows, cause_usd = data or _gather(db_path, fix)
+    before = _side([(s, totals.get(s, 0.0)) for s, d, _ in rows if d < fix["fix_date"]], cause_usd)
+    after = _side([(s, totals.get(s, 0.0)) for s, d, _ in rows if d >= fix["fix_date"]], cause_usd)
     out = {"fix": fix, "before": before, "after": after, "caveat": CAVEAT, "saving_usd": 0.0,
            "basis": waste.BASIS["label"],
            "min_sessions": MIN_SESSIONS}
@@ -182,12 +191,45 @@ def _recent_rate(db_path, project, today):
     return n / RATE_DAYS
 
 
+def _mix(data, fix):
+    """Shape mix on each side of the fix (share of spending sessions per shape), a warning when the work
+    changed, and a same-shape before/after for every shape with MIN_SESSIONS on both sides. Informational:
+    verify's verdict is computed without it."""
+    totals, rows, cause_usd = data
+    spend = [(s, d, sh) for s, d, sh in rows if totals.get(s, 0.0) > 0]
+    side = {"before": [r for r in spend if r[1] < fix["fix_date"]], "after": [r for r in spend if r[1] >= fix["fix_date"]]}
+    count = {k: {} for k in side}
+    for k, rs in side.items():
+        for _, _, sh in rs:
+            count[k][sh or "unknown"] = count[k].get(sh or "unknown", 0) + 1
+    n = {k: len(rs) for k, rs in side.items()}
+    shapes = [sh for sh in (*shape.CATEGORIES, "mixed", "chat", "unknown") if sh in count["before"] or sh in count["after"]]
+    share = {k: {sh: count[k].get(sh, 0) / n[k] for sh in shapes} if n[k] else {} for k in side}
+    out = {"before": [{"shape": sh, "label": shape.label(sh), "pct": share["before"].get(sh, 0.0)} for sh in shapes] if n["before"] else [],
+           "after": [{"shape": sh, "label": shape.label(sh), "pct": share["after"].get(sh, 0.0)} for sh in shapes] if n["after"] else [],
+           "warn": False, "warning": "", "same_shape": []}
+    if min(n.values()) >= MIN_SESSIONS:
+        shift = {sh: round(abs(share["after"][sh] - share["before"][sh]), 9) for sh in shapes}
+        top = max(shapes, key=lambda sh: shift[sh])
+        if shift[top] >= shape.MIX_SHIFT:
+            out["warn"] = True
+            out["warning"] = (f"the work changed: {shape.label(top)} {share['before'][top] * 100:.0f}% -> "
+                              f"{share['after'][top] * 100:.0f}% of sessions; read this verdict with care")
+        for sh in shapes:
+            sides = {k: _side([(s, totals.get(s, 0.0)) for s, _, x in rs if (x or "unknown") == sh], cause_usd) for k, rs in side.items()}
+            if min(sides["before"]["sessions"], sides["after"]["sessions"]) >= MIN_SESSIONS:
+                out["same_shape"].append({"shape": sh, "label": shape.label(sh), **sides})
+    return out
+
+
 def change_view(db_path, fix, today=None):
     """verify() plus what the Changes tab shows. ``state`` is one of waiting / no_history / reduced /
     no_change / increased. A verdict state needs MIN_SESSIONS on both sides (verify's rule, unchanged);
     otherwise ``interim`` is true and the numbers are a preview, never a result."""
     today = today or date.today()
-    r = verify(db_path, fix)
+    data = _gather(db_path, fix)
+    r = verify(db_path, fix, data)
+    r["mix"] = _mix(data, fix)
     b, a = r["before"]["sessions"], r["after"]["sessions"]
     r["interim"] = r["status"] == "insufficient data"
     r["eta_days"] = None

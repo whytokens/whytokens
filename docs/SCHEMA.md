@@ -76,6 +76,10 @@ NULL AND message_id != ''` — this enforces the dedup invariant in the DB.
 | `agent` | TEXT | source coding agent: `claude` (default), `codex`, or `coordinator` (partial; see below) |
 | `topic` | TEXT | session title, or NULL |
 | `topic_source` | TEXT | where `topic` came from. Higher rank wins: `custom` (user rename) > `thread` (Claude Projects thread title) > `ai` (ai-title record) > `prompt` (the Projects thread's trigger message, used when the title is no longer cached) |
+| `shape` | TEXT | work shape from the tool-call mix (see Work shape): `edit`, `read_search`, `shell`, `web`, `connector`, `subagent`, `mixed` or `chat`; NULL until derived |
+| `shape_detail` | TEXT | the top connector server for a `connector` session, else NULL |
+| `shape_version` | INTEGER | `shape.SHAPE_VERSION` of the rule that derived `shape`; a different value re-derives it |
+| `shape_turns` | INTEGER | signature (turn count + stored tool-call bytes) when the shape was derived; a session that gained turns or had tool calls backfilled is re-derived |
 
 Index: `idx_sessions_first(first_timestamp)`.
 
@@ -399,6 +403,43 @@ budget` (positive = over; null without a budget); `needed_daily = (budget - spen
 days_remaining` (null without a budget or on the last day). `POST /api/budget
 {"monthly_usd": number|null}` sets or clears it (token-guarded like `/api/fixes`; invalid
 values are 400). CLI: `whytokens budget [AMOUNT|--clear]`.
+
+## Work shape
+
+A session's shape is derived from `turns.tool_calls` alone (`shape.py`; no model, no transcript
+read, so a rule change re-derives from the DB: `shape.sync_shapes` runs at the end of every scan
+and fills any session whose `shape` is NULL, whose `shape_version` differs, or whose
+`turn_count` moved). Tool names fall in categories: edit (Edit, Write, NotebookEdit, MultiEdit,
+apply_patch), read/search (Read, Grep, Glob), shell (Bash, PowerShell, shell, exec_command,
+local_shell), web (WebFetch, WebSearch), connector (`mcp__<server>__<tool>`, the top server is
+kept in `shape_detail`), subagent (Agent, Task). Other tools count in the total but in no
+category. The shape is the category holding at least `DOMINANT_SHARE` (0.40) of the tool calls
+(ties go to the earlier category in that order), else `mixed`; a session with fewer than
+`MIN_TOOL_CALLS` (5) calls is `chat`. Image input is not recorded by ingestion, so it is not a
+category. The human labels live in `shape.LABELS` and reach the dashboard through the API.
+
+Peers: sessions of the same project and shape, itself included. The baseline is the median cost
+per user prompt (`MAX(prompt_seq)` of the main thread; sessions without prompts or spend have no
+multiple and are not peers). Under `MIN_PEERS` (5) the project's median across shapes is used and
+the payload says `basis: "project"`; with neither there is no multiple. A multiple of
+`OUTLIER_X` (2.0) or more is an outlier: counted and listed, never added to attributed overhead
+or any total.
+
+`GET /api/shapes`: `{labels, constants, tags, rows, sessions, outliers}` where `rows` is the
+by-shape table (sessions, usd, share of cost, overhead_usd counting only findings in the total,
+overhead_share of that shape's cost) and `sessions` maps each session id to
+`{shape, detail, x, basis, n, median}`. Cached per DB state like the waste payload.
+
+On a recorded change, `GET /api/changes` rows carry `mix`: the session-share per shape before and
+after, a `warning` when any shape's share moved by `MIX_SHIFT` (0.20) or more on a decided change,
+and a `same_shape` before/after for each shape with at least 10 sessions on both sides. It is
+informational: `fixes.verify` (the 10-session gate, the materiality thresholds, the verdict) does
+not read it.
+
+Project tags: `budget.json` also holds `"project_tags": {project: text}` (at most 40 plain
+characters each; read-modify-write under a lock, so setting a budget or a tag never drops the
+other). `POST /api/project-tag {project, tag|null}` (token-guarded; the project must exist) and
+`whytokens project tag PROJECT [TAG|--clear]`.
 
 ## Model what-if
 

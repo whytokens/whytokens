@@ -3,9 +3,10 @@
 // Dollars here are the server's (waste.py findings, list rate); this module only sums and orders them.
 
 export const SESSION_SORTS = ['last', 'duration_min', 'turns', 'input', 'output', 'cache_read',
-  'cache_creation', 'cost', 'cache_share', 'overhead'];
+  'cache_creation', 'cost', 'cache_share', 'overhead', 'peers', 'shape'];
 export const DEFAULT_SORT = { col: 'last', dir: 'desc' };
-export const EMPTY_FILTERS = { project: '', branch: '', tool: '', minCost: 0, hasCacheCreation: false, cause: '' };
+export const EMPTY_FILTERS = { project: '', branch: '', tool: '', minCost: 0, hasCacheCreation: false, cause: '',
+  shape: '', tag: '', minX: 0 };
 
 /** Sessions-list state -> URL params. Defaults are omitted. */
 export function writeSessionState(params, f = EMPTY_FILTERS, sort = DEFAULT_SORT) {
@@ -15,6 +16,9 @@ export function writeSessionState(params, f = EMPTY_FILTERS, sort = DEFAULT_SORT
   if (f.minCost) params.set('smin', String(f.minCost));
   if (f.hasCacheCreation) params.set('scache', '1');
   if (f.cause) params.set('cause', f.cause);
+  if (f.shape) params.set('sshape', f.shape);
+  if (f.tag) params.set('stag', f.tag);
+  if (f.minX) params.set('sx', String(f.minX));
   if (sort.col !== DEFAULT_SORT.col || sort.dir !== DEFAULT_SORT.dir) { params.set('sort', sort.col); params.set('dir', sort.dir); }
 }
 
@@ -28,6 +32,7 @@ export function readSessionState(search) {
     filters: {
       project: q.get('sproject') || '', branch: q.get('sbranch') || '', tool: q.get('stool') || '',
       minCost: parseFloat(q.get('smin')) || 0, hasCacheCreation: q.get('scache') === '1', cause: q.get('cause') || '',
+      shape: q.get('sshape') || '', tag: q.get('stag') || '', minX: parseFloat(q.get('sx')) || 0,
     },
     sort,
   };

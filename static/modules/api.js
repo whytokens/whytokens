@@ -126,3 +126,22 @@ export async function fetchWhatif(params = {}) {
   if (!resp.ok) throw new Error(String(resp.status));
   return resp.json();
 }
+
+/** GET /api/shapes — work shape per session, peer multiples, the by-shape table (shape.py). */
+export async function fetchShapes() {
+  const resp = await fetch('/api/shapes');
+  if (!resp.ok) throw new Error(String(resp.status));
+  return resp.json();
+}
+
+/** POST /api/project-tag — set a project's free-text tag, or clear it with null. Rejects with the server's message. */
+export async function postProjectTag(project, tag) {
+  const resp = await fetch('/api/project-tag', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Whytokens-Token': document.querySelector('meta[name=whytokens-token]')?.content || '' },
+    body: JSON.stringify({ project, tag }),
+  });
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(body.error || String(resp.status));
+  return body;
+}

@@ -285,6 +285,30 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(e.count("<li>"), 3)
         self.assertIn('href="?tab=waste"', e)
 
+    def test_shape_mix_block_warning_and_same_shape_line(self):
+        side = lambda n, p: {"sessions": n, "usd": 10.0, "cause_usd": p * 10, "pct": p}
+        mix = {"before": [{"shape": "edit", "label": "edit-heavy", "pct": 0.67}, {"shape": "shell", "label": "shell-heavy", "pct": 0.33}],
+               "after": [{"shape": "edit", "label": "edit-heavy", "pct": 0.33}, {"shape": "shell", "label": "shell-heavy", "pct": 0.67}],
+               "warn": False, "warning": "the work changed <b>x</b>",
+               "same_shape": [{"shape": "edit", "label": "edit-heavy", "before": side(8, 0.30), "after": side(4, 0.10)}]}
+        row = self.render(_change("reduced", mix=mix))["row"]
+        self.assertIn("Shape mix", row)
+        self.assertIn("edit-heavy 67%, shell-heavy 33%", row)
+        self.assertIn("edit-heavy 33%, shell-heavy 67%", row)
+        self.assertNotIn("shp-warn", row)
+        self.assertIn("Same-shape comparison (not the verdict): edit-heavy: 30.0% -> 10.0% of spend, 8 vs 4 sessions", row)
+        warned = self.render(_change("reduced", mix={**mix, "warn": True}))["row"]
+        self.assertIn('class="shp-warn"', warned)
+        self.assertIn("the work changed &lt;b&gt;x&lt;/b&gt;", warned)   # server text, escaped
+        interim = self.render(_change("waiting", after=4, mix=mix))["row"]
+        self.assertIn("Shape mix", interim)
+        self.assertNotIn("Same-shape comparison", interim)
+
+    def test_no_mix_key_leaves_the_detail_unchanged(self):
+        row = self.render(_change("reduced"))["row"]
+        self.assertNotIn("shp-", row)
+        self.assertNotIn("Shape mix", row)
+
     def test_delete_needs_confirm(self):
         no = self.render(_change("reduced"), confirm="false")
         self.assertEqual((no["deleted"], no["fetches"]), (False, 0))

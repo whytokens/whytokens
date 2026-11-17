@@ -233,8 +233,8 @@ class PerformanceBudget(unittest.TestCase):
 
     def test_check_catches_over_budget(self):
         over = perf_budget.check({"turns": 100_000, "cold_scan": 999, "warm_scan": 999,
-                                  "page_load": 999, "sessions_page": 999, "waste": 999})
-        self.assertEqual(len(over), 5)
+                                  "page_load": 999, "sessions_page": 999, "waste": 999, "shapes": 999})
+        self.assertEqual(len(over), 6)
 
 
 if __name__ == "__main__":

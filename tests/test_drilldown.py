@@ -85,7 +85,7 @@ class TestDrillModule(unittest.TestCase):
     def test_state_round_trips_through_the_url(self):
         self.assertEqual(_node(f"""
 import {{ writeSessionState, readSessionState, writeWasteState, readWasteState }} from '{DRILL_URL}';
-const f = {{ project: 'acme', branch: 'main', tool: 'Bash', minCost: 1.5, hasCacheCreation: true, cause: 'idle_gap' }};
+const f = {{ project: 'acme', branch: 'main', tool: 'Bash', minCost: 1.5, hasCacheCreation: true, cause: 'idle_gap', shape: '', tag: '', minX: 0 }};
 const p = new URLSearchParams(); writeSessionState(p, f, {{ col: 'overhead', dir: 'asc' }});
 const back = readSessionState(p.toString());
 console.log(JSON.stringify([back.filters, back.sort]) === JSON.stringify([f, {{ col: 'overhead', dir: 'asc' }}]) ? 'ok' : 'BAD ' + p);
@@ -119,6 +119,25 @@ const s = drillHref(g, {{ tab: 'sessions', filters: {{ cause: 'idle_gap' }}, sor
 if (!s.includes('cause=idle_gap') || !s.includes('sort=overhead&dir=desc')) throw new Error(s);
 console.log('ok');
 """), "ok")
+
+    def test_shape_filters_and_peer_sorts_round_trip_through_the_url(self):
+        out = _node(f"""
+import {{ writeSessionState, readSessionState, EMPTY_FILTERS, DEFAULT_SORT, SESSION_SORTS }} from '{DRILL_URL}';
+const eq = (g, w, m) => {{ if (JSON.stringify(g) !== JSON.stringify(w)) throw new Error(m + ': got ' + JSON.stringify(g) + ', want ' + JSON.stringify(w)); }};
+const f = {{ ...EMPTY_FILTERS, shape: 'edit', tag: 'client work', minX: 2 }};
+const p = new URLSearchParams(); writeSessionState(p, f, {{ col: 'peers', dir: 'desc' }});
+eq([p.get('sshape'), p.get('stag'), p.get('sx'), p.get('sort')], ['edit', 'client work', '2', 'peers'], 'params');
+const back = readSessionState(p.toString());
+eq([back.filters, back.sort], [f, {{ col: 'peers', dir: 'desc' }}], 'round trip');
+const d = new URLSearchParams(); writeSessionState(d);
+eq(d.toString(), '', 'defaults omitted');
+eq(readSessionState('').filters, EMPTY_FILTERS, 'empty url = defaults');
+eq(readSessionState('sort=shape&dir=asc').sort, {{ col: 'shape', dir: 'asc' }}, 'shape sort allowed');
+eq(readSessionState('sort=vs_peers&sx=abc').sort, DEFAULT_SORT, 'unknown sort falls back');
+eq(readSessionState('sx=abc').filters.minX, 0, 'junk multiple tolerated');
+console.log('ok');
+""")
+        self.assertEqual(out, "ok")
 
     def test_overhead_index_sums_server_dollars(self):
         self.assertEqual(_node(f"""

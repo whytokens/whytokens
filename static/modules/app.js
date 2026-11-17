@@ -23,7 +23,8 @@ import { watchProvenance, provBadge, addSplit, orUnknown } from './provenance.js
 import { writeTraceLink, readTraceLink, findTurnRow } from './tracelink.js';
 import { renderChanges } from './changes.js';
 import { verifySlot, fillVerifySlots, resetVerify, recordButton, recordFix } from './verify.js';
-import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchSessionWaste, fetchStatus, fetchBudget, postBudget, fetchWhatif } from './api.js';
+import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchSessionWaste, fetchStatus, fetchBudget, postBudget, fetchWhatif, fetchShapes } from './api.js';
+import { shapeCell, peersCell, peersOf, shapeLabel, shapeOf, shapeKeeps, traceLineHtml, outlierLineHtml, shapeTableHtml, fillShapeFilters, setSelectValue, tagCellHtml, editTag } from './shapes.js';
 import { budgetBandHTML } from './budget.js';
 import { whatifCellHTML, lanesLineHTML } from './whatif.js';
 import { readSessionState, writeSessionState, readWasteState, writeWasteState, drillHref, CARD_TARGET, DEFAULT_SORT, overheadIndex, overheadOf, counted } from './drill.js';
@@ -487,6 +488,7 @@ function buildSessionFilterUI(sessions) {
     `<option value="${esc(k)}">${esc(v)}</option>`).join('');
 }
 
+let sessionMinX = 0;  // from ?sx=: the Overview outlier link; no control, shown as a chip
 function readSessionFilters() {
   sessionFilters = {
     project: document.getElementById('session-project-filter').value.trim().toLowerCase(),
@@ -495,6 +497,9 @@ function readSessionFilters() {
     minCost: parseFloat(document.getElementById('session-min-cost-filter').value) || 0,
     hasCacheCreation: document.getElementById('session-cache-filter').checked,
     cause: document.getElementById('session-cause-filter').value,
+    shape: document.getElementById('session-shape-filter').value,
+    tag: document.getElementById('session-tag-filter').value,
+    minX: sessionMinX,
   };
   renderProjectChip();
 }
@@ -504,7 +509,9 @@ function renderProjectChip() {
   const raw = /** @type {HTMLInputElement} */ (document.getElementById('session-project-filter')).value.trim();
   document.getElementById('project-chip-slot').innerHTML = raw
     ? `<span class="filter-chip">Sessions · project: ${esc(raw)}<button type="button" aria-label="Remove project filter" onclick="clearProjectChip()">&times;</button></span>` : '';
+  if (sessionMinX) document.getElementById('project-chip-slot').innerHTML += `<span class="filter-chip">Sessions · ${esc(sessionMinX)}x+ their peers<button type="button" aria-label="Remove peer multiple filter" onclick="clearMinX()">&times;</button></span>`;
 }
+function clearMinX() { sessionMinX = 0; onSessionFilterChange(); }
 function clearProjectChip() {
   /** @type {HTMLInputElement} */ (document.getElementById('session-project-filter')).value = '';
   onSessionFilterChange();
@@ -532,6 +539,9 @@ function clearSessionFilters() {
   document.getElementById('session-min-cost-filter').value = '';
   document.getElementById('session-cache-filter').checked = false;
   document.getElementById('session-cause-filter').value = '';
+  document.getElementById('session-shape-filter').value = '';
+  document.getElementById('session-tag-filter').value = '';
+  sessionMinX = 0;
   readSessionFilters();
   updateURL();
   applyFilter();
@@ -552,6 +562,7 @@ function applySessionFilters(sessions) {
     if (sessionFilters.tool && !(s.tools || []).includes(sessionFilters.tool)) return false;
     if (sessionFilters.hasCacheCreation && !(s.cache_creation > 0)) return false;
     if (sessionFilters.cause && activeTab === 'sessions' && idx && !(overheadOf(idx, s.full_session_id, sessionFilters.cause) > 0)) return false;
+    if ((sessionFilters.shape || sessionFilters.tag || sessionFilters.minX) && activeTab === 'sessions' && !shapeKeeps(shapesPayload, s, sessionFilters)) return false;
     if (sessionFilters.minCost && sessionCost(s, s.last_date) < sessionFilters.minCost) return false;
     return true;
   });
@@ -579,7 +590,8 @@ function updateURL(hash, push = false) {
   // (Changes reads ?project=&cause= for itself). The cause key is the Sessions filter on Sessions
   // and the cause bar on Waste.
   if (activeTab !== 'trace' && !extTabs.has(activeTab)) {
-    writeSessionState(params, { ...sessionFilters, cause: activeTab === 'sessions' ? sessionFilters.cause : '' },
+    const mine = activeTab === 'sessions';  // cause, shape, tag and multiple narrow Sessions only
+    writeSessionState(params, { ...sessionFilters, cause: mine ? sessionFilters.cause : '', shape: mine ? sessionFilters.shape : '', tag: mine ? sessionFilters.tag : '', minX: mine ? sessionFilters.minX : 0 },
       { col: sessionSortCol, dir: sessionSortDir });
     if (activeTab === 'waste') writeWasteState(params, wasteCause, wasteWeek);
   }
@@ -622,6 +634,11 @@ function sortSessions(sessions) {
     } else if (sessionSortCol === 'overhead') {
       const idx = wasteIndex();
       av = overheadOf(idx, a.full_session_id, sessionFilters.cause); bv = overheadOf(idx, b.full_session_id, sessionFilters.cause);
+    } else if (sessionSortCol === 'peers') {
+      av = peersOf(shapesPayload, a.full_session_id); bv = peersOf(shapesPayload, b.full_session_id);
+      if (av == null || bv == null) return av == null && bv == null ? 0 : av == null ? 1 : -1;  // no multiple: last either way
+    } else if (sessionSortCol === 'shape') {
+      av = shapeLabel(shapesPayload, shapeOf(shapesPayload, a.full_session_id)?.shape); bv = shapeLabel(shapesPayload, shapeOf(shapesPayload, b.full_session_id)?.shape);
     } else if (sessionSortCol === 'duration_min') {
       av = parseFloat(a.duration_min) || 0;
       bv = parseFloat(b.duration_min) || 0;
@@ -898,6 +915,7 @@ function renderTab(name) {
       document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution — ' + RANGE_LABELS[selectedRange];
       renderStats(lastTotals, lastCostTotals);
       renderWhereToAct();
+      renderShapeOverview();
       renderBudgetBand();
       loadModelWhatif();
       renderDailyChart(lastDaily);
@@ -916,6 +934,7 @@ function renderTab(name) {
       // and silently collapse an expanded table on a plain tab switch.
       renderSessionsTable(lastFilteredSessions);
       if (!wastePayload) loadWaste().then(p => { if (p && activeTab === 'sessions') applyFilter(); });  // fills Overhead, applies a cause filter
+      if (!shapesPayload) loadShapes().then(p => { if (p && activeTab === 'sessions') applyFilter(); });  // fills Shape / vs peers
       renderSessionSignalsTable(lastHotSessions.slice(0, 15));  // fixed top-15, no footer
       break;
     case 'waste':
@@ -1136,6 +1155,26 @@ async function loadWaste() {
   try { const p = await req.promise; if (gen !== wasteGen) return null; return (wastePayload = p); }
   catch (e) { if (wasteFetch === req) wasteFetch = null; return null; }
 }
+// /api/shapes follows the data the same way (wasteGen), for Sessions, Trace and Overview.
+let shapesPayload = null, shapesFetch = null;
+async function loadShapes() {
+  if (shapesPayload) return shapesPayload;
+  const gen = wasteGen;
+  if (!shapesFetch || shapesFetch.gen !== gen) shapesFetch = { gen, promise: fetchShapes() };
+  const req = shapesFetch;
+  try { const p = await req.promise; if (gen !== wasteGen) return null; fillShapeFilters(p); return (shapesPayload = p); }
+  catch (e) { if (shapesFetch === req) shapesFetch = null; return null; }
+}
+const sessionsByShapeHref = shape => drillHref(globalParams(), { tab: 'sessions', filters: { shape }, sort: { col: 'cost', dir: 'desc' } });
+// Overview: the outlier line under "Where to act", the by-shape table, and the tag column of Projects.
+async function renderShapeOverview() {
+  const d = await loadShapes();
+  if (!d || activeTab !== 'overview') return;
+  document.getElementById('shape-outliers').innerHTML = outlierLineHtml(d, drillHref(globalParams(),
+    { tab: 'sessions', filters: { minX: d.constants.outlier_x }, sort: { col: 'peers', dir: 'desc' } }));
+  document.getElementById('shape-table-body').innerHTML = shapeTableHtml(d, sessionsByShapeHref);
+  renderProjectCostTable(lastByProject);
+}
 let wasteWeek = null;      // heatmap-cell filter: only sessions whose last_date falls in this week
 async function setWasteCell(c, week) {
   const clear = wasteCause === c && wasteWeek === week;
@@ -1294,7 +1333,7 @@ function setTab(name, hash) {
   activeTab = name;
   applyTabVisibility(name);
   updateURL(hash, changed);
-  if (changed && sessionFilters.cause) aggregate();  // the cause filter narrows Sessions only; other screens re-scope
+  if (changed && (sessionFilters.cause || sessionFilters.shape || sessionFilters.tag || sessionFilters.minX)) aggregate();  // the cause filter narrows Sessions only; other screens re-scope
   renderTab(name);
   gotoSection(hash);
 }
@@ -1316,12 +1355,13 @@ function setSessionControls(f, sort) {
   set('session-project-filter', f.project); set('session-branch-filter', f.branch);
   set('session-tool-filter', f.tool); set('session-min-cost-filter', f.minCost || '');
   set('session-cause-filter', f.cause);
+  setSelectValue('session-shape-filter', f.shape); setSelectValue('session-tag-filter', f.tag); sessionMinX = f.minX;
   /** @type {HTMLInputElement} */ (document.getElementById('session-cache-filter')).checked = f.hasCacheCreation;
   sessionSortCol = sort.col; sessionSortDir = sort.dir;
 }
 function applyURLState(tab) {
   const st = readSessionState(window.location.search), ws = readWasteState(window.location.search);
-  if (tab !== 'sessions') st.filters.cause = '';  // on other screens ?cause= is not a Sessions filter
+  if (tab !== 'sessions') Object.assign(st.filters, { cause: '', shape: '', tag: '', minX: 0 });  // on other screens these are not Sessions filters
   setSessionControls(st.filters, st.sort);
   readSessionFilters();
   wasteCause = tab === 'waste' && ws.cause ? ws.cause : null;
@@ -1786,6 +1826,8 @@ function renderSessionsTable(sessions) {
       ${cell}
       <td class="num">${fmtPct(cacheShare(s))}</td>
       ${overheadCell(s, idx)}
+      ${shapeCell(shapesPayload, s.full_session_id)}
+      ${peersCell(shapesPayload, s.full_session_id)}
     </tr>`;
   }).join('');
   renderTableToggle('sessions-foot', sessions.length, sessionsLimit, 'lessSessionRows', 'moreSessionRows', 'exportSessionsCSV');
@@ -2123,6 +2165,7 @@ function renderSessionDetail(d) {
   document.getElementById('session-detail-title').textContent = 'Session Drilldown — ' + s.display_id + '…';
   document.getElementById('session-detail-subtitle').textContent = s.session_id + ' · ' + s.project;
   renderTraceWhatif(d);
+  loadShapes().then(p => { if (selectedSessionDetail === d) document.getElementById('session-detail-shape').innerHTML = traceLineHtml(p, s.session_id); });
   document.getElementById('session-detail-stats').innerHTML = [
     ['Project', s.project],
     ['Model', s.model],
@@ -2704,6 +2747,7 @@ function renderProjectCostTable(byProject) {
       <td class="num">${fmt(p.input)}</td>
       <td class="num">${fmt(p.output)}</td>
       <td class="cost">${fmtCost(p.cost)}</td>
+      <td class="shp-tagcell">${shapesPayload ? tagCellHtml(p.project, (shapesPayload.tags || {})[p.project]) : ''}</td>
     </tr>`;
     const branchRows = expandable ? branches.map(b => `<tr class="branch-subrow" data-parent="${esc(p.project)}" hidden>
       <td class="branch-cell">↳ ${esc(b.branch || '—')}</td>
@@ -2712,6 +2756,7 @@ function renderProjectCostTable(byProject) {
       <td class="num">${fmt(b.input)}</td>
       <td class="num">${fmt(b.output)}</td>
       <td class="cost">${fmtCost(b.cost)}</td>
+      <td></td>
     </tr>`).join('') : '';
     return mainRow + branchRows;
   }).join('');
@@ -2725,6 +2770,12 @@ function wireProjectExpand() {
   const body = document.getElementById('project-cost-body');
   if (!body) return;
   body.addEventListener('click', e => {
+    const tg = e.target.closest('[data-tag-project]');
+    if (tg) {
+      const project = tg.dataset.tagProject;
+      editTag(tg.closest('td'), project, (shapesPayload?.tags || {})[project], () => { shapesPayload = null; shapesFetch = null; loadShapes(); });
+      return;
+    }
     const go = e.target.closest('[data-sessions-of]');
     if (go) { showProjectSessions(go.dataset.sessionsOf); return; }
     const btn = e.target.closest('.row-toggle');
@@ -2942,6 +2993,7 @@ async function loadData() {
     rawData = d;
     document.body.classList.remove('booting');
     wastePayload = null;  // findings follow the data: refetch on the next Waste render
+    shapesPayload = null; shapesFetch = null;
     sessionFindings.clear();
     sessionLanes.clear();  // a rescan changes an active session's lanes
     wasteGen++;
@@ -2966,6 +3018,7 @@ async function loadData() {
       applyURLState(activeTab);
       // a cause filter or an overhead sort needs the findings before the first draw
       if (sessionFilters.cause || sessionSortCol === 'overhead') await loadWaste();
+      if (sessionFilters.shape || sessionFilters.tag || sessionFilters.minX || sessionSortCol === 'peers' || sessionSortCol === 'shape') await loadShapes();
       updateSortIcons();
       updateModelSortIcons();
       updateProjectSortIcons();
@@ -3013,7 +3066,7 @@ function onAutoRefreshToggle() {
 Object.assign(window, {
   triggerRescan, selectAllModels, clearAllModels, setRange, setDisplayTZ,
   setModelSort, resetPricing, onPricingChange, exportSessionsCSV,
-  onSessionFilterChange, clearSessionFilters, setSessionSort, exportProjectsCSV,
+  onSessionFilterChange, clearSessionFilters, clearMinX, setSessionSort, exportProjectsCSV,
   exportProjectBranchCSV, setProjectSort, setProjectBranchSort,
   closeSessionDetail, exportSessionTurnsCSV, closeToolPanel, onModelToggle, setGroupModels,
   openSessionDetail, openToolPanel, exportModelCSV,
