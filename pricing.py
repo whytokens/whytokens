@@ -291,10 +291,11 @@ def calc_cost(model, inp, out, cache_read, cache_creation, timestamp=None,
 # priced at the row's normal rates -- exact even with rates edited in the dashboard.
 #
 # Haiku 5.5 long prompts: every rate is 5x once a request's prompt exceeds 100K
-# tokens (anthropic.com/claude-haiku-5-5, 2026-10-07). The announcement does not
-# define "prompt"; we assume the Sonnet 4.5 long-context rule — prompt = input +
-# cache_read + cache_creation, and the whole request (output too) bills at the
-# higher rate. ponytail: unconfirmed until the platform pricing page defines it.
+# tokens. Confirmed on platform.claude.com/docs/en/about-claude/pricing (2026-11-17):
+# prompt = input + cache_read + cache_creation, applied per request, and the whole
+# request (output too) bills at the higher rate. Per request, so a row that sums
+# several requests (scanner's AgentSummary estimate) must stay under the line itself.
+# shortcut: list price only; an Enterprise contract may price this differently.
 LONG_PROMPT_MODEL, LONG_PROMPT_TOKENS, LONG_PROMPT_MULT = "haiku-5-5", 100_000, 5.0
 LONG_PROMPT_COLS = ("model", "input_tokens", "cache_read_tokens", "cache_creation_tokens")
 

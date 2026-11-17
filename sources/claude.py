@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 import policy
+import pricing
 import scanner
 
 # schema_meta marker of backfill_retry_inputs; waste.measurement reads it
@@ -378,9 +379,21 @@ class ClaudeSource:
         if scanner._meta_get(conn, "subagent_estimates_v2_reparse_done_claude") != "1":
             conn.execute("DELETE FROM turns WHERE message_id LIKE 'agent_summary:%' "
                          "OR message_id LIKE 'advisor:%:est'")
-        return cleared + scanner.force_reparse_once(
+        cleared += scanner.force_reparse_once(
             conn, "subagent_estimates_v2_reparse_done_claude", NAME,
             why="to add subagent output/advisor/AgentSummary estimates")
+        # v3: a Haiku 5.5 summary row summed past 100K prompt tokens took the 5x
+        # long-prompt rate although each fire was shorter. Only DBs holding such a
+        # row pay the re-read; the re-parse rewrites it as rows of <= 100K each.
+        marker = "agent_summary_long_prompt_reparse_done_claude"
+        if scanner._meta_get(conn, marker) != "1" and not conn.execute(
+                f"""SELECT 1 FROM turns WHERE message_id LIKE 'agent_summary:%'
+                    AND model LIKE '%{pricing.LONG_PROMPT_MODEL}%' AND input_tokens
+                    + cache_read_tokens + cache_creation_tokens > {pricing.LONG_PROMPT_TOKENS}
+                    LIMIT 1""").fetchone():
+            scanner._meta_set(conn, marker, "1")
+        return cleared + scanner.force_reparse_once(
+            conn, marker, NAME, why="to price AgentSummary estimates on Haiku 5.5 per call")
 
     def backfill_effort(self, conn):
         """One-time turns.effort backfill (see scanner.backfill_effort_once).

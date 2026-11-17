@@ -13,6 +13,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import policy
+import pricing
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
@@ -1286,7 +1287,10 @@ def _apply_estimates(filepath, turns, full_turns, info):
     # counts at tick t0+k*30 (k>=1) only up to the agent's last activity, when any
     # record (user/tool_result too) landed in that tick's window, priced as the
     # latest assistant message's context at that tick re-read from cache.
-    # Aggregated into ONE turn per subagent file so turn counts don't inflate.
+    # Aggregated into ONE turn per subagent file so turn counts don't inflate,
+    # except on a model priced by prompt length (Haiku 5.5, pricing.LONG_PROMPT_*):
+    # there consecutive fires are grouped into rows of at most that many prompt
+    # tokens, so the per-row rule prices each fire as its own request would be.
     msgs = []
     for t in full_turns:
         ts = _parse_ts(t.get("timestamp"))
@@ -1299,27 +1303,40 @@ def _apply_estimates(filepath, turns, full_turns, info):
         times = [m[0] for m in msgs]
         t0, t_end = min(events), max(events)
         buckets = {max(1, math.ceil((e - t0) / AGENT_SUMMARY_INTERVAL_S)) for e in events}
-        n = ctx = 0
+        last = msgs[-1][1]
+        # The file's own summary id; every row of this parse carries it, so insert_turns
+        # can drop the file's rows a regroup (or a lost fire) left behind.
+        base = "%s%s:%s" % (AGENT_SUMMARY_ID_PREFIX, last["session_id"], Path(filepath).stem)
+        for t in turns:
+            if t.get("is_sidechain"):
+                t["summary_of"] = base
+        cap = (pricing.LONG_PROMPT_TOKENS
+               if pricing.LONG_PROMPT_MODEL in (last.get("model") or "").lower() else math.inf)
+        chunks = []  # [fires, context, last fire's message time]; greedy in time order, so earlier rows never change
         for k in sorted(buckets):
             tick = t0 + k * AGENT_SUMMARY_INTERVAL_S
             j = bisect.bisect_right(times, tick) - 1
             if tick > t_end or j < 0:
                 continue
             m = msgs[j][1]
-            n += 1
-            ctx += m["input_tokens"] + m["cache_read_tokens"] + m["cache_creation_tokens"]
-        if n:
-            last = msgs[-1][1]
+            c = m["input_tokens"] + m["cache_read_tokens"] + m["cache_creation_tokens"]
+            if not chunks or (chunks[-1][0] + 1) * AGENT_SUMMARY_INPUT_TOKENS + chunks[-1][1] + c > cap:
+                chunks.append([0, 0, None])
+            chunks[-1][0] += 1
+            chunks[-1][1] += c
+            chunks[-1][2] = m["timestamp"]
+        for i, (n, ctx, ts) in enumerate(chunks):
             extra.append(dict(
                 last,
+                # a closed row is dated by its own last fire, so later fires never move its day
+                timestamp=ts if i < len(chunks) - 1 else last["timestamp"],
                 input_tokens=n * AGENT_SUMMARY_INPUT_TOKENS,
                 output_tokens=n * AGENT_SUMMARY_OUTPUT_TOKENS,
                 cache_read_tokens=ctx,
                 cache_creation_tokens=0, cache_creation_5m_tokens=0, cache_creation_1h_tokens=0,
                 speed="", tool_name=None, tool_calls=None, stop_reason="",
-                duration_ms=0, is_sidechain=1, is_subagent=1, estimated=1,
-                message_id="%s%s:%s" % (AGENT_SUMMARY_ID_PREFIX, last["session_id"],
-                                         Path(filepath).stem)))
+                duration_ms=0, is_sidechain=1, is_subagent=1, estimated=1, summary_of=base,
+                message_id=base + ("#%d" % i if i else "")))
     turns.extend(extra)
 
 
@@ -1508,6 +1525,26 @@ def insert_turns(conn, turns):
     conn.executemany("DELETE FROM turns WHERE message_id = ? AND message_id IS NOT NULL AND message_id != ''", [
         (t["message_id"].rsplit(":", 1)[0] + ":est",)
         for t in turns if is_advisor_turn(t) and not t["message_id"].endswith(":est")])
+    # A re-parse emits a subagent file's whole AgentSummary row set (`summary_of`, set
+    # by _apply_estimates); a regroup or a lost fire can shrink it, so drop that file's
+    # estimate rows the new set no longer has.
+    summaries = {}
+    for t in turns:
+        if t.get("summary_of"):
+            keep = summaries.setdefault(t["summary_of"], set())
+            if is_agent_summary_turn(t):
+                keep.add(t["message_id"])
+    # shortcut: an incremental parse that yields no turn at all (only user records,
+    # timestamped before the file's start) cannot clean up; transcripts are append-only.
+    for base, keep in summaries.items():
+        rows = conn.execute("""SELECT message_id FROM turns WHERE estimated = 1
+                               AND message_id IS NOT NULL AND message_id != ''
+                               AND message_id >= ? AND message_id < ?""",
+                            (base, base + "$")).fetchall()  # '$' follows '#': an index range
+        stale = [m for (m,) in rows if m not in keep
+                 and (m == base or (m[len(base):len(base) + 1] == "#" and m[len(base) + 1:].isdigit()))]
+        conn.executemany("DELETE FROM turns WHERE message_id = ? AND message_id IS NOT NULL "
+                         "AND message_id != ''", [(m,) for m in stale])
     conn.executemany("""
         INSERT INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
@@ -1553,7 +1590,8 @@ def insert_turns(conn, turns):
                AND COALESCE(turns.estimated, 0) = 1
                AND (excluded.output_tokens != turns.output_tokens
                     OR excluded.cache_read_tokens != turns.cache_read_tokens
-                    OR excluded.input_tokens != turns.input_tokens))
+                    OR excluded.input_tokens != turns.input_tokens
+                    OR excluded.timestamp != turns.timestamp))
            OR (COALESCE(excluded.estimated, 0) = 1
                AND COALESCE(turns.estimated, 0) = 0
                AND COALESCE(turns.stop_reason, '') = ''

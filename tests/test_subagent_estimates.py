@@ -190,6 +190,144 @@ class TestAgentSummary(Base):
         self.assertEqual(len(keys), 2)
 
 
+class TestAgentSummaryLongPrompt(Base):
+    """Haiku 5.5 bills a request 5x once its prompt passes 100K. Summed into one row,
+    short fires crossed that line together; each row must stay one fire's side of it."""
+    KEY = TestAgentSummary.KEY
+
+    def write_agent(self, model, crs):
+        recs = []
+        for i, cr in enumerate(crs):  # one message per 30 s window: one fire each
+            r = rec("m%d" % i, i * 30, [{"type": "text", "text": "hi"}], stop="end_turn", cr=cr)
+            r["message"]["model"] = model
+            recs.append(r)
+        recs.append(user(len(crs) * 30))  # keeps the last tick inside the agent's life
+        self.write(self.path(), recs)
+
+    def summaries(self, rows):
+        return {k: v for k, v in rows.items() if k.startswith("agent_summary:")}
+
+    def prompt(self, r):
+        return r["input_tokens"] + r["cache_read_tokens"] + r["cache_creation_tokens"]
+
+    def test_haiku_fires_grouped_under_the_line(self):
+        self.write_agent("claude-haiku-5-5", [45_000, 45_000, 45_000, 150_000, 45_000])
+        rows = self.summaries(self.parse(self.path()))
+        # ticks 30..150 read m1, m2, m3 (150K), m4, m4
+        self.assertEqual(sorted(rows), [self.KEY, self.KEY + "#1", self.KEY + "#2"])
+        fires = [rows[k]["input_tokens"] // scanner.AGENT_SUMMARY_INPUT_TOKENS for k in sorted(rows)]
+        self.assertEqual(fires, [2, 1, 2])
+        self.assertEqual(self.prompt(rows[self.KEY + "#1"]), 300 + 10 + 150_000)  # alone, over the line
+        for k in (self.KEY, self.KEY + "#2"):
+            self.assertLessEqual(self.prompt(rows[k]), 100_000)
+        self.assertEqual(sum(r["cache_read_tokens"] for r in rows.values()),
+                         4 * 45_010 + 150_010)  # nothing lost or doubled
+
+    def test_other_models_keep_one_row(self):
+        self.write_agent("claude-sonnet-5-5", [45_000, 45_000, 45_000])
+        self.assertEqual(list(self.summaries(self.parse(self.path()))), [self.KEY])
+
+    def haiku(self, mid, off, cr, stop="end_turn"):
+        r = rec(mid, off, [{"type": "text", "text": "hi"}], stop=stop, cr=cr)
+        r["message"]["model"] = "claude-haiku-5-5"
+        return r
+
+    def rescan(self, p, records, n):
+        self.write(p, records, mode="a")
+        os.utime(p, (1e9 + n,) * 2)
+        return self.summaries(self.scan())
+
+    def test_regroup_on_rescan_drops_the_obsolete_row(self):
+        p = self.path()
+        # m1 still streaming at 60K: fires 60K | 40K+40K -> two rows
+        self.write(p, [self.haiku("m0", 0, 45_000), self.haiku("m1", 30, 60_000, stop=None),
+                       self.haiku("m2", 60, 40_000), user(90)])
+        os.utime(p, (1e9,) * 2)
+        self.assertEqual(sorted(self.summaries(self.scan())), [self.KEY, self.KEY + "#1"])
+        # m1's final record says 10K: all three fires fit one row, so ":1" must go
+        rows = self.rescan(p, [self.haiku("m1", 30, 10_000)], 10)
+        self.assertEqual(list(rows), [self.KEY])
+        self.assertEqual(rows[self.KEY]["input_tokens"], 3 * scanner.AGENT_SUMMARY_INPUT_TOKENS)
+
+    def test_closed_row_is_dated_by_its_own_last_fire(self):
+        p = self.path()
+        self.write(p, [self.haiku("m0", 0, 45_000), self.haiku("m1", 30, 60_000),
+                       self.haiku("m2", 50, 45_000)])  # one fire (tick 30); dated by m2, the latest
+        os.utime(p, (1e9,) * 2)
+        self.scan()
+        # later fires open row ":1"; row 0 keeps its tokens but closes, dated by m1
+        rows = self.rescan(p, [self.haiku("m3", 100, 45_000), user(130)], 10)
+        self.assertEqual(sorted(rows), [self.KEY, self.KEY + "#1"])
+        self.assertEqual(rows[self.KEY]["input_tokens"], scanner.AGENT_SUMMARY_INPUT_TOKENS)
+        self.assertEqual(rows[self.KEY]["timestamp"], self.parse(p)[self.KEY]["timestamp"])
+        self.assertEqual(rows[self.KEY]["timestamp"],
+                         (T0 + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    def test_rescan_of_one_file_keeps_its_siblings_rows(self):
+        sid = "sess:one"  # a colon in the session id must not merge two files' rows
+        files = {}
+        for stem in ("agent-a", "agent-b"):
+            f = self.proj / "p" / "x" / "subagents" / (stem + ".jsonl")
+            f.parent.mkdir(parents=True, exist_ok=True)
+            recs = [self.haiku("%s-m%d" % (stem, i), i * 30, 45_000) for i in range(3)] + [user(90)]
+            for r in recs:
+                r["sessionId"] = sid
+            self.write(f, recs)
+            os.utime(f, (1e9,) * 2)
+            files[stem] = f
+        before = sorted(self.summaries(self.scan()))
+        self.assertEqual(len(before), 4)  # two rows per file
+        tail = user(95)
+        tail["sessionId"] = sid
+        self.write(files["agent-b"], [tail], mode="a")
+        os.utime(files["agent-b"], (1e9 + 10,) * 2)
+        self.assertEqual(sorted(self.summaries(self.scan())), before)
+
+    def test_rescan_never_touches_a_lookalike_owner(self):
+        # every id below starts with the first file's; a rescan of the first keeps them
+        files = []
+        for sid, stem in (("sess", "agent-a"), ("sess:agent-a", "agent-b"), ("sess", "agent-a#x")):
+            f = self.proj / "p" / sid.replace(":", "_") / "subagents" / (stem + ".jsonl")
+            f.parent.mkdir(parents=True, exist_ok=True)
+            recs = [self.haiku("%s-m%d" % (stem, i), i * 30, 45_000) for i in range(3)] + [user(90)]
+            for r in recs:
+                r["sessionId"] = sid
+            self.write(f, recs)
+            os.utime(f, (1e9,) * 2)
+            files.append((f, sid))
+        before = sorted(self.summaries(self.scan()))
+        self.assertEqual(len(before), 6)
+        tail = user(95)
+        tail["sessionId"] = files[0][1]
+        self.write(files[0][0], [tail], mode="a")
+        os.utime(files[0][0], (1e9 + 10,) * 2)
+        self.assertEqual(sorted(self.summaries(self.scan())), before)
+
+    def test_rescan_with_no_fire_left_drops_the_row(self):
+        p = self.path()
+        self.write(p, [self.haiku("m0", 0, 1000, stop=None), user(40)])  # tick 30 fires
+        os.utime(p, (1e9,) * 2)
+        self.assertEqual(list(self.summaries(self.scan())), [self.KEY])
+        # m0's final record lands at t=70: no message exists at or before any tick
+        self.assertEqual(self.rescan(p, [self.haiku("m0", 70, 1000)], 10), {})
+
+    def test_old_summed_row_is_rewritten_on_upgrade(self):
+        import sources
+        self.write_agent("claude-haiku-5-5", [45_000, 45_000, 45_000])
+        src = [sources.claude.ClaudeSource(projects_dirs=[str(self.proj)])]
+        sources.scan_all(db_path=self.db, verbose=False, sources=src)
+        conn = scanner.get_db(self.db)  # simulate a pre-fix DB: one summed row, marker unset
+        conn.execute("DELETE FROM turns WHERE message_id LIKE 'agent_summary:%#1'")
+        conn.execute("UPDATE turns SET input_tokens=900, cache_read_tokens=135030 WHERE message_id=?",
+                     (self.KEY,))
+        conn.execute("DELETE FROM schema_meta WHERE key='agent_summary_long_prompt_reparse_done_claude'")
+        conn.commit(); conn.close()
+        sources.scan_all(db_path=self.db, verbose=False, sources=src)
+        rows = self.summaries(self.scan())
+        self.assertEqual(sorted(rows), [self.KEY, self.KEY + "#1"])
+        self.assertTrue(all(self.prompt(r) <= 100_000 for r in rows.values()))
+
+
 class TestIncremental(Base):
     def test_rescan_updates_summary_without_duplicates(self):
         p = self.path()
