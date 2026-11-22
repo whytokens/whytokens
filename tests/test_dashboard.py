@@ -512,6 +512,7 @@ class TestDashboardHTTP(unittest.TestCase):
             self.assertEqual(resp.status, 200)
             self.assertIn("application/json", resp.headers["Content-Type"])
             data = json.loads(resp.read())
+            self.assertEqual(data.pop("_fees"), {"web_search_usd": pricing.WEB_SEARCH_FEE_USD})
             self.assertEqual(data, pricing.PRICING)
             self.assertIn("claude-opus-4-8", data)
 
@@ -808,11 +809,11 @@ class TestStaticAssets(unittest.TestCase):
         self.assertIn('[12, 13, 14, 15, 16, 17]', APP_JS)
 
     def test_recent_sessions_shows_cache_tokens(self):
-        """A session's expanded detail exposes its cache token usage; the list itself stays at eight columns."""
+        """A session's expanded detail exposes its cache token usage; the list itself stays at nine columns."""
         self.assertIn("stat('Cache Read', fmt(s.cache_read))", APP_JS)
         self.assertIn("orUnknown(s.cache_creation", APP_JS)
         head = INDEX_HTML[INDEX_HTML.index('<table class="sessions-table">'):INDEX_HTML.index('id="sessions-body"')]
-        self.assertEqual(head.count("<th>") + head.count("<th "), 8)
+        self.assertEqual(head.count("<th>") + head.count("<th "), 9)
         for hidden in ("cache_read", "cache_creation", "input", "output", "cache_share", "peers"):
             self.assertNotIn(f"setSessionSort('{hidden}')", head)
 

@@ -14,9 +14,11 @@ import {
   loadPricing, setOverride, clearOverrides,
   isBillable, isEstimated, getPricing, calcCost, rowCost, rowCostBreakdown,
   sessionCost, sessionCostBreakdown, sessionCostAtListRates,
+  costLayers, LAYERS, LAYER_TOOLTIP, webSearchFee,
   cacheShare, coldRestarts, toolBreakdown,
 } from './pricing.js';
 import { VALID_TABS, resolveTab, applyTabVisibility, addExtRailItem, toggleRail, initRail } from './nav.js';
+import { pickReceipt, receiptHTML } from './firstscreen.js';
 import { store, TZ_KEY, alpha, fillTokens, initTheme, setThemePref } from './theme.js';
 import { weekOf, promptBands, turnsOfBand, sessionWaterfall, causeWeekMatrix } from './analytics.js';
 import { watchProvenance, provBadge, addSplit, orUnknown } from './provenance.js';
@@ -26,6 +28,7 @@ import { verifySlot, fillVerifySlots, resetVerify, recordButton, recordFix } fro
 import { fetchData, fetchSession, fetchSessionBreakdown, fetchPricing, postRescan, fetchExtensions, fetchJson, fetchWaste, fetchSessionWaste, fetchStatus, scanLine, fetchBudget, postBudget, fetchWhatif, fetchShapes } from './api.js';
 import { shapeCell, peersCell, peersOf, shapeLabel, shapeOf, shapeKeeps, traceLineHtml, outlierLineHtml, shapeTableHtml, fillShapeFilters, setSelectValue, tagCellHtml, editTag } from './shapes.js';
 import { budgetBandHTML } from './budget.js';
+import { initReconcile, ccCell, CC_TOOLTIP } from './reconcile.js';
 import { whatifCellHTML, lanesLineHTML } from './whatif.js';
 // The opt-in model-help module (llm.js) is left out of public builds; it is loaded at init if present.
 let llm = null;
@@ -98,6 +101,7 @@ let branchLimit = TABLE_STEPS[0];
 // day buckets (/api/data?tz), the range bounds derived from them, the hourly
 // chart and rendered timestamps. Claude's own usage page reports UTC; this
 // machine's local day is the default. Read from ?tz= on first load.
+let refreshReconcile;  // set by initReconcile: reloads an open reconcile panel
 let displayTZ = 'local';  // 'local' or 'utc'
 
 // ── Peak-hour config ───────────────────────────────────────────────────────
@@ -107,8 +111,8 @@ const PEAK_HOURS_UTC = new Set([12, 13, 14, 15, 16, 17]);
 
 // Local-timezone offset in hours (signed). Fractional offsets (e.g. India UTC+5:30)
 // are rounded to the nearest hour for bucket alignment.
-function localOffsetHours() {
-  return Math.round(-new Date().getTimezoneOffset() / 60);
+function localOffsetHours(at) {
+  return Math.round(-(at || new Date()).getTimezoneOffset() / 60);
 }
 
 // Return the UTC hour (0–23) corresponding to a displayed-hour bucket.
@@ -118,9 +122,11 @@ function displayHourToUTC(displayHour, tzMode) {
 }
 
 // Return the displayed-hour bucket for a UTC hour.
-function utcHourToDisplay(utcHour, tzMode) {
+// `utcDay` (the event's own UTC date) picks that date's offset, so DST does not shift history.
+function utcHourToDisplay(utcHour, tzMode, utcDay) {
   if (tzMode === 'utc') return utcHour;
-  return ((utcHour + localOffsetHours()) % 24 + 24) % 24;
+  const at = utcDay ? new Date(`${utcDay}T${String(utcHour).padStart(2, '0')}:00:00Z`) : null;
+  return ((utcHour + localOffsetHours(at && !isNaN(at) ? at : null)) % 24 + 24) % 24;
 }
 
 function isPeakHour(displayHour, tzMode) {
@@ -159,6 +165,8 @@ function renderPricingEditor() {
       <td class="pricing-source">${overridden ? 'Custom' : 'Default'}</td>
     </tr>`;
   }).join('');
+  const fee = document.getElementById('pricing-fees');
+  if (fee) fee.textContent = `Web search: ${fmtCost(webSearchFee())} per successful WebSearch call, added to Estimated (not editable here).`;
   renderPricingFallbacks();
 }
 
@@ -334,6 +342,7 @@ function setRange(range) {
 
 function setDisplayTZ(mode) {
   displayTZ = mode;
+  refreshReconcile?.();
   renderBuildInfo();
   document.querySelectorAll('.tz-btn').forEach(btn =>
     btn.classList.toggle('active', btn.dataset.tz === mode)
@@ -415,7 +424,7 @@ function refreshModelFilter() {
   for (const r of rawData.daily_by_model) {
     if ((start && r.day < start) || (end && r.day > end)) continue;
     const u = usage[r.model] || (usage[r.model] = { cost: 0, tokens: 0 });
-    u.cost   += rowCost(r, r.day);
+    u.cost   += rowCost(r, r.rate_day || r.day);
     u.tokens += r.input + r.output + r.cache_read + r.cache_creation;
   }
   document.querySelectorAll('#model-checkboxes details.model-group').forEach(d => {
@@ -660,17 +669,18 @@ function aggregateCostBreakdown(rows) {
   return rows.reduce((acc, r) => {
     // Per-model when a session breakdown is present (mixed-model sessions), else
     // single-model. sessionCostBreakdown handles both. A per-day row prices on its own day.
-    const c = sessionCostBreakdown(r, r.day || r.last_date);
+    const c = sessionCostBreakdown(r, r.rate_day || r.day || r.last_date);
     acc.input += c.input;
     acc.output += c.output;
     acc.cache_read += c.cache_read;
     acc.cache_creation += c.cache_creation;
+    acc.cache_creation_1h += c.cache_creation_1h;
     acc.total += c.total;
     acc.cache_savings += c.cache_savings;
     acc.prompt += (r.input || 0) + (r.cache_read || 0) + (r.cache_creation || 0);  // same basis as cacheShare()
     acc.cache_tokens += r.cache_read || 0;
     return acc;
-  }, { input: 0, output: 0, cache_read: 0, cache_creation: 0, total: 0, cache_savings: 0, prompt: 0, cache_tokens: 0 });
+  }, { input: 0, output: 0, cache_read: 0, cache_creation: 0, cache_creation_1h: 0, total: 0, cache_savings: 0, prompt: 0, cache_tokens: 0 });
 }
 
 function sessionSignals(sessions) {
@@ -725,7 +735,7 @@ function aggregate() {
     // Priced per (day, model) row and summed — same reason as modelMap below:
     // each row knows its own model AND its own day, so a tiered model stays
     // correctly priced across a range that straddles a price change.
-    d.cost           += rowCost(r, r.day);
+    d.cost           += rowCost(r, r.rate_day || r.day);
   }
   const daily = Object.values(dailyMap).sort((a, b) => a.day.localeCompare(b.day));
 
@@ -742,7 +752,7 @@ function aggregate() {
     m.cache_read     += r.cache_read;
     m.cache_creation += r.cache_creation;
     m.turns          += r.turns;
-    m.cost           += rowCost(r, r.day);
+    m.cost           += rowCost(r, r.rate_day || r.day);
   }
 
   // Filter sessions by model + date range
@@ -761,35 +771,27 @@ function aggregate() {
 
   const byModel = Object.values(modelMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
-  // By project: aggregate from filtered sessions
-  const projMap = {};
+  // By project and project+branch: aggregated from turn-level rows with the same model + range
+  // filters as Overview, so a session spanning the range edge only contributes its in-range turns.
+  // Session counts still come from the sessions whose last day falls in range.
+  const projMap = {}, projBranchMap = {};
+  const bump = (m, key, init, r) => {
+    const p = m[key] || (m[key] = { ...init, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 });
+    p.input += r.input; p.output += r.output; p.cache_read += r.cache_read;
+    p.cache_creation += r.cache_creation; p.turns += r.turns;
+    p.cost += rowCost(r, r.rate_day || r.day);
+  };
+  for (const r of rawData.daily_by_project || []) {
+    if (!selectedModels.has(r.model) || (start && r.day < start) || (end && r.day > end)) continue;
+    bump(projMap, r.project, { project: r.project }, r);
+    bump(projBranchMap, r.project + '\x00' + (r.branch || ''), { project: r.project, branch: r.branch || '' }, r);
+  }
   for (const s of rangeFilteredSessions) {
-    if (!projMap[s.project]) projMap[s.project] = { project: s.project, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
-    const p = projMap[s.project];
-    p.input          += s.input;
-    p.output         += s.output;
-    p.cache_read     += s.cache_read;
-    p.cache_creation += s.cache_creation;
-    p.turns          += s.turns;
-    p.sessions++;
-    p.cost += sessionCost(s, s.last_date);
+    if (projMap[s.project]) projMap[s.project].sessions++;
+    const pb = projBranchMap[s.project + '\x00' + (s.branch || '')];
+    if (pb) pb.sessions++;
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
-
-  // By project+branch: aggregate from filtered sessions
-  const projBranchMap = {};
-  for (const s of rangeFilteredSessions) {
-    const key = s.project + '\x00' + (s.branch || '');
-    if (!projBranchMap[key]) projBranchMap[key] = { project: s.project, branch: s.branch || '', input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
-    const pb = projBranchMap[key];
-    pb.input          += s.input;
-    pb.output         += s.output;
-    pb.cache_read     += s.cache_read;
-    pb.cache_creation += s.cache_creation;
-    pb.turns          += s.turns;
-    pb.sessions++;
-    pb.cost += sessionCost(s, s.last_date);
-  }
   const byProjectBranch = Object.values(projBranchMap).sort((a, b) => b.cost - a.cost);
 
   // Totals
@@ -800,6 +802,7 @@ function aggregate() {
     output:         byModel.reduce((s, m) => s + m.output, 0),
     cache_read:     byModel.reduce((s, m) => s + m.cache_read, 0),
     cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
+    cache_creation_1h: filteredDaily.reduce((s, r) => s + (r.cache_creation_1h || 0), 0),
     // Codex reports no cache writes: all-Codex = unknown, mixed = the total covers Claude only
     cache_creation_unknown: byModel.length > 0 && byModel.every(m => isEstimated(m.model)),
     cache_creation_partial: byModel.some(m => isEstimated(m.model)),
@@ -808,6 +811,7 @@ function aggregate() {
   // Dollar cards use the same per-day rows as the chart, the model table and their own token
   // sub-lines. Whole sessions by last day would move a midnight-spanning session's cost onto one day.
   const costTotals = aggregateCostBreakdown(filteredDaily);
+  costTotals.layers = costLayers(filteredDaily, r => r.rate_day || r.day);
 
   // By tool: aggregate from server-side per-day tool data
   const toolMap = {};
@@ -822,7 +826,7 @@ function aggregate() {
     t.cache_read     += r.cache_read;
     t.cache_creation += r.cache_creation;
     t.turns          += r.turns;
-    t.cost           += rowCost(r, r.day);
+    t.cost           += rowCost(r, r.rate_day || r.day);
   }
   const byTool = Object.values(toolMap).sort((a, b) => b.cost - a.cost);
 
@@ -840,7 +844,7 @@ function aggregate() {
     e.cache_read     += r.cache_read;
     e.cache_creation += r.cache_creation;
     e.turns          += r.turns;
-    e.cost           += rowCost(r, r.day);
+    e.cost           += rowCost(r, r.rate_day || r.day);
   }
   const byEffort = Object.values(effortMap).sort((a, b) => b.cost - a.cost);
 
@@ -857,7 +861,7 @@ function aggregate() {
     e.cache_read     += r.cache_read;
     e.cache_creation += r.cache_creation;
     e.turns          += r.turns;
-    e.cost           += rowCost(r, r.day);
+    e.cost           += rowCost(r, r.rate_day || r.day);
   }
   const byMcp = Object.values(mcpMap).sort((a, b) => b.cost - a.cost);
 
@@ -920,6 +924,7 @@ function renderTab(name) {
       document.getElementById('daily-chart-title').textContent = 'Daily Token Usage — ' + RANGE_LABELS[selectedRange];
       document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution — ' + RANGE_LABELS[selectedRange];
       renderStats(lastTotals, lastCostTotals);
+      renderFirstScreen();
       renderWhereToAct();
       renderShapeOverview();
       renderBudgetBand();
@@ -1023,8 +1028,12 @@ function nextStepBody(s, fix, why, open, project, inTrace = false) {
     return `<details${open ? ' open' : ''}><summary class="muted">Next step</summary>` +
       // Reading order: what to do, what it cost, the button that records it, then the calls as evidence.
       `<p class="wg-title"><strong>${esc(a.title)}</strong></p>` +
-      `<p class="wg-step">Add this rule to your project's CLAUDE.md:</p>` +
-      `<div class="wg-rule"><code>${esc(a.rule)}</code> <button class="filter-btn" onclick="navigator.clipboard && navigator.clipboard.writeText(this.previousElementSibling.textContent)">Copy</button></div>` +
+      // Only agent-followable rules go to CLAUDE.md; a human habit (/compact, breaks) never does.
+      (a.audience === 'agent'
+        ? `<p class="wg-step">Add this rule to your project's CLAUDE.md:</p>` +
+          `<div class="wg-rule"><code>${esc(a.rule)}</code> <button class="filter-btn" onclick="navigator.clipboard && navigator.clipboard.writeText(this.previousElementSibling.textContent)">Copy</button></div>`
+        : `<p class="wg-step">A habit for you, not a rule for Claude (Claude cannot do this on its own):</p>` +
+          `<div class="wg-rule">${esc(a.rule)}</div>`) +
       `<p class="wg-est">Estimated cost of this habit in this session: about ${fmtCostBig(a.est_usd)}.</p>` +
       (project ? `<p class="wg-step">${recordButton(project, s.cause, a.title)} <span class="muted">Marks today as the day you changed this, so the Changes tab can compare before and after.</span></p>` : '') +
       `<details class="wg-evidence"><summary class="muted">The calls behind this (${rows.length} shown)</summary>` +
@@ -1394,6 +1403,7 @@ function restoreFromURL() {
   buildFilterUI(rawData.all_models, readURLModels(rawData.all_models));
   const tz = readURLTZ(), tzChanged = tz !== displayTZ;  // day buckets are server-side: a new zone needs a refetch
   displayTZ = tz;
+  if (tzChanged) refreshReconcile?.();
   document.querySelectorAll('.tz-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tz === tz));
   renderBuildInfo();
   activeTab = tab;  // before openSessionDetail: its setTab then replaces the entry instead of pushing
@@ -1443,26 +1453,45 @@ function renderStats(t, c) {
   const share = v => c.total ? fmtPct(v / c.total) : '0.0%';
   const cacheShare = c.prompt ? c.cache_tokens / c.prompt : 0;
   const ccTok = orUnknown(t.cache_creation, t.cache_creation_unknown);
+  const ccNote = t.cache_creation_partial && !t.cache_creation_unknown ? ' · Codex not counted' : '';
+  const cc1h = t.cache_creation_1h || 0, c1h = c.cache_creation_1h || 0;
+  // `group: 'input'` cards render as tiles inside one Input card that spans 3 grid columns:
+  // everything sent to the model is cache read + cache write + uncached, and the group says so.
   const stats = [
-    { label: 'Est. Cost',      prov: 'local_estimate', value: fmtCostBig(c.total), sub: 'API pricing, Nov 2026 · ' + rangeLabel, color: C.green },
-    { label: 'Input',          prov: 'local_estimate', value: fmtCostBig(c.input),          sub: `${share(c.input)} of cost · ${fmt(t.input)} tok` },
+    { label: 'Est. Cost',      prov: 'local_estimate', value: fmtCostBig(c.total), sub: 'API pricing, Nov 2026 · ' + rangeLabel, color: C.green,
+      sub2: layerLine(c.layers), title: LAYER_TOOLTIP },
+    { label: 'Cache Read',     group: 'input', prov: 'local_estimate', value: fmtCostBig(c.cache_read), sub: `${fmt(t.cache_read)} tok`,
+      title: `${share(c.cache_read)} of cost · earlier context served from cache` },
+    { label: 'Cache Write',    group: 'input', prov: 'local_estimate', value: fmtCostBig(c.cache_creation),
+      sub: t.cache_creation && !t.cache_creation_unknown ? `5m ${fmtCostBig(c.cache_creation - c1h)} · 1h ${fmtCostBig(c1h)}` : `${ccTok} tok`,
+      title: `${share(c.cache_creation)} of cost · ${ccTok} tok (5m ${fmt(t.cache_creation - cc1h)}, 1h ${fmt(cc1h)}); 5m bills 1.25x input, 1h 2x${ccNote}` },
+    { label: 'Uncached',       group: 'input', prov: 'local_estimate', value: fmtCostBig(c.input), sub: `${fmt(t.input)} tok`,
+      title: `${share(c.input)} of cost · sent without a cache bookmark, so billed at the full input rate. ` +
+        'Typical sources: one-off API calls, review or advisor calls, Codex, scripts.' },
     { label: 'Output',         prov: 'local_estimate', value: fmtCostBig(c.output),         sub: `${share(c.output)} of cost · ${fmt(t.output)} tok` },
-    { label: 'Cache Read',     prov: 'local_estimate', value: fmtCostBig(c.cache_read),     sub: `${share(c.cache_read)} of cost · ${fmt(t.cache_read)} tok` },
-    { label: 'Cache Creation', prov: 'local_estimate', value: fmtCostBig(c.cache_creation),
-      sub: `${share(c.cache_creation)} of cost · ${ccTok} tok` + (t.cache_creation_partial && !t.cache_creation_unknown ? ' (Codex not counted)' : '') },
     { label: 'Cache Savings',  prov: 'local_estimate', value: fmtCostBig(c.cache_savings),  hl: fmtPct(cacheShare), sub: 'cache share of prompt' },
     { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: `${fmt(t.turns)} turns · ${rangeLabel}` },
     { label: 'Attributed overhead', id: 'stat-overhead', prov: 'local_estimate', value: '…', sub: 'lower bound, API list rate',
       href: drillHref(globalParams(), { tab: 'waste' }) },
   ];
   // Every card is a link to the view that explains its number, under the same range and model filters.
-  document.getElementById('stats-row').innerHTML = stats.map(s => `
-    <a class="stat-card" data-drill${s.id ? ` id="${s.id}"` : ''} href="${esc(s.href || drillHref(globalParams(), { tab: 'sessions', sort: CARD_TARGET[s.label] }))}">
+  const card = (s, cls = 'stat-card') => `
+    <a class="${cls}" data-drill${s.id ? ` id="${s.id}"` : ''}${s.title ? ` title="${esc(s.title)}"` : ''} href="${esc(s.href || drillHref(globalParams(), { tab: 'sessions', sort: CARD_TARGET[s.label] }))}">
       <div class="label"${s.prov ? ` data-prov="${s.prov}"` : ''}>${s.label}</div>
       <div class="value" style="${s.color ? 'color:' + s.color : ''}">${esc(s.value)}</div>
       ${s.sub ? `<div class="sub">${s.hl ? `<span class="hl">${esc(s.hl)}</span> ` : ''}${esc(s.sub)}</div>` : ''}
-    </a>
-  `).join('');
+      ${s.sub2 ? `<div class="sub">${esc(s.sub2)}</div>` : ''}
+    </a>`;
+  const inTok = t.input + t.cache_read + (t.cache_creation || 0), inCost = c.input + c.cache_read + c.cache_creation;
+  const group = `
+    <div class="stat-group">
+      <div class="group-head"><span class="label" data-prov="local_estimate">Input</span>
+        <span class="value">${esc(fmtCostBig(inCost))}</span>
+        <span class="sub">${share(inCost)} of cost · ${fmt(inTok)} tok sent to the model</span></div>
+      <div class="group-tiles">${stats.filter(s => s.group).map(s => card(s, 'stat-card tile')).join('')}</div>
+    </div>`;
+  document.getElementById('stats-row').innerHTML =
+    card(stats[0]) + group + stats.slice(1).filter(s => !s.group).map(s => card(s)).join('');
 }
 
 const sessionsByCauseHref = cause => drillHref(globalParams(), { tab: 'sessions', filters: { cause }, sort: { col: 'overhead', dir: 'desc' } });
@@ -1485,6 +1514,27 @@ async function renderWhereToAct() {
         `<span>${esc(CAUSE_LABEL[c.cause] || c.cause)} ${avoidTag(c.cause)}</span><span class="num">${fmtCostBig(c.usd)}</span>` +
         `<span class="muted">${c.sessions} session${c.sessions === 1 ? '' : 's'}</span></a>`).join('')
     : '';
+}
+
+// First screen: one receipt above the overview. Hiding it leaves a one-line button to bring it back.
+const FIRST_SCREEN_KEY = 'whytokensFirstScreen';  // '0' = hidden
+let firstScreenHidden = null;  // this page's choice, held in memory so it works with storage blocked
+async function renderFirstScreen() {
+  const slot = document.getElementById('first-screen');
+  const p = await loadWaste();
+  if (!slot || !p || activeTab !== 'overview') return;
+  const r = pickReceipt(p);
+  if (!r) { slot.innerHTML = ''; return; }
+  const set = hide => { firstScreenHidden = hide; store.set(FIRST_SCREEN_KEY, hide ? '0' : '1'); return renderFirstScreen(); };
+  if (firstScreenHidden ?? store.get(FIRST_SCREEN_KEY) === '0') {
+    slot.innerHTML = '<button class="link-btn fs-reopen" type="button" data-fs-show>Show the one thing to try first</button>';
+    slot.querySelector('[data-fs-show]').onclick = () => set(false).then(() => slot.querySelector('[data-fs-dismiss]')?.focus());
+    slot.classList.add('collapsed');
+    return;
+  }
+  slot.classList.remove('collapsed');
+  slot.innerHTML = receiptHTML(r, CAUSE_LABEL[r.cause] || r.cause, avoidTag(r.cause));
+  slot.querySelector('[data-fs-dismiss]').onclick = () => set(true).then(() => slot.querySelector('[data-fs-show]')?.focus());
 }
 
 // Overview budget band: this calendar month against the monthly budget. Always the current month,
@@ -1565,7 +1615,7 @@ function aggregateHourly(rows, tzMode) {
   for (let h = 0; h < 24; h++) byHour[h] = { turns: 0, output: 0 };
   const days = new Set();
   for (const r of rows) {
-    const displayHour = utcHourToDisplay(r.hour, tzMode);
+    const displayHour = utcHourToDisplay(r.hour, tzMode, r.utc_day);
     byHour[displayHour].turns  += r.turns  || 0;
     byHour[displayHour].output += r.output || 0;
     if (r.day) days.add(r.day);
@@ -1811,8 +1861,14 @@ function lessBranchRows()  { branchLimit   = TABLE_STEPS[0]; renderProjectBranch
 // API-equivalent estimate for plan-included Codex/GPT, n/a for everything else.
 // Aggregate tables (project/branch/tool) mix models, so they can't label per row —
 // they sum whatever calcCost prices (now including the Codex estimate).
-function costCellHTML(model, cost) {
-  if (isBillable(model)) return `<td class="cost">${fmtCost(cost)}</td>`;
+// "recorded $A · advisor $B · estimated $C" (pricing.js costLayers).
+function layerLine(L) {
+  return LAYERS.map(k => `${k} ${fmtCostBig(L[k])}`).join(' · ');
+}
+const sessionLayers = s => costLayers(s.by_model, m => m.timestamp ? m.timestamp.slice(0, 10) : s.last_date);
+
+function costCellHTML(model, cost, title = '') {
+  if (isBillable(model)) return `<td class="cost"${title ? ` title="${esc(title)}"` : ''}>${fmtCost(cost)}</td>`;
   if (isEstimated(model)) {
     return `<td class="cost cost-est" title="API-equivalent estimate — Codex/GPT is plan-included; priced at OpenAI API rates">${fmtCost(cost)}</td>`;
   }
@@ -1829,7 +1885,7 @@ function renderSessionsTable(sessions) {
   const idx = wasteIndex();
   const shown = sessions.slice(0, sessionsLimit);
   document.getElementById('sessions-body').innerHTML = shown.map(s => {
-    const cell = costCellHTML(s.model, sessionCost(s, s.last_date));
+    const cell = costCellHTML(s.model, sessionCost(s, s.last_date), layerLine(sessionLayers(s)) + '\n\n' + LAYER_TOOLTIP);
     // Level 1 is eight columns; token counts, cache share and vs peers sit in the row's detail (sessionTotalsRowHTML).
     const sessLabel = llm ? llm.labelHTML(llm.llmState.labels[s.full_session_id]) : '';
     return `<tr class="session-row" data-session-row="${esc(s.full_session_id)}" data-session-day="${esc(s.last_date || '')}">
@@ -1840,6 +1896,7 @@ function renderSessionsTable(sessions) {
       <td><span class="model-tag">${esc(s.model)}</span></td>
       <td class="num">${s.turns}</td>
       ${cell}
+      ${ccCell(s)}
       ${overheadCell(s, idx)}
       ${shapeCell(shapesPayload, s.full_session_id)}
     </tr>`;
@@ -1847,15 +1904,16 @@ function renderSessionsTable(sessions) {
   renderTableToggle('sessions-foot', sessions.length, sessionsLimit, 'lessSessionRows', 'moreSessionRows', 'exportSessionsCSV');
 }
 
-// The first detail row of an expanded session: the figures the eight-column list leaves out.
+// The first detail row of an expanded session: the figures the nine-column list leaves out.
 function sessionTotalsRowHTML(sessionId) {
   const s = lastFilteredSessions.find(x => x.full_session_id === sessionId);
   if (!s) return '';
   const est = isEstimated(s.model), stat = (label, value, prov = 'official') => `<div class="detail-stat"><div class="label"${prov ? ` data-prov="${prov}"` : ''}>${label}</div><div class="value">${value}</div></div>`;
-  return `<tr class="session-totals-subrow" data-parent-session="${esc(sessionId)}"><td class="branch-cell" colspan="8"><div class="detail-stats">` +
+  return `<tr class="session-totals-subrow" data-parent-session="${esc(sessionId)}"><td class="branch-cell" colspan="9"><div class="detail-stats">` +
     stat('Input', fmt(s.input)) + stat('Output', fmt(s.output)) + stat('Cache Read', fmt(s.cache_read)) +
     stat('Cache Creation', est ? '<span title="Codex reports no cache-write tokens: unknown, not zero">' + orUnknown(s.cache_creation, true) + '</span>' : fmt(s.cache_creation)) +
     stat('Cache Share', fmtPct(cacheShare(s)), '') +
+    LAYERS.map(k => stat(k[0].toUpperCase() + k.slice(1), `<span title="${esc(LAYER_TOOLTIP)}">${fmtCost(sessionLayers(s)[k])}</span>`, 'local_estimate')).join('') +
     stat('vs peers', peersCell(shapesPayload, s.full_session_id).replace('<td', '<span').replace('</td>', '</span>'), '') +
     '</div></td></tr>';
 }
@@ -1876,7 +1934,6 @@ function summarizeBreakdown(rows, day) {
       turns: 0, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0,
     };
     cur.models.set(r.model, (cur.models.get(r.model) || 0) + r.turns);
-    cur.slices.push(r);
     cur.turns += r.turns;
     cur.input += r.input;
     cur.output += r.output;
@@ -1887,8 +1944,12 @@ function summarizeBreakdown(rows, day) {
     // calcCost takes TOTAL cache creation plus the 1h portion of it (it bills the
     // remainder at the 5m rate); passing the 5m slice as the total zeroes the whole
     // cache-creation charge, which is most of a Claude Code session's write cost.
-    const sliceCost = rowCost(r, day);
-    cur.slices[cur.slices.length - 1].cost = sliceCost;
+    const sliceCost = rowCost(r, r.rate_day || day);
+    // One display row per model: API rows are also split by tier epoch and cost layer.
+    let sl = cur.slices.find(x => x.model === r.model);
+    if (!sl) cur.slices.push(sl = { model: r.model, turns: 0, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 });
+    for (const k of ['turns', 'input', 'output', 'cache_read', 'cache_creation']) sl[k] += r[k];
+    sl.cost += sliceCost;
     cur.cost += sliceCost;
     byLabel.set(r.label, cur);
   }
@@ -1899,11 +1960,11 @@ function breakdownRowsHTML(sessionId, rows, day, whatifLine = '') {
   const buckets = summarizeBreakdown(rows, day);
   if (!buckets.length) {
     return `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}">
-      <td class="branch-cell muted" colspan="8">No per-actor detail recorded for this session.</td>
+      <td class="branch-cell muted" colspan="9">No per-actor detail recorded for this session.</td>
     </tr>`;
   }
   const total = buckets.reduce((sum, b) => sum + b.cost, 0);
-  return `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}"><td class="branch-cell" colspan="8"><table class="sub-table">` +
+  return `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}"><td class="branch-cell" colspan="9"><table class="sub-table">` +
     '<thead><tr><th>Who</th><th>Model</th><th>Turns</th>' + ['Input', 'Output', 'Cache Read', 'Cache Creation'].map(h => `<th data-prov="official">${h}</th>`).join('') +
     '<th data-prov="local_estimate">Est. Cost</th></tr></thead><tbody>' +
     buckets.map(b => {
@@ -1926,7 +1987,7 @@ function breakdownRowsHTML(sessionId, rows, day, whatifLine = '') {
       <td class="cost">${fmtCost(b.cost)}</td>
     </tr>` + (models.length > 1 ? modelRowsHTML(sessionId, b) : '');
   }).join('') + '</tbody></table></td></tr>' + (whatifLine ? `<tr class="breakdown-subrow whatif-row" data-parent-session="${esc(sessionId)}">
-      <td class="branch-cell" colspan="8">${whatifLine}</td></tr>` : '');
+      <td class="branch-cell" colspan="9">${whatifLine}</td></tr>` : '');
 }
 
 /** Per-model rows for one multi-model bucket, costliest first. */
@@ -1972,7 +2033,7 @@ function wireSessionExpand() {
     if (!payload) {
       anchor.insertAdjacentHTML('afterend',
         `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}">
-           <td class="branch-cell muted" colspan="8">Loading&hellip;</td></tr>`);
+           <td class="branch-cell muted" colspan="9">Loading&hellip;</td></tr>`);
       try {
         payload = await fetchSessionBreakdown(sessionId);
         if (!stale()) sessionBreakdownCache.set(sessionId, payload);  // a late answer must not replace the newer one a reopen will read
@@ -1988,7 +2049,7 @@ function wireSessionExpand() {
     if (stale()) return;
     const html = payload.error
       ? `<tr class="breakdown-subrow" data-parent-session="${esc(sessionId)}">
-           <td class="branch-cell muted" colspan="8">${esc(payload.error)}</td></tr>`
+           <td class="branch-cell muted" colspan="9">${esc(payload.error)}</td></tr>`
       : breakdownRowsHTML(sessionId, payload.rows || [], day, whatifLine) +
         (llm ? llm.llmRowHTML(sessionId, (wastePayload?.findings || []).filter(f => f.session_id === sessionId).map(f => f.cause)) : '');
     anchor.insertAdjacentHTML('afterend', html);
@@ -2994,6 +3055,10 @@ async function refreshStatus() {
   }
   if (sc.state === 'error') lines.push('<span class="bad">Scan failed: ' + esc(sc.error) + '</span>');
   if (st.hint) lines.push(esc(st.hint));
+  if (sc.result && sc.result.unreadable) {
+    lines.push('<span class="bad">' + sc.result.unreadable.toLocaleString() +
+      ' compressed session file(s) not read, so totals are partial: ' + esc(sc.unreadable_hint || '') + '</span>');
+  }
   const errs = (sc.file_errors || []).map(e => '<li class="bad">' + esc(e.path) + ': ' + esc(e.error) + '</li>').join('');
   const showRoots = st.empty || errs;  // where it looked matters when nothing was found or a file failed
   const roots = showRoots ? '<ul>' + st.roots.map(r => '<li>' + esc(r.source) + ': ' + esc(r.path) +
@@ -3137,6 +3202,9 @@ async function renderBuildInfo() {
 }
 
 async function init() {
+  refreshReconcile = initReconcile(() => displayTZ);
+  const ccTh = document.getElementById('cc-th');
+  if (ccTh) ccTh.title = CC_TOOLTIP;
   try {
     const table = await fetchPricing();
     applyDefaultPricing(table);
@@ -3167,7 +3235,8 @@ async function init() {
   if (bar && 'ResizeObserver' in window) new ResizeObserver(() =>
     document.documentElement.style.setProperty('--filter-bar-h', bar.offsetHeight + 'px')).observe(bar);
   applyTabVisibility(readURLTab().tab);  // show the landing tab's skeleton, not Overview, while data loads
-  loadData();
+  // Show what the DB holds now, then rescan: a reload (F5) is how people ask for the latest.
+  loadData().then(triggerRescan);
   refreshStatus();
   scheduleAutoRefresh();
 }

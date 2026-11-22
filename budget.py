@@ -89,11 +89,19 @@ def _locked(path):
 TAG_MAX = 40
 
 
-def _read(path):
+def _read(path, strict=False):
+    """The settings dict; unreadable reads as empty. ``strict`` (writers) raises ValueError
+    instead when the file exists but can't be parsed, so a save never erases the other settings."""
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError):
+        if strict:
+            raise ValueError(f"{path.name} is unreadable; fix or delete it") from None
+        return {}
+    if not isinstance(d, dict) and strict:
+        raise ValueError(f"{path.name} is not a JSON object; fix or delete it")
     return d if isinstance(d, dict) else {}
 
 
@@ -119,7 +127,7 @@ def set_budget(value, db_path=None):
     if value is not None and not _valid(value):
         raise ValueError("monthly_usd must be a finite number greater than 0")
     with _locked(path):
-        d = _read(path)
+        d = _read(path, strict=True)
         if value is None:
             d.pop("monthly_usd", None)
         else:
@@ -145,7 +153,7 @@ def set_tag(project, tag, db_path=None):
         raise ValueError(f"tag must be plain text of at most {TAG_MAX} characters")
     path = budget_path(db_path)
     with _locked(path):
-        d = _read(path)
+        d = _read(path, strict=True)
         tags = d.get("project_tags") if isinstance(d.get("project_tags"), dict) else {}
         if tag:
             tags[project] = tag

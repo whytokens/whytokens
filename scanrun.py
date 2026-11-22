@@ -18,7 +18,7 @@ _state = {"state": "idle", "started": None, "finished": None, "result": None, "e
 def status():
     p = sources.PROGRESS
     return dict(_state, source=p["source"], done=p["done"], total=p["total"], phase=p["phase"],
-                file_errors=list(p["errors"]))
+                file_errors=list(p["errors"]), unreadable_hint=sources.ZST_HINT)
 
 
 def _run(db_path, projects_dir, out):
@@ -27,6 +27,8 @@ def _run(db_path, projects_dir, out):
         _state["result"] = {k: sum(s[k] for s in per_source.values())
                             for k in ("new", "updated", "skipped", "turns", "sessions")}
         _state["result"]["sources"] = per_source
+        # Compressed rollouts no decoder could read: partial totals the banner must flag.
+        _state["result"]["unreadable"] = sum(s.get("unreadable", 0) for s in per_source.values())
         _state["state"] = "done"
     except Exception as e:  # surfaced on the page; the server stays up
         _state.update(state="error", error=f"{type(e).__name__}: {e}")

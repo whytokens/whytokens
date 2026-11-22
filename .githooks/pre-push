@@ -3,5 +3,7 @@
 # Capped at 20 min where coreutils timeout exists (Git for Windows, Linux), so a hung suite cannot
 # block the push forever. --version tells it apart from Windows' own timeout.exe, which only waits.
 # shortcut: timeout kills python but not its children; kill the tree if strays show up again.
+# Git exports GIT_DIR and friends to hooks; tests that run git in temp repos would act on this one.
+unset $(git rev-parse --local-env-vars)
 T=""; timeout --version >/dev/null 2>&1 && T="timeout -k 10 1200"
 $T python -m unittest discover -s tests -q >/dev/null 2>&1 || { echo "WT-PRE-PUSH-REFUSED: tests red or still running after 20 min (python -m unittest discover -s tests)"; exit 1; }

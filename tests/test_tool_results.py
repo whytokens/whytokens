@@ -180,6 +180,19 @@ class TestReviewFindings(Base):
         self.scan()
         self.assertIsNone(self.sizes()[SID])
 
+    def test_unresolved_call_lost_from_an_old_row_makes_session_unknown(self):
+        # a row ingested before calls were merged lists only the last record's call, and its
+        # transcript may be gone: the unresolved call is visible in tool_results alone
+        self.write(_prompt("go"), _asst("m1", [_use("c1")]), _asst("m1", [_use("c2")]),
+                   _rec("user", [_result("c2", "abcd")]))
+        self.scan()
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE turns SET tool_calls = json_array(json_extract(tool_calls, '$[#-1]')) WHERE message_id='m1'")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.q("SELECT json_array_length(tool_calls) FROM turns WHERE message_id='m1'"), [(1,)])
+        self.assertIsNone(self.sizes()[SID])
+
     def test_branch_copy_keeps_the_first_session(self):
         lines = [_prompt("go"), _asst("m1", [_use("c1")]), _rec("user", [_result("c1", "abcd")])]
         self.write(*lines)

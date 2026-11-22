@@ -69,12 +69,20 @@ MUTANTS = [
     ("waste.py", 'h1 = h1 * min(creation, total) / total if total else h1', 'h1 = h1'),
     ("waste.py", '            has_tool, repeated, rep_idx = _tool_info(turn, seen_paths)', '            has_tool, repeated, rep_idx = _tool_info(turn, seen_paths) if not compact else (False, [], [])'),
     ("policy.py", 'if isinstance(v, int) and not isinstance(v, bool):\n            out[key] = v', 'if v is not None:\n            out[key] = v'),
+    # next-step rule audience: a CLAUDE.md rule must be one the agent can follow alone
+    ("waste.py", 'resume later from a handoff note.", "you"),', 'resume later from a handoff note.", "agent"),'),
+    ("waste.py", 'start a fresh session from it.", "you"),', 'start a fresh session from it.", "agent"),'),
+    ("waste.py", 'blocks longer than {life} "', 'blocks longer than 4 minutes "'),
+    ("waste.py", 'out of the main context.", "agent"),', 'out of the main context when you return.", "agent"),'),
+    ("waste.py", 'then Read only that range with offset and limit.", "agent"),', 'then Read only that range with offset and limit.", "agnt"),'),
+    ("waste.py", 'min(own or [ttl for *_, ttl in gaps]) >= 3600 else', 'min(own or [ttl for *_, ttl in gaps]) >= 0 else'),
+    ("static/modules/app.js", "(a.audience === 'agent'", "(true"),
 ]
 
 
 
 def run(tree):
-    return subprocess.run([sys.executable, "-m", "unittest", "tests.test_waste", "tests.test_waste_action", "tests.test_repeated_reads"],
+    return subprocess.run([sys.executable, "-m", "unittest", "tests.test_waste", "tests.test_waste_action", "tests.test_repeated_reads", "tests.test_waste_tab", "tests.test_drilldown"],
                           cwd=tree, capture_output=True, text=True).returncode
 
 

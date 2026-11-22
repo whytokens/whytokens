@@ -3,7 +3,7 @@
 // Dollars here are the server's (waste.py findings, list rate); this module only sums and orders them.
 
 export const SESSION_SORTS = ['last', 'duration_min', 'turns', 'input', 'output', 'cache_read',
-  'cache_creation', 'cost', 'cache_share', 'overhead', 'peers', 'shape'];
+  'cache_creation', 'cost', 'cc_cost', 'cache_share', 'overhead', 'peers', 'shape'];
 export const DEFAULT_SORT = { col: 'last', dir: 'desc' };
 export const EMPTY_FILTERS = { project: '', branch: '', tool: '', minCost: 0, hasCacheCreation: false, cause: '',
   shape: '', tag: '', minX: 0 };
@@ -61,10 +61,10 @@ export function drillHref(globals, { tab, filters, sort, cause, week }) {
 /** The Sessions view that explains each Overview card (the Overhead card and the cause rows go to Waste). */
 export const CARD_TARGET = {
   'Est. Cost': { col: 'cost', dir: 'desc' },
-  'Input': { col: 'input', dir: 'desc' },
+  'Uncached': { col: 'input', dir: 'desc' },
   'Output': { col: 'output', dir: 'desc' },
   'Cache Read': { col: 'cache_share', dir: 'asc' },
-  'Cache Creation': { col: 'cache_creation', dir: 'desc' },
+  'Cache Write': { col: 'cache_creation', dir: 'desc' },
   'Cache Savings': { col: 'cache_share', dir: 'asc' },
   'Sessions': DEFAULT_SORT,
 };

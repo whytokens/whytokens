@@ -183,6 +183,15 @@ def _lane_gap_session(sid, gap_min):
 
 FIXTURES["lane_idle"] = _lane_gap_session("lane_idle", 8)
 FIXTURES["lane_warm"] = _lane_gap_session("lane_warm", 2)
+# a 1k prefix, a 30-minute break, then a 100k write: only the 1k that was cached can have expired
+FIXTURES["idle_grow"] = [_rec("idle_grow", 1, _ts(0), read=0, create=1_000),
+                         _rec("idle_grow", 2, _ts(30), read=0, create=100_000)]
+# a 30-minute break, then the whole 30k prefix is read back: nothing expired, the 10k write is growth
+FIXTURES["idle_read_back"] = [_rec("idle_read_back", 1, _ts(0), read=0, create=30_000),
+                              _rec("idle_read_back", 2, _ts(30), read=30_000, create=10_000)]
+# the same in a subagent lane: its 30,500-token prefix expires, then the next turn writes 200k
+FIXTURES["lane_idle_grow"] = _lane_gap_session("lane_idle_grow", 8)
+FIXTURES["lane_idle_grow"][3] = _rec("lane_idle_grow", 4, _ts(10), read=0, create=200_000, side=True, agent="a1")
 
 PREAMBLE, GROWTH = 30_000, 20_000
 
@@ -467,6 +476,18 @@ class TestWasteReport(_Scanned):
         self.assertIn(f"${paid - warm:.2f}", f["detail"])
         self.assertIn(f"${paid:.2f}", f["detail"])
         self.assertNotIn("$", f["fix"])  # fix is shared across a project/cause group in the UI
+
+    def test_idle_gap_claims_only_what_was_cached_before_the_gap(self):
+        for sid, cached in (("idle_grow", 1_000), ("lane_idle_grow", 30_500)):
+            f = [f for f in waste.report(self.db, sid, min_share=0, min_usd=0) if f["cause"] == "idle_gap"][0]
+            self.assertEqual(sum(e["tokens"] for e in f["evidence"]), cached, sid)
+            self.assertIn(f"rewrote {cached:,} cache tokens", f["detail"])
+            ts = f["evidence"][0]["at"]
+            self.assertAlmostEqual(f["usd"], pricing.calc_cost(MODEL, 0, 0, 0, cached, ts), msg=sid)
+
+    def test_idle_gap_claims_nothing_when_the_prefix_was_read_back(self):
+        causes = {f["cause"] for f in waste.report(self.db, "idle_read_back", min_share=0, min_usd=0)}
+        self.assertNotIn("idle_gap", causes)
 
     def test_subagent_lane_idle_gap_is_not_resident_output(self):
         causes = {f["cause"]: f for f in self.waste.report(self.db, session_id="lane_idle")}

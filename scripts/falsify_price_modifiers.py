@@ -25,7 +25,7 @@ MUTANTS = [
      "            speed                    = turns.speed,\n"),
     ("sources/claude.py", '.get("speed") == "fast":', '.get("speed") == "nope":'),
     ("api.py", "* pricing.price_mult(t.get(\"speed\")", "* pricing.price_mult(\"\""),
-    ("api.py", "                pricing.surcharge_cost(r[\"model\"], r, r[\"day\"]))", "                0)"),
+    ("api.py", "                pricing.surcharge_cost(r[\"model\"], r, r[\"rate_day\"]))", "                0)"),
     ("cli.py", "            surcharge_cost(r[\"model\"], r, timestamp))", "            0)"),
     ("waste.py", "row[\"timestamp\"], h1) * row[\"mult\"]", "row[\"timestamp\"], h1)"),
     ("static/modules/pricing.js", "  if (!x) return c;", "  return c;"),

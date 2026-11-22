@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # (file, original, mutant) - each must turn the first-run tests red on its own.
 MUTANTS = [
+    ("static/modules/app.js", "loadData().then(triggerRescan);", "loadData();"),  # F5 shows stale data
     ("static/modules/app.js", """if (/[",\\r\\n]/.test(s)) {""", """if (/[",\\n]/.test(s)) {"""),  # a carriage return splits the row
     ("sources/__init__.py", 'open(filepath, "rb").close()', "pass"),
     ("sources/__init__.py", 'PROGRESS.update(source=source.name, done=0, total=len(files), phase="walk")', "pass"),

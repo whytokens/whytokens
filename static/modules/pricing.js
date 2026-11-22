@@ -64,8 +64,37 @@ export function getOverrides() {
  * @param {Record<string, any>} table
  */
 export function applyDefaultPricing(table) {
+  const { _fees, ...models } = table || {};
   for (const k of Object.keys(DEFAULT_PRICING)) delete DEFAULT_PRICING[k];
-  Object.assign(DEFAULT_PRICING, table || {});
+  Object.assign(DEFAULT_PRICING, models);
+  WEB_SEARCH_FEE = (_fees && _fees.web_search_usd) || 0;
+}
+
+// Per successful WebSearch call (pricing.py WEB_SEARCH_FEE_USD via GET /api/pricing `_fees`).
+let WEB_SEARCH_FEE = 0;
+export function webSearchFee() { return WEB_SEARCH_FEE; }
+
+/** The fixed cost-layer names (docs/SCHEMA.md "Cost layers"). */
+export const LAYERS = ['recorded', 'advisor', 'estimated'];
+
+/** Fixed wording, used wherever the split appears. */
+export const LAYER_TOOLTIP = "Recorded: usage Claude Code wrote to the transcript for each request. Tools that read Claude Code's transcripts count the same thing. Advisor: advisor-call tokens that are in the transcript but outside each request's main usage fields, so other tools skip them. Estimated: costs Claude Code is billed for but never writes down: subagent context summaries (every 30 s while a subagent runs; modelled) and web-search fees ($0.01 per search). Checked against Claude Code's own cost record: on Opus 5.5 the total lands at a median of 0.99. All figures are API list-price equivalents, not a bill.";
+
+/**
+ * {recorded, advisor, estimated, total, web_searches} of payload rows carrying `layer` and
+ * `web_searches`. The fee always lands in estimated, whatever its row's layer; total is rowCost's.
+ * @param {Array<any>} rows @param {(r: any) => string} dayOf
+ */
+export function costLayers(rows, dayOf) {
+  const L = { recorded: 0, advisor: 0, estimated: 0, total: 0, web_searches: 0 };
+  for (const r of rows || []) {
+    const c = rowCostBreakdown(r, dayOf(r));
+    L[r.layer || 'recorded'] += c.total - c.web_search;
+    L.estimated += c.web_search;
+    L.total += c.total;
+    L.web_searches += r.web_searches || 0;
+  }
+  return L;
 }
 
 export function loadPricing() {
@@ -123,7 +152,7 @@ export function clearOverrides() {
 export function isBillable(model) {
   if (!model) return false;
   const m = model.toLowerCase();
-  return m.includes('fable') || m.includes('opus-') || m.includes('sonnet') || m.includes('haiku');
+  return m.includes('fable') || m.includes('mythos') || m.includes('opus-') || m.includes('sonnet') || m.includes('haiku');
 }
 
 /**
@@ -205,10 +234,16 @@ export function rowCostBreakdown(r, day) {
   const c = calcCostBreakdown(r.model, r.input, r.output, r.cache_read, r.cache_creation,
     day, r.cache_creation_1h);
   const x = r.x;
-  if (!x) return c;
+  if (!x) return withFee(c, r);
   const s = calcCostBreakdown(r.model, x.input, x.output, x.cache_read, x.cache_creation,
     day, x.cache_creation_1h);
   for (const k of Object.keys(c)) c[k] += s[k];
+  return withFee(c, r);
+}
+
+function withFee(c, r) {
+  c.web_search = (r.web_searches || 0) * WEB_SEARCH_FEE;
+  c.total += c.web_search;
   return c;
 }
 
@@ -238,10 +273,11 @@ export function sessionCostBreakdown(s, day) {
       acc.output += c.output;
       acc.cache_read += c.cache_read;
       acc.cache_creation += c.cache_creation;
+      acc.cache_creation_1h += c.cache_creation_1h;
       acc.total += c.total;
       acc.cache_savings += c.cache_savings;
       return acc;
-    }, { input: 0, output: 0, cache_read: 0, cache_creation: 0, total: 0, cache_savings: 0 });
+    }, { input: 0, output: 0, cache_read: 0, cache_creation: 0, cache_creation_1h: 0, total: 0, cache_savings: 0 });
   }
   return rowCostBreakdown(s, day);
 }
@@ -259,7 +295,7 @@ export function sessionCostAtListRates(s, day) {
 }
 
 export function calcCostBreakdown(model, inp, out, cacheRead, cacheCreation, day, cacheCreation1h = 0) {
-  const zero = { input: 0, output: 0, cache_read: 0, cache_creation: 0, total: 0, cache_savings: 0 };
+  const zero = { input: 0, output: 0, cache_read: 0, cache_creation: 0, cache_creation_1h: 0, total: 0, cache_savings: 0 };
   // Gate on getPricing (mirrors Python calc_cost): prices Anthropic models AND the
   // plan-included Codex/GPT estimate; non-priced models (local, gpt-4o) fall to zero.
   const p = getPricing(model, day);
@@ -271,14 +307,14 @@ export function calcCostBreakdown(model, inp, out, cacheRead, cacheCreation, day
   const input = inp * p.input / 1e6;
   const output = out * p.output / 1e6;
   const cache_read = cacheRead * p.cache_read / 1e6;
-  const cache_creation = ((cacheCreation - cc1h) * p.cache_write
-    + cc1h * (p.cache_write_1h ?? p.cache_write)) / 1e6;
+  const cache_creation_1h = cc1h * (p.cache_write_1h ?? p.cache_write) / 1e6;  // the 1h part of cache_creation
+  const cache_creation = (cacheCreation - cc1h) * p.cache_write / 1e6 + cache_creation_1h;
   // Net of what the writes cost over plain input (5m 1.25x, 1h 2x): a session that only
   // ever rewrote its prefix saved nothing, so this can go negative.
   const cache_savings = (cacheRead * Math.max(p.input - p.cache_read, 0)
     - (cacheCreation - cc1h) * (p.cache_write - p.input)
     - cc1h * ((p.cache_write_1h ?? p.cache_write) - p.input)) / 1e6;
-  return { input, output, cache_read, cache_creation, total: input + output + cache_read + cache_creation, cache_savings };
+  return { input, output, cache_read, cache_creation, cache_creation_1h, total: input + output + cache_read + cache_creation, cache_savings };
 }
 
 /** Fraction of prompt tokens served from cache. Reads only: a write is a cost, not a hit. */

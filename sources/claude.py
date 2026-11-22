@@ -10,8 +10,10 @@ source explicitly.
 
 import glob
 import json
+import sys
 from pathlib import Path
 
+import cost_state
 import policy
 import pricing
 import scanner
@@ -60,6 +62,56 @@ def _stores_a_call_without_id(conn):
     return False
 
 
+def last_cost_state(filepath, start_line=0, end_line=None):
+    """(line number, record) of the last ``cost-state`` in lines (start_line, end_line], or None.
+    end_line is the scanner's line count, which leaves out a trailing line still being written.
+    Subagent transcripts carry none and are not read."""
+    if scanner.is_subagent_record({}, filepath):
+        return None
+    last = None
+    with open(filepath, encoding="utf-8", errors="replace") as f:
+        for n, line in enumerate(f, 1):
+            if end_line is not None and n > end_line:
+                break
+            if n <= start_line or '"cost-state"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if (isinstance(r, dict) and r.get("type") == "cost-state"
+                    and cost_state.num(r.get("totalCostUSD")) == r.get("totalCostUSD")
+                    and isinstance(r.get("modelUsage", {}), dict)):
+                last = (n, r)
+    return last
+
+
+def _first_turn(conn, sid):
+    """The session's earliest turn as epoch ms, or None. One parser (SQLite's) both picks and converts
+    it: '10:00:00.5Z' sorts before '10:00:00Z' as text, and an empty, garbage or time-only
+    timestamp must not count as the first turn. ROUND: julianday is off by up to ~0.02 ms, which
+    would flip the inclusive 60 s coverage edge. Inputs SQLite and fromisoformat disagree on
+    ('+0000', '2026-02-30', lowercase 'z') never occur in Claude Code's own timestamps."""
+    return (conn.execute("SELECT ROUND((julianday(timestamp) - 2440587.5) * 86400000.0) FROM turns"
+                         " WHERE session_id = ? AND timestamp LIKE '____-__-__%' AND julianday(timestamp) IS NOT NULL"
+                         " ORDER BY julianday(timestamp) LIMIT 1", (sid,)).fetchone() or [None])[0]
+
+
+def upsert_cost_state(conn, filepath, found):
+    """Store a session's latest record; call after its turns are inserted (coverage reads them)."""
+    n, r = found
+    sid = r.get("sessionId")
+    sid = sid if isinstance(sid, str) and sid else Path(filepath).stem  # a malformed id must not abort the file
+    start = r.get("startTime")
+    start = start if cost_state.num(start) == start and 0 <= start < 1e14 else None  # epoch ms, sane range
+    # earliest instant, not the text minimum ('10:00:00.5Z' sorts before '10:00:00Z')
+    first = _first_turn(conn, sid)
+    conn.execute("INSERT OR REPLACE INTO cost_state (session_id, total_cost_usd, start_time_ms, model_usage,"
+                 " covers_full, source_line) VALUES (?, ?, ?, ?, ?, ?)",
+                 (sid, float(r["totalCostUSD"]), start, json.dumps(r.get("modelUsage") or {}),
+                  cost_state.covers_full(start, first), n))
+
+
 class ClaudeSource:
     name = NAME
 
@@ -100,15 +152,55 @@ class ClaudeSource:
     def parse_file(self, filepath, start_line=0):
         agents = {}
         calls = {}
+        errors = []
         metas, turns, line_count = scanner.parse_jsonl_file(
-            filepath, start_line=start_line, agents_out=agents, calls_out=calls)
+            filepath, start_line=start_line, agents_out=agents, calls_out=calls, errors_out=errors)
+        if errors:  # a parse that stopped early: scan_all reports it and leaves the file unrecorded
+            raise ValueError(errors[0])
         for t in turns:
             t["agent"] = NAME
         for m in metas:
             m["agent"] = NAME
         # 4th element: subagent dispatch rows for scan_all to upsert (Claude-only);
-        # 5th: tool_results rows (Claude-only).
-        return metas, turns, line_count, list(agents.values()), list(calls.values())
+        # 5th: tool_results rows (Claude-only); 6th: the last cost-state record in the new lines.
+        return (metas, turns, line_count, list(agents.values()), list(calls.values()),
+                last_cost_state(filepath, start_line, line_count))
+
+    def backfill_cost_state(self, conn):
+        """One-time cost_state fill for transcripts ingested before the table existed."""
+        if scanner._meta_get(conn, cost_state.BACKFILL_MARKER) == "1":
+            return 0
+        if not any(Path(d).exists() for d in self._dirs()):
+            return 0  # no transcript dir: leave the marker unset and retry later
+        # Fresh DB: the walk that follows reads every record inline. Keyed on processed files, not
+        # turns: a transcript holding only a record is already past the walk's cursor.
+        if conn.execute("SELECT 1 FROM processed_files WHERE COALESCE(source, 'claude') = 'claude' "
+                        "LIMIT 1").fetchone():
+            failed = 0
+            for filepath in self.discover_files():
+                try:
+                    found = last_cost_state(filepath)
+                except OSError as e:  # one unreadable transcript: report it, retry the backfill next scan
+                    print(f"whytokens: cost-state backfill skipped {filepath}: {e}", file=sys.stderr)
+                    failed += 1
+                    continue
+                if found:
+                    upsert_cost_state(conn, filepath, found)
+            if failed:
+                conn.commit()
+                return 0
+        scanner._meta_set(conn, cost_state.BACKFILL_MARKER, "1")
+        conn.commit()
+        return 1
+
+    def sync_cost_state(self, conn):
+        """Re-derive coverage after the walk: a record stored before its first turn (NULL), or a
+        session whose earliest turn arrived later, gets the right value. One indexed query per record."""
+        for sid, start, old in conn.execute("SELECT session_id, start_time_ms, covers_full FROM cost_state").fetchall():
+            new = cost_state.covers_full(start, _first_turn(conn, sid))
+            if new != old:
+                conn.execute("UPDATE cost_state SET covers_full = ? WHERE session_id = ?", (new, sid))
+        conn.commit()
 
     def backfill_tool_results(self, conn):
         """One-time backfill: prompt_seq and tool_results for rows ingested
@@ -374,11 +466,9 @@ class ClaudeSource:
             conn, "final_tallies_reparse_done_claude", NAME,
             why="to correct turns stored mid-stream")
         # v2: v1 keyed summaries without the session id and could keep a stale :est
-        # beside a real advisor row. Drop every synthetic estimate row once so the
-        # re-parse regenerates them under the current keys.
-        if scanner._meta_get(conn, "subagent_estimates_v2_reparse_done_claude") != "1":
-            conn.execute("DELETE FROM turns WHERE message_id LIKE 'agent_summary:%' "
-                         "OR message_id LIKE 'advisor:%:est'")
+        # beside a real advisor row. The re-parse regenerates them under the current
+        # keys; insert_turns drops a v1 row or :est only once its replacement is in hand,
+        # so an estimate whose transcript is gone is kept, not deleted.
         cleared += scanner.force_reparse_once(
             conn, "subagent_estimates_v2_reparse_done_claude", NAME,
             why="to add subagent output/advisor/AgentSummary estimates")
@@ -392,8 +482,19 @@ class ClaudeSource:
                     + cache_read_tokens + cache_creation_tokens > {pricing.LONG_PROMPT_TOKENS}
                     LIMIT 1""").fetchone():
             scanner._meta_set(conn, marker, "1")
-        return cleared + scanner.force_reparse_once(
+        cleared += scanner.force_reparse_once(
             conn, marker, NAME, why="to price AgentSummary estimates on Haiku 5.5 per call")
+        # Streamed messages kept only their last record's tool calls; the re-parse
+        # merges them (upsert rewrites tool_calls). Rows whose transcript is gone stay.
+        cleared += scanner.force_reparse_once(
+            conn, "merged_tool_calls_reparse_done_claude", NAME,
+            why="to merge tool calls across streamed records")
+        # A final record with the same output as a stored partial (only billing detail
+        # added) used to lose; re-read once under the final-record rule. Id-less turns
+        # are not duplicated by it (insert_turns skips one already stored).
+        return cleared + scanner.force_reparse_once(
+            conn, "final_record_reparse_done_claude", NAME,
+            why="to keep each message's final usage record")
 
     def backfill_effort(self, conn):
         """One-time turns.effort backfill (see scanner.backfill_effort_once).

@@ -57,7 +57,31 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
   <h1 class="sr-only">whytokens</h1>
 
   <section class="tab-panel" id="panel-overview" data-panel="overview">
+    <div class="first-screen" id="first-screen"></div>
     <div class="budget-band" id="budget-band"></div>
+    <details class="table-card collapsible" id="reconcile">
+      <summary>Reconcile with your bill</summary>
+      <div class="rec-form">
+        <label class="filter-label" for="rec-period">Month (UTC)</label>
+        <input type="month" id="rec-period">
+        <label class="filter-label" for="rec-billed">Billed (USD, from your usage screen)</label>
+        <input type="number" id="rec-billed" min="0" step="any" inputmode="decimal" placeholder="not entered">
+        <label class="filter-label" for="rec-asof">Read at (optional; default now)</label>
+        <input type="datetime-local" id="rec-asof" step="1">
+        <button type="button" class="export-btn" id="rec-save">Save</button>
+        <button type="button" class="export-btn" id="rec-clear">Clear</button>
+        <span class="muted" id="rec-status" role="status"></span>
+      </div>
+      <div id="rec-out"></div>
+      <div class="rec-form">
+        <label class="filter-label" for="rec-session">Session id</label>
+        <input type="text" id="rec-session" placeholder="from /usage">
+        <label class="filter-label" for="rec-usage">/usage session cost</label>
+        <input type="number" id="rec-usage" min="0" step="any" inputmode="decimal">
+        <button type="button" class="export-btn" id="rec-check">Check</button>
+      </div>
+      <div id="rec-session-out" role="status"></div>
+    </details>
     <div class="stats-row" id="stats-row"><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div><div class="stat-card"><div class="skel" style="width:55%;height:12px"></div><div class="skel" style="width:75%;height:24px;margin:8px 0"></div><div class="skel" style="width:90%;height:11px"></div></div></div>
     <div class="where-to-act" id="where-to-act"></div>
     <div class="shp-line" id="shape-outliers"></div>
@@ -258,6 +282,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
           <th>Model</th>
           <th class="sortable" onclick="setSessionSort('turns')">Turns&nbsp;<span class="sort-icon" id="sort-icon-turns"></span></th>
           <th data-prov="local_estimate" class="sortable" onclick="setSessionSort('cost')">Est. Cost&nbsp;<span class="sort-icon" id="sort-icon-cost"></span></th>
+          <th id="cc-th" class="sortable" onclick="setSessionSort('cc_cost')">Claude Code&nbsp;<span class="sort-icon" id="sort-icon-cc_cost"></span></th>
           <th class="sortable" onclick="setSessionSort('overhead')" title="Attributed overhead (lower bound, API list rate); the selected cause's share when a cause is chosen">Overhead&nbsp;<span class="sort-icon" id="sort-icon-overhead"></span></th>
           <th class="sortable" onclick="setSessionSort('shape')" title="What the session mostly did, from the tools it called">Shape&nbsp;<span class="sort-icon" id="sort-icon-shape"></span></th>
         </tr></thead>
@@ -467,6 +492,7 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
         </tr></thead>
         <tbody id="pricing-body"></tbody>
       </table>
+      <p id="pricing-fees" class="muted"></p>
       <p id="pricing-fallbacks" class="muted" hidden></p>
     </div>
     </div>
@@ -490,8 +516,6 @@ try { var t = localStorage.getItem('whytokens.theme'); if (t === 'light' || t ==
     <p>Cost estimates use editable dashboard pricing defaults: Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>, November 2026) and OpenAI API pricing (July 2026). Custom price edits are saved in this browser only. Anthropic models (<em>fable</em>/<em>opus</em>/<em>sonnet</em>/<em>haiku</em>) are priced at API rates; plan-included Codex/GPT usage is shown in a distinct color as an API-equivalent estimate. Other models show <em>n/a</em>. Actual costs for Max/Pro/Plus subscribers differ from API pricing.</p>
     <p>
       <span id="build-info">whytokens</span> &middot; Apache-2.0
-      &nbsp;&middot;&nbsp;
-      Derived from <a href="https://github.com/phuryn/claude-usage" target="_blank">claude-usage</a> by Pawel Huryn (MIT)
     </p>
   </div>
 </footer>

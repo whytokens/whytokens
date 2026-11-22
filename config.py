@@ -50,7 +50,10 @@ DEFAULT_PORT = 8090
 # OpenAI Codex CLI home (second ingestion source). Codex stores
 # per-session rollout transcripts under <CODEX_HOME>/sessions/YYYY/MM/DD/. Honor
 # the CODEX_HOME env var Codex itself uses; default to ~/.codex.
-CODEX_PATH = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+# Under unittest an inherited CODEX_HOME is ignored (a developer's shell exports the real one, and
+# a default-sources scan would decode every real rollout): only WHYTOKENS_TEST_CODEX_HOME, which a
+# test sets on purpose, redirects it.
+CODEX_PATH = Path(os.environ.get("WHYTOKENS_TEST_CODEX_HOME") or DATA_DIR / "codex-home") if "unittest" in sys.modules     else Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
 # Claude desktop app's claude.ai IndexedDB blob cache: the only local copy of
 # Projects thread titles (see project_threads.py).

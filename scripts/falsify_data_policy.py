@@ -24,7 +24,8 @@ MUTANTS = [
     # migration
     ("sources/__init__.py", "    policy.migrate_tool_calls(conn, scanner._meta_get, scanner._meta_set)\n", ""),
     ("policy.py", '        conn.execute("VACUUM")', "        pass"),
-    ("policy.py", "    if store_raw_inputs() or meta_get(conn, MIGRATION_KEY):", "    if meta_get(conn, MIGRATION_KEY):"),
+    ("policy.py", "    if store_raw_inputs():\n        if meta_get(conn, MIGRATION_KEY):", "    if False:\n        if meta_get(conn, MIGRATION_KEY):"),
+    ("policy.py", '            meta_set(conn, MIGRATION_KEY, "")\n', "            pass\n"),
     ("policy.py", "    meta_set(conn, MIGRATION_KEY, \"1\")\n", ""),
     ("policy.py", "    if _purged(conn):\n        meta_set(conn, MIGRATION_KEY", "    if True:\n        meta_set(conn, MIGRATION_KEY"),
     ("policy.py", "    except sqlite3.OperationalError:\n        return False\n",

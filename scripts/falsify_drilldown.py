@@ -28,13 +28,13 @@ MUTANTS = [
     # card targets
     (DRILL, "'Est. Cost': { col: 'cost', dir: 'desc' }", "'Est. Cost': { col: 'cost', dir: 'asc' }"),
     (DRILL, "'Cache Read': { col: 'cache_share', dir: 'asc' }", "'Cache Read': { col: 'cache_share', dir: 'desc' }"),
-    (DRILL, "'Cache Creation': { col: 'cache_creation', dir: 'desc' }", "'Cache Creation': { col: 'cache', dir: 'desc' }"),
+    (DRILL, "'Cache Write': { col: 'cache_creation', dir: 'desc' }", "'Cache Write': { col: 'cache', dir: 'desc' }"),
     (DRILL, "'Sessions': DEFAULT_SORT,", "'Sessions': { col: 'cost', dir: 'desc' },"),
     # overhead index
     (DRILL, "e.byCause[f.cause] = (e.byCause[f.cause] || 0) + f.usd;", "e.byCause[f.cause] = f.usd;"),
     (DRILL, "(cause ? e.byCause[cause] || 0 : e.total)", "e.total"),
     # Overview cards and strip
-    (APP, '<a class="stat-card" data-drill', '<div class="stat-card" data-drill'),
+    (APP, '<a class="${cls}" data-drill', '<div class="${cls}" data-drill'),
     (APP, "href: drillHref(globalParams(), { tab: 'waste' }) },", "href: '?' },"),
     (APP, "v.causes.filter(c => c.in_total).slice(0, 3)", "v.causes.filter(c => c.in_total).slice(0, 4)"),
     (APP, "const v = groupWaste(p.findings, lastScopeSessions);", "const v = groupWaste(p.findings, lastFilteredSessions);"),

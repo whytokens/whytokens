@@ -1,5 +1,6 @@
 * text=auto eol=lf
 *.png binary
+*.zst binary
 *.svg text eol=lf
 # Private-only paths, dropped by `git archive` in the release export (07 section 9).
 docs/private/ export-ignore

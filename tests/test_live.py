@@ -84,6 +84,15 @@ class LiveSessionTest(unittest.TestCase):
         self.assertEqual(api.get_live_session(session_id=SESSION)["model"],
                          "claude-opus-4-8")
 
+    def test_message_in_main_and_subagent_transcript_counts_once(self):
+        before = api.get_live_session(session_id=SESSION)
+        shutil.copy(self.main, self.proj / SESSION / "subagents" / "agent-dup.jsonl")
+        after = api.get_live_session(session_id=SESSION)
+        # the only new turn is the subagent file's own AgentSummary estimate (id keyed on the
+        # file); the nine real messages shared with main must not double.
+        self.assertEqual(after["turns"], before["turns"] + 1)
+        self.assertEqual(after["output"], before["output"] + 960)
+
     # -- resolution ---------------------------------------------------------
 
     def test_by_session_id_and_by_cwd_agree(self):

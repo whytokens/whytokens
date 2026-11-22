@@ -24,11 +24,12 @@ TITLES = {"acme/web": ["Fix checkout form validation", "Add dark mode toggle", "
 MODELS = ["claude-sonnet-4-6"] * 6 + ["claude-opus-4-8"] * 2 + ["claude-haiku-4-5"]
 
 
-def main(out):
+def main(out, sessions=60, fixed=None):
+    """`fixed` = (project, days_ago): that project drops its habit in sessions newer than that, so a recorded change has an after to compare."""
     rnd = random.Random(7)
     now = datetime.now(timezone.utc).replace(microsecond=0)
     out = Path(out)
-    for s in range(60):
+    for s in range(sessions):
         proj = PROJECTS[s % len(PROJECTS)]
         habit = HABITS[proj]
         cwd = "/work/" + proj
@@ -37,6 +38,8 @@ def main(out):
         sid = f"demo-{s:04d}-0000-4000-8000-000000000000"
         model = rnd.choice(MODELS)
         clock = now - timedelta(days=rnd.random() * 13, hours=rnd.random() * 8)
+        if fixed and proj == fixed[0] and clock > now - timedelta(days=fixed[1]):
+            habit = None
         lines = []
         ctx = 8000
         n = rnd.randint(12, 60)

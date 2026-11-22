@@ -357,6 +357,10 @@ class PageOddities(unittest.TestCase):
     def cut(self, a, b):
         return self.APP[self.APP.index(a):self.APP.index(b, self.APP.index(a))]
 
+    def test_page_load_rescans_after_showing_the_db(self):
+        init = self.cut("async function init(", "\ninit();")
+        self.assertIn("loadData().then(triggerRescan);", init)  # F5 picks up new turns
+
     def test_csv_cells_cannot_start_a_formula(self):
         self.node(self.cut("function csvField(", "function csvTimestamp(") + r"""
 const assert = require('node:assert/strict');
@@ -396,3 +400,27 @@ const assert = require('node:assert/strict');
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SuiteStaysOffRealData(unittest.TestCase):
+    def _config_path(self, **env):
+        import os
+        import subprocess
+        import sys
+        e = {k: v for k, v in os.environ.items() if k not in ("CODEX_HOME", "WHYTOKENS_TEST_CODEX_HOME")}
+        e.update(env)
+        root = Path(__file__).resolve().parent.parent
+        out = subprocess.run([sys.executable, "-c", "import unittest, config; print(config.CODEX_PATH)"],
+                             cwd=root, env=e, capture_output=True, text=True, timeout=60)
+        return Path(out.stdout.strip())
+
+    def test_inherited_codex_home_is_ignored_under_unittest(self):
+        # a default-sources scan in any test would otherwise decode every real rollout (minutes, and real data)
+        fake = Path.home() / "an-exported-real-codex-home"
+        got = self._config_path(CODEX_HOME=str(fake))
+        self.assertNotEqual(got, fake)
+        self.assertNotEqual(got, Path.home() / ".codex")
+
+    def test_a_test_can_still_point_it_explicitly(self):
+        fake = Path.home() / "explicit-test-home"
+        self.assertEqual(self._config_path(WHYTOKENS_TEST_CODEX_HOME=str(fake)), fake)

@@ -123,6 +123,13 @@ PRICING = {
     # gpt-6.1-sol (released 2026-09-29): Sol's price, but cached input is 0.05x
     # ($0.10), not 0.1x. Not a prefix of "gpt-6-sol", so without this row it fell
     # to the astra fallback at 5x. Same 272K caveat (2x input/cache, 1.5x output).
+    # gpt-6.2-astra / gpt-6.2-sol / gpt-6.1-terra: Standard short-context rates from
+    # developers.openai.com/api/docs/pricing (the platform.openai.com/docs/pricing redirect),
+    # fetched 2026-11-20; cache_write is the page's 30m write column. Same 272K caveat. The
+    # other GPT-6 rows above were re-checked on the same page that day and are unchanged.
+    "gpt-6.2-astra":     {"input": 8.00, "output": 40.00, "cache_read": 0.40,  "cache_write": 10.00},
+    "gpt-6.2-sol":       {"input": 2.00, "output": 10.00, "cache_read": 0.10,  "cache_write": 2.50},
+    "gpt-6.1-terra":     {"input": 1.00, "output":  5.00, "cache_read": 0.05,  "cache_write": 1.25},
     "gpt-6.1-sol":       {"input": 2.00, "output": 10.00, "cache_read": 0.10,  "cache_write": 2.50},
     "gpt-6-sol":         {"input": 2.00, "output": 10.00, "cache_read": 0.20,  "cache_write": 2.50},
     "gpt-6-luna":        {"input": 0.10, "output":  0.50, "cache_read": 0.01,  "cache_write": 0.125},
@@ -297,6 +304,39 @@ def calc_cost(model, inp, out, cache_read, cache_creation, timestamp=None,
 # several requests (scanner's AgentSummary estimate) must stay under the line itself.
 # shortcut: list price only; an Enterprise contract may price this differently.
 LONG_PROMPT_MODEL, LONG_PROMPT_TOKENS, LONG_PROMPT_MULT = "haiku-5-5", 100_000, 5.0
+# Server-side web search, $10 per 1,000 requests: Claude Code's cost-state costUSD reprices
+# exactly with it (12 searches = $0.12 on a Haiku 5.5 entry, 2026-11-21).
+WEB_SEARCH_FEE_USD = 0.01
+
+# Cost layers (docs/SCHEMA.md "Cost layers"): recorded = per-request usage the transcript wrote;
+# advisor = advisor iterations, recorded outside the envelope's top-level usage; estimated = what
+# Claude Code is billed for but never writes down (agent_summary forks, advisor calls with no
+# recorded iteration, web-search fees). Every total is their sum.
+LAYERS = ("recorded", "advisor", "estimated")
+
+
+def layer_sql(t=""):
+    """SQL CASE naming the layer of a turns row by its message_id."""
+    import scanner  # scanner imports this module; the prefixes stay single-sourced there
+    m = f"COALESCE({t}message_id, '')"
+    adv, summ = scanner.ADVISOR_ID_PREFIX, scanner.AGENT_SUMMARY_ID_PREFIX
+    return (f"CASE WHEN {m} LIKE '{summ}%' OR {m} LIKE '{adv}%:est' THEN 'estimated'"
+            f" WHEN {m} LIKE '{adv}%' THEN 'advisor' ELSE 'recorded' END")
+
+
+# A successful WebSearch call: its result arrived (a pending call has none yet) and is_error is
+# not set. Charged at read time, never as a synthetic turn.
+WEB_SEARCH_OK = "tool_name = 'WebSearch' AND result_bytes IS NOT NULL AND COALESCE(is_error, 0) = 0"
+
+
+def web_search_join(t=""):
+    """LEFT JOIN adding ws.n (successful web searches) per turn, pre-grouped so token sums don't
+    fan out. Select with ``SUM(COALESCE(ws.n, 0)) AS web_searches``."""
+    return (f"LEFT JOIN (SELECT message_id AS mid, COUNT(*) AS n FROM tool_results WHERE {WEB_SEARCH_OK}"
+            f" GROUP BY message_id) ws ON ws.mid = {t}message_id")
+
+
+WEB_SEARCHES = "SUM(COALESCE(ws.n, 0)) AS web_searches"
 LONG_PROMPT_COLS = ("model", "input_tokens", "cache_read_tokens", "cache_creation_tokens")
 
 SURCHARGE_COLS = (("input_tokens", "input"), ("output_tokens", "output"),
@@ -327,6 +367,19 @@ def price_mult_sql(cols, t=""):
                    f" > {LONG_PROMPT_TOKENS} THEN {LONG_PROMPT_MULT} ELSE 1.0 END"
                    if set(LONG_PROMPT_COLS) <= set(cols) else "1.0")
     return f"({fast} * {geo} * {long_prompt})"
+
+
+def tier_day_sql(col="timestamp"):
+    """SQL for the pricing-tier epoch of a turn's own UTC timestamp: the latest dated-tier
+    boundary <= its UTC day ('0000-00-00' before the first). Group by it next to any display
+    day (local or UTC) and price each group at this date, so a turn costs the same in every
+    view regardless of which calendar the day buckets use."""
+    cuts = sorted({t["from"] for e in PRICING.values() if isinstance(e, list)
+                   for t in e if t.get("from")})
+    expr = "'0000-00-00'"
+    for c in cuts:
+        expr = f"CASE WHEN substr({col}, 1, 10) >= '{c}' THEN '{c}' ELSE {expr} END"
+    return expr
 
 
 def surcharge_sql(cols, t="", agg=True):

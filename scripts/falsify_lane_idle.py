@@ -18,6 +18,10 @@ MUTANTS = [
     ("waste.py", CHECK, "lgap.total_seconds() >= 0"),               # every turn is idle
     ("waste.py", "if sum(bool(e[\"agent_id\"]) for e in evidence) * 2 > len(evidence) else",
      "if False else"),                                              # subagent fix text dropped
+    ("waste.py", '(lost := min(creation, lane["prefix"] - (turn["cache_read_tokens"] or 0)))', "(lost := creation)"),  # lane claims new context
+    ("waste.py", '(lost := min(creation, previous_main["prefix"] - (turn["cache_read_tokens"] or 0)))', "(lost := creation)"),
+    ("waste.py", 'previous_main["prefix"] - (turn["cache_read_tokens"] or 0)', 'previous_main["prefix"]'),  # read-back prefix expired
+    ("waste.py", '(gap, lost, warm, previous_main["ttl"])', '(gap, creation, warm, previous_main["ttl"])'),  # detail disagrees
 ]
 
 

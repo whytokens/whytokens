@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pricing
 import waste
 from sources import ClaudeSource, scan_all
 from tests.test_waste import _rec, _ts
@@ -101,6 +102,33 @@ def _two_rewrites(i, rec):  # two later quiet turns become full rewrites (no cac
 
 FIXTURES["kwc0"] = _patched("kwc0", _compact_next)
 FIXTURES["kwrw"] = _patched("kwrw", _two_rewrites)
+# the same two turns as unexpected partial rebuilds: they still read 1,000 tokens, but another cause claimed them
+FIXTURES["kwpart"] = _patched("kwpart", lambda i, rec: i in (6, 7) and rec["message"]["usage"].update(
+    cache_read_input_tokens=1_000, cache_creation_input_tokens=90_000))
+# the eight quiet turns after the schema write read back only 1,000 tokens each
+FIXTURES["kwlow"] = _patched("kwlow", lambda i, rec: i >= 5 and rec["message"]["usage"].update(cache_read_input_tokens=1_000))
+
+
+def _row(n, read, create, calls=(), mult=1.0):
+    return {"id": n, "message_id": f"m{n}", "is_sidechain": 0, "agent_id": None, "is_compact_summary": 0,
+            "tool_name": calls[0] if calls else None, "agent": "claude", "model": "claude-sonnet-4-6",
+            "timestamp": _ts(n), "mult": mult, "cache_read_tokens": read, "cache_creation_tokens": create,
+            "tool_calls": json.dumps([{"name": c, "id": f"c{n}"} for c in calls]) if calls else None}
+
+
+class TestDeferredReadBudget(unittest.TestCase):
+    def test_overlapping_loads_share_the_reads_and_price_them_where_read(self):
+        # two unused ToolSearch loads in a row; the six later turns read back 1,000 tokens each.
+        # The first schema-write turn ran in fast mode (2x); the reads did not.
+        turns = [_row(0, 0, 20_000), _row(1, 20_000, 400, ["ToolSearch"]), _row(2, 1_000, 90_000, mult=2.0),
+                 _row(3, 1_000, 400, ["ToolSearch"]), _row(4, 1_000, 90_000)]
+        turns += [_row(n, 1_000, 400) for n in range(5, 9)]
+        loads = {"m1": [f"mcp__a__t{i}" for i in range(5)], "m3": [f"mcp__b__t{i}" for i in range(5)]}
+        claims = {c: [0.0, [], []] for c in waste.CAUSES}
+        waste._deferred_tool_load(turns, loads, claims)
+        usd, _, evidence = claims["deferred_tool_load"]
+        self.assertLessEqual(sum(e["tokens"] for e in evidence), 6 * 1_000)
+        self.assertAlmostEqual(usd, pricing.calc_cost("claude-sonnet-4-6", 0, 0, sum(e["tokens"] for e in evidence), 0, _ts(5)))
 
 
 class TestDeferredToolLoad(unittest.TestCase):
@@ -151,10 +179,16 @@ class TestDeferredToolLoad(unittest.TestCase):
         # combined review: `k > i + 1` skipped a compaction on the very next turn
         self.assertIsNone(self._find("kwc0"))
 
+    def test_charge_never_exceeds_the_cache_reads_recorded(self):
+        f = {f["cause"]: f for f in waste.report(self.db, "kwlow", min_share=0, min_usd=0)}["deferred_tool_load"]
+        self.assertLessEqual(sum(e["tokens"] for e in f["evidence"]), 8 * 1_000)
+        self.assertGreater(f["usd"], 0)
+
     def test_later_turns_without_a_cache_read_are_not_charged(self):
         # combined review: 8 quiet turns after the schema write in "kw"; two become rewrites in "kwrw"
         kw, rw = self._find("kw")["evidence"][0]["tokens"], self._find("kwrw")["evidence"][0]["tokens"]
         self.assertEqual(rw * 8, kw * 6)
+        self.assertEqual(self._find("kwpart")["evidence"][0]["tokens"], rw)  # a turn another cause claimed is skipped
 
     def test_overlap_is_judged_per_lane(self):
         self.assertIsNone(self._find("subsx"))

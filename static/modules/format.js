@@ -14,11 +14,20 @@ export function esc(s) {
 }
 
 /**
+ * A value that reaches innerHTML as a number: anything non-numeric (a string a malformed
+ * transcript smuggled through SQLite) becomes 0, never raw text.
+ * @param {*} n
+ * @returns {number}
+ */
+function num(n) { n = Number(n); return Number.isFinite(n) ? n : 0; }
+
+/**
  * Compact token count: 1.50M / 1.5K / 999.
  * @param {number} n
  * @returns {string}
  */
 export function fmt(n) {
+  n = num(n);
   if (n >= 1e9) return (n/1e9).toFixed(2)+'B';
   if (n >= 1e6) return (n/1e6).toFixed(2)+'M';
   if (n >= 1e3) return (n/1e3).toFixed(1)+'K';
@@ -26,11 +35,11 @@ export function fmt(n) {
 }
 
 /** Cost to 4 decimals ($0.0000). @param {number} c @returns {string} */
-export function fmtCost(c)    { return '$' + c.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 4 }); }
+export function fmtCost(c)    { return '$' + num(c).toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 4 }); }
 /** Cost to 2 decimals ($0.00), for headline totals. @param {number} c @returns {string} */
-export function fmtCostBig(c) { return '$' + c.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+export function fmtCostBig(c) { return '$' + num(c).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
 /** Fraction as a percentage (0.0% when non-finite). @param {number} v @returns {string} */
-export function fmtPct(v)     { return isFinite(v) ? (v * 100).toFixed(1) + '%' : '0.0%'; }
+export function fmtPct(v)     { v = Number(v); return isFinite(v) ? (v * 100).toFixed(1) + '%' : '0.0%'; }
 
 /**
  * ISO-UTC timestamp → "YYYY-MM-DD HH:MM" in the display timezone.

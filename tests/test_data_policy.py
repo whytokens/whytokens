@@ -197,6 +197,19 @@ class TestMigration(PolicyCase):
         self.run_scan_all()
         self.assertNotIn(SECRET, "".join(self.stored()))
 
+    def test_raw_opt_in_after_marker_is_redacted_again_once_off(self):
+        self.scan()                                   # default policy: marker set
+        with mock.patch.dict(os.environ, {policy.RAW_ENV: "1"}):
+            self.scan()                               # opted in: marker must drop
+            with closing(sqlite3.connect(self.db)) as c:
+                c.execute("UPDATE turns SET tool_calls = ? WHERE rowid = (SELECT MIN(rowid) FROM turns)",
+                          (json.dumps([{"name": "Write", "input": {"content": SECRET}}]),))
+                c.commit()
+        self.assertIn(SECRET, "".join(self.stored()))
+        self.scan()                                   # opt-in off again
+        self.assertNotIn(SECRET, "".join(self.stored()))
+        self.assertNotIn(SECRET.encode(), self.db_bytes())
+
     def test_standalone_scan_also_migrates(self):
         self.seed_raw()
         import scanner   # the standalone entry point, not scan_all

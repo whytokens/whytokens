@@ -13,7 +13,7 @@ import re
 import sqlite3
 
 RAW_ENV = "WHYTOKENS_STORE_RAW_INPUTS"
-MIGRATION_KEY = "tool_calls_redacted_v1"
+MIGRATION_KEY = "tool_calls_redacted_v2"
 PROMPT_TOPICS_KEY = "prompt_topics_cleared_v1"
 
 # tool name -> input keys kept verbatim. Everything else is reduced to sizes.
@@ -89,10 +89,16 @@ def redact_calls(calls):
 def migrate_tool_calls(conn, meta_get, meta_set):
     """Rewrite stored ``turns.tool_calls`` under the default policy, once.
 
-    Skipped (and not marked) while the raw opt-in is on. VACUUMs afterwards:
-    without it the raw text stays recoverable in the file's free pages.
+    While the raw opt-in is on nothing is rewritten and the marker is cleared, so turning the
+    opt-in back off redacts whatever raw rows it let in. VACUUMs afterwards: without it the raw
+    text stays recoverable in the file's free pages.
     """
-    if store_raw_inputs() or meta_get(conn, MIGRATION_KEY):
+    if store_raw_inputs():
+        if meta_get(conn, MIGRATION_KEY):
+            meta_set(conn, MIGRATION_KEY, "")
+            conn.commit()
+        return 0
+    if meta_get(conn, MIGRATION_KEY):
         return 0
     rows = conn.execute(
         "SELECT rowid, tool_calls FROM turns WHERE tool_calls IS NOT NULL").fetchall()

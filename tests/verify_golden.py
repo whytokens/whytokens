@@ -33,6 +33,10 @@ def capture():
             conn.close()
             fix.pop("recorded_at", None)
             r = fixes.verify(db, fix)
+            for extra in ("baselines", "counters"):  # additive observations, not part of the frozen verdict
+                r.pop(extra, None)
+            for side in ("before", "after"):  # additive count of set-aside sessions; every fixture here is measured
+                assert r[side].pop("unmeasured") == 0
             out[name] = json.loads(json.dumps(r, sort_keys=True))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

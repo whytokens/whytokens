@@ -6,6 +6,7 @@ this file goes red.
 """
 import json
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -150,6 +151,17 @@ class _Scan(unittest.TestCase):
         return [f for f in waste.report(self.db, session_id=sid, **kw) if f["cause"] == cause]
 
 
+
+def _legacy_trim(db, sids):
+    """Rows ingested before a streamed message's calls were merged keep only the last record's call.
+    Their transcripts can be gone, so a re-parse never fixes them: the tool_results fallback must."""
+    conn = sqlite3.connect(db)
+    for sid in sids:
+        conn.execute("UPDATE turns SET tool_calls = json_array(json_extract(tool_calls, '$[#-1]'))"
+                     " WHERE session_id = ? AND json_array_length(tool_calls) > 1", (sid,))
+    conn.commit()
+    conn.close()
+
 class TestLargeContext(_Scan):
     def test_clean_session_scores_zero(self):
         self.assertEqual(self.find("lc_clean", "large_context"), [])
@@ -198,6 +210,27 @@ class TestRetryLoop(_Scan):
         self.assertEqual(self.find("rt_streamed", "retry_loop"), [])
 
     def test_a_failure_lost_from_a_streamed_message_still_breaks_the_run(self):
+        self.assertEqual(self.find("rt_streamed_failure", "retry_loop"), [])
+
+
+class TestLegacyStreamedRows(_Scan):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        _legacy_trim(cls.db, ("rt_streamed", "rt_streamed_failure"))
+
+    def test_the_trim_really_lost_calls(self):  # guards the fixture: otherwise the tests below prove nothing
+        conn = sqlite3.connect(self.db)
+        n = conn.execute("SELECT COUNT(*) FROM tool_results r WHERE r.session_id IN ('rt_streamed','rt_streamed_failure')"
+                         " AND NOT EXISTS (SELECT 1 FROM turns t, json_each(t.tool_calls) j WHERE t.message_id = r.message_id"
+                         " AND json_extract(j.value, '$.id') = r.call_id)").fetchone()[0]
+        conn.close()
+        self.assertGreater(n, 0)
+
+    def test_an_edit_lost_from_an_old_row_still_breaks_the_run(self):
+        self.assertEqual(self.find("rt_streamed", "retry_loop"), [])
+
+    def test_a_failure_lost_from_an_old_row_still_breaks_the_run(self):
         self.assertEqual(self.find("rt_streamed_failure", "retry_loop"), [])
 
     def test_a_run_on_a_model_without_a_price_is_no_finding_and_no_crash(self):

@@ -32,6 +32,9 @@ Routes:
   GET  /icon.svg               -> resources/icon.svg (header icon)
   GET  /api/budget             -> budget.month_status(): this calendar month vs the monthly budget
   POST /api/budget             -> {monthly_usd: number|null} set / clear the budget (token-guarded)
+  GET  /api/reconcile          -> ?period=YYYY-MM&tz=: the gap to the bill split into causes;
+                                  ?session=ID&usage=N: one session vs its /usage cost
+  POST /api/reconcile          -> {period, billed: number|null, as_of?} store / clear the billed figure
   GET  /api/whatif?to&start&end&model&project&actor&session_id -> whatif.reprice(): repricing only
   GET  /api/llm                -> llm.totals(): the opt-in adapter's own spend + stored labels / judges
   POST /api/llm/preview        -> {kind, session_id, cause?}: the exact outbound call, unsent (token-guarded)
@@ -47,6 +50,7 @@ Routes:
 
 import collections
 import json
+import math
 import os
 import secrets
 import re
@@ -59,6 +63,7 @@ from datetime import date, datetime
 from urllib.parse import parse_qs, quote, urlparse
 
 import config
+import cost_state
 import extensions
 import pricing
 import provenance
@@ -121,6 +126,11 @@ def _qs1(query_dict, key, default=""):
     return query_dict.get(key, [default])[0]
 
 
+def _int(v):
+    """A stored number as an int; anything non-numeric (a malformed transcript's string) is 0."""
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else 0
+
+
 def _connect(db_path):
     """Open a read connection with row access + a short busy timeout.
 
@@ -128,6 +138,8 @@ def _connect(db_path):
     concurrent scan; busy_timeout only covers the rare writer/writer overlap and
     keeps an external reader from erroring if it happens to open mid-commit.
     """
+    if not Path(db_path).exists():  # sqlite3.connect would create an empty file, then fail on it
+        raise sqlite3.OperationalError("database not found: run python cli.py scan")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
@@ -155,9 +167,10 @@ def _session_model_breakdowns(conn, session_ids=None):
                SUM(cache_read_tokens)     AS cache_read,
                SUM(cache_creation_tokens) AS cache_creation,
                SUM(cache_creation_1h_tokens)  AS cache_creation_1h,
-               {x}
-        FROM turns
-    """.format(x=pricing.surcharge_sql(_turn_cols(conn)))
+               {x}, {td} AS rate_day, {layer} AS layer, {ws}
+        FROM turns {wsj}
+    """.format(x=pricing.surcharge_sql(_turn_cols(conn)), td=pricing.tier_day_sql(),
+               layer=pricing.layer_sql(), ws=pricing.WEB_SEARCHES, wsj=pricing.web_search_join())
     params = []
     if session_ids is not None:
         ids = list(session_ids)
@@ -165,7 +178,7 @@ def _session_model_breakdowns(conn, session_ids=None):
             return {}
         sql += " WHERE session_id IN (%s)" % ",".join("?" * len(ids))
         params = ids
-    sql += " GROUP BY session_id, COALESCE(NULLIF(model, ''), 'unknown')"
+    sql += " GROUP BY session_id, COALESCE(NULLIF(model, ''), 'unknown'), rate_day, layer"
 
     out = {}
     for r in conn.execute(sql, params):
@@ -177,17 +190,22 @@ def _session_model_breakdowns(conn, session_ids=None):
             "cache_creation": r["cache_creation"] or 0,
             "cache_creation_1h": r["cache_creation_1h"] or 0,
             "x":              pricing.surcharge(r),
+            "timestamp":      r["rate_day"],  # the tier epoch; pricing.js prices by it
+            "layer":          r["layer"],
+            "web_searches":   r["web_searches"] or 0,
         })
     return out
 
 
-def _session_to_dict(r, by_model=None, tz="local"):
+def _session_to_dict(r, by_model=None, tz="local", cc=None):
     """Map a sessions-table row (joined with a ``tools`` GROUP_CONCAT column) to
     the JSON shape the dashboard and the /api/sessions endpoint both return.
 
     ``by_model`` is the {session_id: [...]} map from _session_model_breakdowns; the
     matching entry is attached so the client can price each model's tokens correctly.
+    ``cc`` is cost_state.compare's {session_id: comparison}; a session absent from it has no record.
     """
+    c = (cc or {}).get(r["session_id"]) or {}
     try:
         t1 = datetime.fromisoformat(r["first_timestamp"].replace("Z", "+00:00"))
         t2 = datetime.fromisoformat(r["last_timestamp"].replace("Z", "+00:00"))
@@ -220,6 +238,11 @@ def _session_to_dict(r, by_model=None, tz="local"):
         # main + opus Task) would otherwise be mispriced by applying the single
         # `model` label to the summed tokens. Empty when no breakdown was supplied.
         "by_model":        by_model.get(r["session_id"], []) if by_model else [],
+        # Claude Code's own cost-state figure, compared at read time (docs/SCHEMA.md cost_state)
+        "cc_cost":         c.get("cc_cost"),
+        "cc_coverage":     c.get("cc_coverage", "none"),
+        "cc_delta_pct":    c.get("cc_delta_pct"),
+        "cc_flag":         c.get("cc_flag", False),
     }
 
 
@@ -249,6 +272,7 @@ _SESSION_SORTS = {
     "oldest": "s.last_timestamp ASC",
     "tokens": "(s.total_input_tokens + s.total_output_tokens) DESC",
     "turns":  "s.turn_count DESC",
+    "cc_cost": "(SELECT total_cost_usd FROM cost_state c WHERE c.session_id = s.session_id) DESC NULLS LAST",
 }
 
 
@@ -306,6 +330,8 @@ def get_dashboard_data(db_path=None, tz="local"):
     # Fast/US surcharge terms (x_*), priced client-side by pricing.js rowCost.
     turn_cols = _turn_cols(conn)
     X = pricing.surcharge_sql(turn_cols)
+    TD = pricing.tier_day_sql()
+    LAYER = pricing.layer_sql()
     daily_rows = conn.execute(f"""
         SELECT
             {day} as day,
@@ -315,15 +341,16 @@ def get_dashboard_data(db_path=None, tz="local"):
             SUM(cache_read_tokens)     as cache_read,
             SUM(cache_creation_tokens) as cache_creation,
             SUM(cache_creation_1h_tokens)  as cache_creation_1h,
-            {X},
+            {X}, {TD} as rate_day, {LAYER} as layer, {pricing.WEB_SEARCHES},
             COUNT(*)                   as turns
-        FROM turns
-        GROUP BY day, COALESCE(NULLIF(model, ''), 'unknown')
+        FROM turns {pricing.web_search_join()}
+        GROUP BY day, COALESCE(NULLIF(model, ''), 'unknown'), rate_day, layer
         ORDER BY day, model
     """).fetchall()
 
     daily_by_model = [{
         "day":            r["day"],
+        "rate_day":       r["rate_day"],
         "model":          r["model"],
         "input":          r["input"] or 0,
         "output":         r["output"] or 0,
@@ -332,7 +359,36 @@ def get_dashboard_data(db_path=None, tz="local"):
         "cache_creation_1h": r["cache_creation_1h"] or 0,
         "x":              pricing.surcharge(r),
         "turns":          r["turns"] or 0,
+        "layer":          r["layer"],
+        "web_searches":   r["web_searches"] or 0,
     } for r in daily_rows]
+
+    # ── Daily per-project/branch/model: the Projects table is built from turns, like Overview,
+    # so its range and model filters cut individual turns, not whole sessions.
+    p_day = _day_expr(tz, "t.timestamp")
+    daily_by_project = [{
+        "day": r["day"], "rate_day": r["rate_day"], "project": r["project"], "branch": r["branch"],
+        "model": r["model"], "input": r["input"] or 0, "output": r["output"] or 0,
+        "cache_read": r["cache_read"] or 0, "cache_creation": r["cache_creation"] or 0,
+        "cache_creation_1h": r["cache_creation_1h"] or 0, "x": pricing.surcharge(r),
+        "turns": r["turns"] or 0, "layer": r["layer"], "web_searches": r["web_searches"] or 0,
+    } for r in conn.execute(f"""
+        SELECT {p_day} as day,
+               COALESCE(s.project_name, 'unknown')       as project,
+               COALESCE(s.git_branch, '')                as branch,
+               COALESCE(NULLIF(t.model, ''), 'unknown')  as model,
+               SUM(t.input_tokens)            as input,
+               SUM(t.output_tokens)           as output,
+               SUM(t.cache_read_tokens)       as cache_read,
+               SUM(t.cache_creation_tokens)   as cache_creation,
+               SUM(t.cache_creation_1h_tokens) as cache_creation_1h,
+               {pricing.surcharge_sql(turn_cols, 't.')},
+               {pricing.tier_day_sql('t.timestamp')} as rate_day,
+               {pricing.layer_sql('t.')} as layer, {pricing.WEB_SEARCHES},
+               COUNT(*) as turns
+        FROM turns t LEFT JOIN sessions s ON s.session_id = t.session_id {pricing.web_search_join('t.')}
+        GROUP BY 1, 2, 3, 4, rate_day, layer
+    """)]
 
     # ── Hourly per-day per-model (client filters by range + TZ-shifts) ────────
     # Timestamps are ISO8601 UTC (e.g. "2026-04-08T09:30:00Z"); chars 12-13 = hour.
@@ -342,18 +398,20 @@ def get_dashboard_data(db_path=None, tz="local"):
     hourly_rows = conn.execute(f"""
         SELECT
             {day} as day,
+            substr(timestamp, 1, 10)                  as utc_day,
             CAST(substr(timestamp, 12, 2) AS INTEGER) as hour,
             COALESCE(NULLIF(model, ''), 'unknown')    as model,
             SUM(output_tokens)                        as output,
             COUNT(*)                                  as turns
         FROM turns
         WHERE timestamp IS NOT NULL AND length(timestamp) >= 13
-        GROUP BY day, hour, COALESCE(NULLIF(model, ''), 'unknown')
+        GROUP BY day, utc_day, hour, COALESCE(NULLIF(model, ''), 'unknown')
         ORDER BY day, hour, model
     """).fetchall()
 
     hourly_by_model = [{
         "day":    r["day"],
+        "utc_day": r["utc_day"],
         "hour":   r["hour"] if r["hour"] is not None else 0,
         "model":  r["model"],
         "output": r["output"] or 0,
@@ -371,15 +429,16 @@ def get_dashboard_data(db_path=None, tz="local"):
             SUM(cache_read_tokens)          as cache_read,
             SUM(cache_creation_tokens)      as cache_creation,
             SUM(cache_creation_1h_tokens)       as cache_creation_1h,
-            {X},
+            {X}, {TD} as rate_day, {pricing.WEB_SEARCHES},
             COUNT(*)                        as turns
-        FROM turns
-        GROUP BY day, model, tool
+        FROM turns {pricing.web_search_join()}
+        GROUP BY day, model, tool, rate_day
         ORDER BY day, model, tool
     """).fetchall()
 
     tool_by_model = [{
         "day":            r["day"],
+        "rate_day":       r["rate_day"],
         "model":          r["model"],
         "tool":           r["tool"],
         "input":          r["input"] or 0,
@@ -389,6 +448,7 @@ def get_dashboard_data(db_path=None, tz="local"):
         "cache_creation_1h": r["cache_creation_1h"] or 0,
         "x":              pricing.surcharge(r),
         "turns":          r["turns"] or 0,
+        "web_searches":   r["web_searches"] or 0,
     } for r in tool_rows]
 
     # ── Reasoning effort per-day per-model (client filters by local-day range) ─
@@ -406,16 +466,17 @@ def get_dashboard_data(db_path=None, tz="local"):
             SUM(cache_read_tokens)          as cache_read,
             SUM(cache_creation_tokens)      as cache_creation,
             SUM(cache_creation_1h_tokens)       as cache_creation_1h,
-            {X},
+            {X}, {TD} as rate_day, {pricing.WEB_SEARCHES},
             COUNT(*)                        as turns
-        FROM turns
+        FROM turns {pricing.web_search_join()}
         GROUP BY day, COALESCE(NULLIF(model, ''), 'unknown'),
-                 COALESCE(NULLIF(effort, ''), 'unknown')
+                 COALESCE(NULLIF(effort, ''), 'unknown'), rate_day
         ORDER BY day, model, effort
     """).fetchall()
 
     effort_by_model = [{
         "day":            r["day"],
+        "rate_day":       r["rate_day"],
         "model":          r["model"],
         "effort":         r["effort"],
         "input":          r["input"] or 0,
@@ -425,6 +486,7 @@ def get_dashboard_data(db_path=None, tz="local"):
         "cache_creation_1h": r["cache_creation_1h"] or 0,
         "x":              pricing.surcharge(r),
         "turns":          r["turns"] or 0,
+        "web_searches":   r["web_searches"] or 0,
     } for r in effort_rows]
 
     # ── MCP server per-day per-model (same shape as effort_by_model) ──────────
@@ -439,15 +501,16 @@ def get_dashboard_data(db_path=None, tz="local"):
             SUM(cache_read_tokens)          as cache_read,
             SUM(cache_creation_tokens)      as cache_creation,
             SUM(cache_creation_1h_tokens)   as cache_creation_1h,
-            {X},
+            {X}, {TD} as rate_day,
             COUNT(*)                        as turns
         FROM turns
         WHERE mcp_server IS NOT NULL AND mcp_server != ''
-        GROUP BY day, COALESCE(NULLIF(model, ''), 'unknown'), mcp_server
+        GROUP BY day, COALESCE(NULLIF(model, ''), 'unknown'), mcp_server, rate_day
     """).fetchall() if "mcp_server" in turn_cols else []
 
     mcp_by_model = [{
         "day":            r["day"],
+        "rate_day":       r["rate_day"],
         "model":          r["model"],
         "mcp":            r["mcp"],
         "input":          r["input"] or 0,
@@ -464,7 +527,8 @@ def get_dashboard_data(db_path=None, tz="local"):
         _SESSION_SELECT + " ORDER BY s.last_timestamp DESC"
     ).fetchall()
     by_model = _session_model_breakdowns(conn)
-    sessions_all = [_session_to_dict(r, by_model, tz) for r in session_rows]
+    cc = cost_state.compare(conn)
+    sessions_all = [_session_to_dict(r, by_model, tz, cc) for r in session_rows]
 
     # ── Subagent dispatches (Task/Agent tool) ─────────────────────────────────
     # The full ranked dispatch list, newest first — the client filters by the
@@ -500,9 +564,9 @@ def get_dashboard_data(db_path=None, tz="local"):
             "project":           r["project"],
             "day":               r["day"] or "",
             "completed_at":      r["completed_at"] or "",
-            "total_tokens":      r["total_tokens"] or 0,
-            "total_duration_ms": r["total_duration_ms"] or 0,
-            "tool_use_count":    r["tool_use_count"] or 0,
+            "total_tokens":      _int(r["total_tokens"]),
+            "total_duration_ms": _int(r["total_duration_ms"]),
+            "tool_use_count":    _int(r["tool_use_count"]),
         } for r in dispatch_rows]
     except sqlite3.OperationalError:
         pass  # pre-migration DB: no agents table yet
@@ -512,6 +576,7 @@ def get_dashboard_data(db_path=None, tz="local"):
     return {
         "all_models":      all_models,
         "daily_by_model":  daily_by_model,
+        "daily_by_project": daily_by_project,
         "hourly_by_model": hourly_by_model,
         "tool_by_model":   tool_by_model,
         "effort_by_model": effort_by_model,
@@ -520,6 +585,11 @@ def get_dashboard_data(db_path=None, tz="local"):
         "subagent_dispatches": subagent_dispatches,
         "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def pricing_payload():
+    """GET /api/pricing: the model table, plus the per-request fees under ``_fees`` (not a model)."""
+    return {**pricing.PRICING, "_fees": {"web_search_usd": pricing.WEB_SEARCH_FEE_USD}}
 
 
 def get_status(db_path=None):
@@ -605,8 +675,9 @@ def get_session_detail(session_id, db_path=None):
             turns.agent_id as agent_id, agents.agent_type as agent_type,
             COALESCE(tool_name, '<none>') as tool_name,
             cwd,
-            {pricing.surcharge_sql(turn_cols, agg=False)}
-        FROM turns LEFT JOIN agents ON agents.agent_id = turns.agent_id
+            {pricing.surcharge_sql(turn_cols, agg=False)},
+            COALESCE(ws.n, 0) as web_searches
+        FROM turns LEFT JOIN agents ON agents.agent_id = turns.agent_id {pricing.web_search_join('turns.')}
         WHERE session_id = ?
         ORDER BY timestamp, turns.id
     """, (session_id,)).fetchall()
@@ -687,6 +758,7 @@ def get_session_detail(session_id, db_path=None):
             "tool_calls":     json.loads(r["tool_calls"]) if r["tool_calls"] else [],
             "cwd":            r["cwd"] or "",
             "x":              pricing.surcharge(r),
+            "web_searches":   r["web_searches"],
         } for r, actor, gap in traced],
     }
     actors = {}
@@ -901,6 +973,35 @@ def post_llm_run(body):
     return llm.run(body.get("confirm"), DB_PATH)
 
 
+def get_reconcile(q):
+    """GET /api/reconcile: the month reconcile, or the one-off session check with ``session``."""
+    import reconcile
+    try:
+        if _qs1(q, "session"):
+            usage = _qs1(q, "usage")
+            return reconcile.session_check(_qs1(q, "session"), float(usage) if usage else None, DB_PATH)
+        tz = _qs1(q, "tz") or "local"
+        if tz not in ("local", "utc"):
+            raise ValueError("tz must be local or utc")
+        return reconcile.report(_qs1(q, "period") or reconcile.current_period(), DB_PATH, tz=tz)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+def post_reconcile(body):
+    """POST /api/reconcile {period, billed, as_of?}: store (billed null clears), return the report."""
+    import reconcile
+    if not isinstance(body, dict) or "period" not in body or "billed" not in body:
+        raise ValueError("expected {period, billed: number|null, as_of?}")
+    period = body["period"]
+    as_of = body["as_of"] if body.get("as_of") is not None else reconcile.default_as_of(period)
+    tz = body.get("tz") or "local"
+    if tz not in ("local", "utc"):
+        raise ValueError("tz must be local or utc")
+    reconcile.set_billed(period, body["billed"], as_of, DB_PATH)  # validates everything before writing
+    return reconcile.report(period, DB_PATH, tz=tz)
+
+
 def post_project_tag(payload, db_path=None):
     """Set or clear a project's display tag. ValueError on a bad payload, tag or unknown project."""
     import budget
@@ -983,9 +1084,10 @@ def get_export(db_path=None):
     try:
         rows = conn.execute(f"{_SESSION_SELECT} ORDER BY s.last_timestamp DESC").fetchall()
         by_model = _session_model_breakdowns(conn, [r["session_id"] for r in rows])
+        cc = cost_state.compare(conn)
     finally:
         conn.close()
-    sessions = [_session_to_dict(r, by_model) for r in rows]
+    sessions = [_session_to_dict(r, by_model, cc=cc) for r in rows]
     waste = get_waste(db_path)
     keys = ("turns", "input", "output", "cache_read", "cache_creation")
     return {
@@ -1041,11 +1143,13 @@ def get_session_breakdown(session_id, db_path=None):
             SUM(t.cache_creation_tokens)                           AS cache_creation,
             SUM({'t.cache_creation_5m_tokens' if 'cache_creation_5m_tokens' in turn_cols else '0'}) AS cache_creation_5m,
             SUM({'t.cache_creation_1h_tokens' if 'cache_creation_1h_tokens' in turn_cols else '0'}) AS cache_creation_1h,
-            {pricing.surcharge_sql(turn_cols, 't.')}
+            {pricing.surcharge_sql(turn_cols, 't.')},
+            {pricing.tier_day_sql('t.timestamp')} AS rate_day,
+            {pricing.layer_sql('t.')} AS layer, {pricing.WEB_SEARCHES}
         FROM turns t
-        {agent_join}
+        {agent_join} {pricing.web_search_join('t.')}
         WHERE t.session_id = ?
-        GROUP BY kind, label, model
+        GROUP BY kind, label, model, rate_day, layer
         ORDER BY label, model
     """, (session_id,)).fetchall()
     conn.close()
@@ -1062,6 +1166,9 @@ def get_session_breakdown(session_id, db_path=None):
         "cache_creation_5m": r["cache_creation_5m"] or 0,
         "cache_creation_1h": r["cache_creation_1h"] or 0,
         "x":                 pricing.surcharge(r),
+        "rate_day":          r["rate_day"],
+        "layer":             r["layer"],
+        "web_searches":      r["web_searches"] or 0,
     } for r in rows]}
 
 
@@ -1124,6 +1231,17 @@ def get_live_session(session_id="", cwd=""):
         metas.extend(m)
     if not turns:
         return {"error": "Transcript has no usage records yet"}
+    # One API message can appear in the main and a subagent transcript: count it once, keeping
+    # the record with the larger output (the final tally), like the scanner's upsert.
+    best = {}
+    for t in turns:
+        k = t.get("message_id") or id(t)  # empty ids never dedup (the DB's unique index skips them)
+        old = best.get(k)
+        # larger output wins; on a tie keep the main-chain record
+        if (old is None or (t.get("output_tokens") or 0) > (old.get("output_tokens") or 0)
+                or ((t.get("output_tokens") or 0) == (old.get("output_tokens") or 0) and not t.get("is_sidechain"))):
+            best[k] = t
+    turns = list(best.values())
 
     cost = sum(pricing.calc_cost(
         t.get("model") or "unknown", t.get("input_tokens", 0), t.get("output_tokens", 0),
@@ -1218,6 +1336,8 @@ def get_sessions_page(project="", model="", start="", end="", limit=50,
 
     conn = _connect(db_path)
     try:
+        if sort == "cc_cost" and not cost_state.has_table(conn):  # a DB from before the table
+            sort, order_by = "recent", _SESSION_SORTS["recent"]
         total = conn.execute(
             f"SELECT COUNT(*) FROM sessions s {where}", params
         ).fetchone()[0]
@@ -1228,11 +1348,12 @@ def get_sessions_page(project="", model="", start="", end="", limit=50,
         by_model = _session_model_breakdowns(
             conn, [r["session_id"] for r in rows]
         )
+        cc = cost_state.compare(conn, [r["session_id"] for r in rows])
     finally:
         conn.close()
 
     return {
-        "sessions": [_session_to_dict(r, by_model, tz) for r in rows],
+        "sessions": [_session_to_dict(r, by_model, tz, cc) for r in rows],
         "total":    total,
         "limit":    limit,
         "offset":   offset,
@@ -1293,45 +1414,61 @@ def get_daily(start="", end="", model="", project="", tz="", db_path=None):
                 SUM(t.cache_creation_tokens)             as cache_creation,
                 SUM(t.cache_creation_1h_tokens)              as cache_creation_1h,
                 {pricing.surcharge_sql(_turn_cols(conn), 't.')},
+                {pricing.tier_day_sql('t.timestamp')}    as rate_day,
+                {pricing.layer_sql('t.')}                as layer, {pricing.WEB_SEARCHES},
                 COUNT(*)                                 as turns
             FROM turns t
-            {join}
+            {join} {pricing.web_search_join('t.')}
             {where}
-            GROUP BY 1, 2
+            GROUP BY 1, 2, rate_day, layer
             ORDER BY 1, 2
         """, params).fetchall()
     finally:
         conn.close()
 
-    daily, tot_in, tot_out, tot_cr, tot_cc, tot_turns, tot_cost = [], 0, 0, 0, 0, 0, 0.0
+    # Price each (day, model, tier epoch) bucket at its own epoch, then fold the epochs of one
+    # display day together: the turn's UTC date picks the rate, the display day only groups.
+    buckets = {}
+    tot_in, tot_out, tot_cr, tot_cc, tot_turns, tot_cost = 0, 0, 0, 0, 0, 0.0
+    layers, tot_ws = dict.fromkeys(pricing.LAYERS, 0.0), 0
     for r in rows:
         inp = r["input"] or 0
         out = r["output"] or 0
         cr = r["cache_read"] or 0
         cc = r["cache_creation"] or 0
         cc1h = r["cache_creation_1h"] or 0
-        cost = (pricing.calc_cost(r["model"], inp, out, cr, cc, r["day"],
+        cost = (pricing.calc_cost(r["model"], inp, out, cr, cc, r["rate_day"],
                                   cache_creation_1h=cc1h) +
-                pricing.surcharge_cost(r["model"], r, r["day"]))
+                pricing.surcharge_cost(r["model"], r, r["rate_day"]))
+        ws = r["web_searches"] or 0
+        fee = ws * pricing.WEB_SEARCH_FEE_USD
+        tot_ws += ws
         tot_in += inp; tot_out += out; tot_cr += cr; tot_cc += cc
-        tot_turns += r["turns"] or 0; tot_cost += cost
-        daily.append({
-            "day":            r["day"],
-            "model":          r["model"],
-            "input":          inp,
-            "output":         out,
-            "cache_read":     cr,
-            "cache_creation": cc,
-            "cache_creation_1h": cc1h,
-            "turns":          r["turns"] or 0,
-            "cost":           round(cost, 6),
-        })
+        tot_turns += r["turns"] or 0
+        d = buckets.setdefault((r["day"], r["model"]), {
+            "day": r["day"], "model": r["model"], "input": 0, "output": 0, "cache_read": 0,
+            "cache_creation": 0, "cache_creation_1h": 0, "turns": 0, "web_searches": 0, "cost": 0.0,
+            "layers": dict.fromkeys(pricing.LAYERS, 0.0)})
+        for L in (layers, d["layers"]):
+            L[r["layer"]] += cost
+            L["estimated"] += fee
+        cost += fee
+        tot_cost += cost
+        d["input"] += inp; d["output"] += out; d["cache_read"] += cr
+        d["cache_creation"] += cc; d["cache_creation_1h"] += cc1h
+        d["turns"] += r["turns"] or 0; d["web_searches"] += ws; d["cost"] += cost
+    daily = []
+    for d in buckets.values():
+        d["cost"] = round(d["cost"], 6)
+        d["layers"] = {k: round(v, 6) for k, v in d["layers"].items()}
+        daily.append(d)
 
     return {
         "daily":   daily,
         "totals":  {"input": tot_in, "output": tot_out, "cache_read": tot_cr,
                     "cache_creation": tot_cc, "turns": tot_turns,
-                    "cost": round(tot_cost, 6)},
+                    "cost": round(tot_cost, 6), "web_searches": tot_ws,
+                    "layers": {k: round(v, 6) for k, v in layers.items()}},
         "filters": {"start": start or "", "end": end or "",
                     "model": model or "", "project": project or "",
                     "tz": "local" if tz == "local" else "utc"},
@@ -1527,6 +1664,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/budget":
             import budget
             self._send_json(budget.month_status(DB_PATH, tz=_qs1(parse_qs(parsed.query), "tz") or "local"))
+        elif path == "/api/reconcile":
+            res = (get_reconcile(parse_qs(parsed.query)) if DB_PATH.exists()
+                   else {"error": "Database not found. Run: python cli.py scan"})
+            self._send_json(res, status=400 if "error" in res else 200)
         elif path == "/api/whatif":
             import whatif
             q = parse_qs(parsed.query)
@@ -1547,7 +1688,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/pricing":
             # The single source of truth for the price table, served so the
             # frontend never hardcodes the numbers (pricing.py owns them).
-            self._send_json(pricing.PRICING)
+            self._send_json(pricing_payload())
 
         elif path == "/api/pricing/fallbacks":
             # Models in the DB billed at another row's rates (no price row of their own).
@@ -1587,10 +1728,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self._guard(post=True):
             return
         path = urlparse(self.path).path
-        if path in ("/api/fixes", "/api/fixes/edit", "/api/fixes/delete", "/api/project-tag") or (
+        if path in ("/api/fixes", "/api/fixes/edit", "/api/fixes/delete", "/api/project-tag", "/api/reconcile") or (
                 HAS_LLM and path in ("/api/llm/preview", "/api/llm/run")):
             handler = {"/api/fixes": post_fix, "/api/fixes/edit": post_fix_edit, "/api/fixes/delete": post_fix_delete,
-                       "/api/project-tag": post_project_tag, "/api/llm/preview": post_llm_preview,
+                       "/api/project-tag": post_project_tag, "/api/reconcile": post_reconcile,
+                       "/api/llm/preview": post_llm_preview,
                        "/api/llm/run": post_llm_run}[path]
             try:
                 n = int(self.headers.get("Content-Length") or 0)

@@ -18,7 +18,8 @@ from datetime import datetime, date, timedelta
 
 # Pricing lives in one place only (pricing.py). Re-exported here so callers
 # can `from cli import PRICING, get_pricing, calc_cost`.
-from pricing import PRICING, get_pricing, calc_cost, surcharge_cost, surcharge_sql
+import pricing
+from pricing import PRICING, get_pricing, calc_cost, surcharge_cost, surcharge_sql, tier_day_sql
 
 
 def row_cost(r, timestamp=None):
@@ -44,6 +45,31 @@ def dated_costs(conn, where="1=1", params=()):
             FROM turns WHERE {where} GROUP BY model, day""", params):
         costs[r["model"]] = costs.get(r["model"], 0.0) + row_cost(r, r["day"])
     return costs
+
+
+def cost_layers(conn, where="1=1", params=()):
+    """{recorded, advisor, estimated, total: $, web_searches: n} for the turns matching ``where``,
+    priced like dated_costs. The web-search fee joins estimated, dated by its parent turn."""
+    out = dict.fromkeys(pricing.LAYERS, 0.0)
+    for r in conn.execute(f"""
+            SELECT COALESCE(model, 'unknown') as model, substr(timestamp, 1, 10) as day,
+                   {pricing.layer_sql()} as layer,
+                   SUM(input_tokens) as inp, SUM(output_tokens) as out,
+                   SUM(cache_read_tokens) as cr, SUM(cache_creation_tokens) as cc,
+                   SUM(cache_creation_1h_tokens) as cc1h, {_surcharge(conn)}
+            FROM turns WHERE {where} GROUP BY model, day, layer""", params):
+        out[r["layer"]] += row_cost(r, r["day"])
+    n = conn.execute(f"SELECT COUNT(*) FROM tool_results WHERE {pricing.WEB_SEARCH_OK} AND message_id IN"
+                     f" (SELECT message_id FROM turns WHERE {where})", params).fetchone()[0]
+    out["estimated"] += n * pricing.WEB_SEARCH_FEE_USD
+    out["web_searches"] = n
+    out["total"] = sum(out[k] for k in pricing.LAYERS)
+    return out
+
+
+def layer_line(L):
+    """The one-liner every cost total carries (fixed layer names: docs/SCHEMA.md)."""
+    return " · ".join(f"{k} {fmt_cost(L[k])}" for k in pricing.LAYERS)
 
 
 def _surcharge(conn):
@@ -171,12 +197,11 @@ def cmd_today():
         return
 
     total_inp = total_out = total_cr = total_cc = total_turns = 0
-    total_cost = 0.0
     costs = dated_costs(conn, f"{LOCAL_DAY} = ?", (today,))
+    layers = cost_layers(conn, f"{LOCAL_DAY} = ?", (today,))
 
     for r in rows:
         cost = costs[r["model"]]
-        total_cost += cost
         total_inp += r["inp"] or 0
         total_out += r["out"] or 0
         total_cr  += r["cr"]  or 0
@@ -185,7 +210,8 @@ def cmd_today():
         print(f"  {r['model']:<30}  turns={r['turns']:<4}  in={fmt(r['inp'] or 0):<8}  out={fmt(r['out'] or 0):<8}  cost={fmt_cost(cost)}")
 
     hr()
-    print(f"  {'TOTAL':<30}  turns={total_turns:<4}  in={fmt(total_inp):<8}  out={fmt(total_out):<8}  cost={fmt_cost(total_cost)}")
+    print(f"  {'TOTAL':<30}  turns={total_turns:<4}  in={fmt(total_inp):<8}  out={fmt(total_out):<8}  cost={fmt_cost(layers['total'])}")
+    print(f"  {'':<30}  {layer_line(layers)}")
     print()
     print(f"  Sessions today:   {sessions['cnt']}")
     print(f"  Cache read:       {fmt(total_cr)}")
@@ -213,10 +239,11 @@ def cmd_week():
             SUM(cache_creation_tokens) as cc,
             SUM(cache_creation_1h_tokens) as cc1h,
             {_surcharge(conn)},
+            {tier_day_sql()}           as rate_day,
             COUNT(*)                   as turns
         FROM turns
         WHERE {LOCAL_DAY} BETWEEN ? AND ?
-        GROUP BY day, model
+        GROUP BY day, model, rate_day
     """, (start, end)).fetchall()
 
     by_model = conn.execute(f"""
@@ -260,7 +287,7 @@ def cmd_week():
         bucket["turns"] += r["turns"]
         bucket["inp"]   += r["inp"] or 0
         bucket["out"]   += r["out"] or 0
-        bucket["cost"]  += row_cost(r, d)
+        bucket["cost"]  += row_cost(r, r["rate_day"])
 
     print("  By Day:")
     for i in range(7):
@@ -272,11 +299,10 @@ def cmd_week():
     print("  By Model:")
 
     total_inp = total_out = total_cr = total_cc = total_turns = 0
-    total_cost = 0.0
     costs = dated_costs(conn, f"{LOCAL_DAY} BETWEEN ? AND ?", (start, end))
+    layers = cost_layers(conn, f"{LOCAL_DAY} BETWEEN ? AND ?", (start, end))
     for r in by_model:
         cost = costs[r["model"]]
-        total_cost  += cost
         total_inp   += r["inp"] or 0
         total_out   += r["out"] or 0
         total_cr    += r["cr"]  or 0
@@ -285,7 +311,8 @@ def cmd_week():
         print(f"    {r['model']:<30}  turns={r['turns']:<4}  in={fmt(r['inp'] or 0):<8}  out={fmt(r['out'] or 0):<8}  cost={fmt_cost(cost)}")
 
     hr()
-    print(f"    {'TOTAL':<30}  turns={total_turns:<4}  in={fmt(total_inp):<8}  out={fmt(total_out):<8}  cost={fmt_cost(total_cost)}")
+    print(f"    {'TOTAL':<30}  turns={total_turns:<4}  in={fmt(total_inp):<8}  out={fmt(total_out):<8}  cost={fmt_cost(layers['total'])}")
+    print(f"    {'':<30}  {layer_line(layers)}")
     print()
     print(f"  Sessions this week:  {sessions['cnt']}")
     print(f"  Cache read:          {fmt(total_cr)}")
@@ -369,7 +396,8 @@ def cmd_stats():
     """).fetchone()
 
     costs = dated_costs(conn)
-    total_cost = sum(costs.values())
+    layers = cost_layers(conn)
+    total_cost = layers["total"]
 
     print()
     hr("=")
@@ -388,6 +416,7 @@ def cmd_stats():
     print(f"  Cache creation:   {fmt(totals['cc'] or 0):<12}  (25% premium on input)")
     print()
     print(f"  Est. total cost:  ${total_cost:.4f}")
+    print(f"                    {layer_line(layers)}")
     hr()
 
     print("  By Model:")
@@ -498,6 +527,43 @@ def cmd_dashboard(projects_dir=None, host=None, port=None, no_browser=False, uns
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def cmd_reread(rest):
+    """Carried re-read cost by source, across sessions (an observation: never in any total)."""
+    import waste
+    from datetime import timezone  # turns.timestamp is UTC ISO
+    days = float(parse_named_arg(rest, "--days") or 30)
+    classes = []
+    for i, arg in enumerate(rest):
+        if arg == "--path-class":
+            name, sep, rx = (rest[i + 1] if i + 1 < len(rest) else "").partition("=")
+            if not (sep and name and rx):
+                print("error: --path-class needs NAME=REGEX")
+                sys.exit(2)
+            try:
+                classes.append((name, re.compile(rx, re.I)))
+            except re.error as e:
+                print(f"error: --path-class {name}: {e}")
+                sys.exit(2)
+    require_db().close()
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    cwd = parse_named_arg(rest, "--cwd")
+    r = waste.carried_rereads(DB_PATH, since=since, cwd=cwd, classes=classes)
+    spend = r["spend_usd"] or 1.0
+    print(f"carried re-reads, last {days:g} days{', cwd~' + cwd if cwd else ''}: {r['sessions']} sessions, "
+          f"{r['lanes']} lanes; observation, overlaps resident_output/repeated_reads, not in any total")
+    print(f"cache reads are ${r['cache_read_usd']:.2f} of ${r['spend_usd']:.2f} spend ({r['cache_read_usd'] / spend:.1%}), "
+          f"{waste.BASIS['pricing']}; tool results are byte estimates")
+    rows = list(r["by_source"].items())
+    if len(rows) > 15:  # the long tail of rarely-used tools folds into one row
+        rows = rows[:14] + [(f"(other {len(rows) - 14} tools)", sum(usd for _, usd in rows[14:]))]
+    rows.append(("(rest: fixed prefix, user text, capped excess)", r["rest_usd"]))
+    for label, usd in rows:
+        print(f"  {label[:48]:<48} ${usd:>10.2f} {usd / spend:>7.1%}")
+    if r["excluded_sessions"]:
+        print(f"not measured: {r['excluded_sessions']} sessions with incomplete result sizes (stored before per-call "
+              f"ingestion, transcripts gone), ${r['excluded_cache_read_usd']:.2f} of cache reads")
+
+
 USAGE = """
 whytokens: where your Claude Code and Codex tokens went, from local logs.
 
@@ -514,7 +580,13 @@ Usage:
   whytokens live [--session ID] [--cwd PATH] [--json]
                                          Current session's stats straight from its
                                              transcript (no DB, no scan) - cost, context, tokens
+  whytokens card --out FILE.html|.svg [--with-projects]
+                                         One aggregate-only file to forward: period, total, top 3 causes,
+                                             one verified change. No names/paths/commands; --with-projects tags the change's project
   whytokens waste [--session ID]         Attribute material session spend to avoidable causes
+  whytokens reread [--days N] [--cwd TEXT] [--path-class NAME=REGEX ...]
+                                         Carried re-read cost by source (own output, tool results,
+                                             Read by path class); an observation, never in a total
   whytokens fix record --project P --cause C --note TEXT [--date YYYY-MM-DD] [--file PATH]
                                          Record a waste fix (--file stores a hash of the CLAUDE.md/config changed)
   whytokens fix list                     List recorded fixes
@@ -522,6 +594,10 @@ Usage:
   whytokens fix delete ID                Remove a recorded fix
   whytokens budget [AMOUNT|--clear]      Show this month's spend vs the monthly budget (USD, API list
                                              price); AMOUNT sets it, --clear removes it
+  whytokens reconcile [--period YYYY-MM] [--billed AMOUNT [--as-of ISO]|--clear] [--json]
+                                         Split the gap to your bill (UTC month) into named causes;
+                                             --billed stores the billed figure (as of now, mid-month)
+  whytokens reconcile --session ID [--usage AMOUNT]   One session vs its /usage cost
   whytokens shapes                       Cost by work shape (edit-heavy, shell-heavy, ...) and how many
                                              sessions cost 2x or more their peers
   whytokens project tag PROJECT [TAG|--clear]   Show, set or clear a project's display tag
@@ -542,6 +618,25 @@ def usage(has_llm=None):
     if has_llm is None:
         has_llm = config.HAS_LLM
     return USAGE if has_llm else re.sub(r"  whytokens llm .*?\n(?=  whytokens )", "", USAGE, flags=re.S)
+
+def cmd_card(rest):
+    import sqlite3
+    import card
+    out = parse_named_arg(rest, "--out")
+    if not out:
+        print("usage: whytokens card --out FILE.html|.svg [--with-projects] [--utc]")
+        sys.exit(2)
+    try:
+        require_db().close()
+        card.write(DB_PATH, out, include_projects="--with-projects" in rest, tz="utc" if "--utc" in rest else "local")
+    except ValueError as e:
+        print(f"error: {e}")
+        sys.exit(2)
+    except sqlite3.OperationalError as e:  # "database is locked": a scan holds the write lock
+        print(f"error: {e}; if a scan is running, try again when it finishes")
+        sys.exit(2)
+    print(f"wrote {out}")
+
 
 def cmd_fix(rest):
     import fixes
@@ -622,6 +717,68 @@ def cmd_budget(rest, today=None):
                                          if need is not None else "none (no days left this month)"))
     print("  " + ("Projection = spent + trailing 7-day daily average x days remaining" if m["method"] == "trailing_7d"
                   else "Projection = spent + month-to-date daily average x days remaining (fewer than 7 days of data)"))
+
+
+def cmd_reconcile(rest, today=None):
+    import json
+    import reconcile
+    require_db().close()  # scan first: never save a reading against a DB that doesn't exist yet
+    sid = parse_named_arg(rest, "--session")
+    try:
+        if sid:
+            usage = parse_named_arg(rest, "--usage")
+            r = reconcile.session_check(sid, None if usage is None else float(usage), DB_PATH)
+        else:
+            period = parse_named_arg(rest, "--period") or reconcile.current_period()
+            if "--clear" in rest:
+                reconcile.set_billed(period, None, db_path=DB_PATH)
+            elif "--billed" in rest:
+                reconcile.set_billed(period, float(parse_named_arg(rest, "--billed")),
+                                     parse_named_arg(rest, "--as-of") or reconcile.default_as_of(period), DB_PATH)
+            r = reconcile.report(period, DB_PATH, today=today)
+    except ValueError as e:
+        print(f"error: {e} (usage: whytokens reconcile [--period YYYY-MM] [--billed AMOUNT [--as-of ISO]|--clear]"
+              " | --session ID [--usage AMOUNT])")
+        sys.exit(2)
+    if "--json" in rest:
+        print(json.dumps(r, indent=2))
+        return
+    money = lambda v: "?" if v is None else f"${v:,.2f}"
+    if sid:
+        print(f"Session {sid}: whytokens {money(r['whytokens'])} over {r['turns']} turns "
+              f"(last scanned turn {r['last_turn']}), /usage {money(r['usage'])}"
+              + (" (from Claude Code's cost-state record)" if r["usage_source"] == "cost-state" else "")
+              + f", delta {money(r['delta'])}")
+        print(f"  layers: {layer_line(r['layers'])} ({r['layers']['web_searches']} web searches)")
+        print(f"  of which estimated summaries {money(r['estimated'])}, Haiku 5x premium {money(r['haiku_5x'])}")
+        if r["cc_flag"]:
+            print("  [flag] whytokens and Claude Code's cost-state differ by more than 5% with no known cause")
+        if r["cc_coverage"] == "partial":
+            print("  Claude Code's cost-state record is partial (a later process restarted its counter): not compared")
+        for m in r["models"]:
+            print(f"    {m['model']:<28} Claude Code {money(m['cc_cost']):>10}  whytokens {money(m['wt_cost']):>10}  {m['label']}")
+        if r["cc_coverage"] != "none":
+            print("  cost-state is an estimate at list prices, not a bill; see the dashboard's Claude Code column for its limits")
+        return
+    print(f"Reconcile {r['period']} ({r['cut']}, {r['basis']})")
+    print(f"  whytokens shown ({r['tz']} days):  {money(r['shown'])}")
+    print("  billed:                " + ("not entered (whytokens reconcile --period %s --billed AMOUNT)" % r["period"]
+                                       if r["billed"] is None else money(r["billed"]) +
+                                       (f" as of {r['as_of']} (whytokens cut there too)" if r["as_of"] else "")))
+    if r["gap"] is not None:
+        print(f"  gap (shown - billed):  {money(r['gap'])}")
+    for row in r["rows"] + [r["remainder"]]:
+        n = "" if row.get("turns") is None else f"  ({row['turns']} rows)"
+        print(f"    {money(row['usd']):>10}  {row['label']}{n}")
+    i, c = r["info"], r["coverage"]
+    print("  Not subtracted (billed calls with estimated counts):")
+    print(f"    {money(i['advisor_estimates']['usd']):>10}  advisor calls with estimated tokens "
+          f"({i['advisor_estimates']['turns']} rows); {i['raised_output_turns']} turns with estimated output")
+    print(f"    {money(i['coordinator_lower_bound']['usd']):>10}  claude.ai Projects seen locally (partial)")
+    print(f"  Coverage: earliest Claude data {c['earliest_claude'] or 'none'}; {c['label']}")
+    if c["projects_first_seen_in_period"]:
+        print(f"  {len(c['projects_first_seen_in_period'])} project(s) first seen this month "
+              "(new, or older history cleaned up before the first scan)")
 
 
 def cmd_verify(fix_id=None):
@@ -723,10 +880,13 @@ COMMANDS = {
     "stats": cmd_stats,
     "live": cmd_live,
     "waste": cmd_waste,
+    "reread": cmd_reread,
     "fix": cmd_fix,
+    "card": cmd_card,
     "verify": cmd_verify,
     "pricing": cmd_pricing,
     "budget": cmd_budget,
+    "reconcile": cmd_reconcile,
     "shapes": cmd_shapes,
     "llm": cmd_llm,
     "project": cmd_project,
@@ -786,12 +946,18 @@ def main():
             cmd_export(as_json="--json" in rest)
         elif command == "waste":
             cmd_waste(parse_named_arg(rest, "--session"))
+        elif command == "reread":
+            cmd_reread(rest)
         elif command == "fix":
             cmd_fix(rest)
         elif command == "pricing":
             cmd_pricing(rest)
         elif command == "budget":
             cmd_budget(rest)
+        elif command == "reconcile":
+            cmd_reconcile(rest)
+        elif command == "card":
+            cmd_card(rest)
         elif command == "project":
             cmd_project(rest)
         elif command == "llm":

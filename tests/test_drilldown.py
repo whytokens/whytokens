@@ -104,7 +104,7 @@ import {{ CARD_TARGET, drillHref }} from '{DRILL_URL}';
 const g = new URLSearchParams('range=7d&models=m1');
 const href = l => drillHref(g, {{ tab: 'sessions', sort: CARD_TARGET[l] }});
 const want = {{
-  'Est. Cost': 'sort=cost&dir=desc', 'Cache Creation': 'sort=cache_creation&dir=desc',
+  'Est. Cost': 'sort=cost&dir=desc', 'Cache Write': 'sort=cache_creation&dir=desc', 'Uncached': 'sort=input&dir=desc',
   'Cache Read': 'sort=cache_share&dir=asc', 'Cache Savings': 'sort=cache_share&dir=asc',
 }};
 for (const [l, q] of Object.entries(want)) {{
@@ -168,6 +168,7 @@ class TestOverviewCards(unittest.TestCase):
 import {{ CARD_TARGET, drillHref }} from '{DRILL_URL}';
 {_STUBS}
 const RANGE_LABELS = {{ '7d': 'Last 7 days' }}, selectedRange = '7d', C = {{ green: 'x' }}, orUnknown = v => v;
+const layerLine = () => 'layers', LAYER_TOOLTIP = 'tip';
 const globalParams = () => new URLSearchParams('range=7d');
 let html = ''; globalThis.document = {{ getElementById: () => ({{ set innerHTML(v) {{ html = v; }} }}) }};
 {src}
@@ -177,7 +178,7 @@ const cards = html.split('<a class="stat-card').slice(1);
 if (cards.length !== 8) throw new Error('want 8 linked cards, got ' + cards.length);
 if (html.includes('<div class="stat-card')) throw new Error('a dead-end card is left');
 const hrefOf = l => {{ const c = cards.find(x => x.includes('>' + l + '<')); return c && /href="([^"]+)"/.exec(c)[1]; }};
-for (const l of ['Est. Cost', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Cache Savings', 'Sessions']) {{
+for (const l of ['Est. Cost', 'Uncached', 'Output', 'Cache Read', 'Cache Write', 'Cache Savings', 'Sessions']) {{
   const h = hrefOf(l);
   if (h !== drillHref(new URLSearchParams('range=7d'), {{ tab: 'sessions', sort: CARD_TARGET[l] }})) throw new Error(l + ' -> ' + h);
 }}
@@ -248,7 +249,7 @@ class TestSessionFindingsPanel(unittest.TestCase):
     def test_states(self):
         out = self._run("""
 const ev = [{ message_id: 'm9', at: '2026-11-01T10:00:00Z', tool: 'Read', tokens: 5, usd: 0.5 }];
-const act = { id: 'read_ranges', title: 'Read whole files 2 times', rule: 'RULE TEXT', est_usd: 1, est_basis: 'basis',
+const act = { id: 'read_ranges', title: 'Read whole files 2 times', rule: 'RULE TEXT', audience: 'agent', est_usd: 1, est_basis: 'basis',
   calls: [{ message_id: 'm1', at: 't', tool: 'Read', file: 'big.py', result_tokens: 12000, prompt_seq: 7 }] };
 const base = { session_id: 's1', detail: 'DETAIL', fix: 'FIX TEXT', evidence: ev, usd: 2.5, action: null };
 // no findings: one quiet line, no empty box
@@ -325,7 +326,7 @@ class TestNavigationRestore(unittest.TestCase):
     def test_back_restores_range_models_timezone_and_drops_pending_trace(self):
         src = _slice("function restoreFromURL", "window.addEventListener('popstate'")
         out = _node(f"""
-let calls = [], traceOpenSeq = 5, selectedRange = '30d', displayTZ = 'local', rawData = {{ all_models: ['m1', 'm2'] }}, activeTab = 'overview';
+let calls = [], traceOpenSeq = 5, selectedRange = '30d', displayTZ = 'local', rawData = {{ all_models: ['m1', 'm2'] }}, activeTab = 'overview', refreshReconcile = () => calls.push('reconcile');
 let urlTZ = 'utc';
 globalThis.document = {{ querySelectorAll: () => [] }};
 const markRange = () => {{}};
@@ -339,7 +340,7 @@ globalThis.window = {{ location: {{ search: '' }} }};
 const eq = (g, w, m) => {{ if (String(g) !== String(w)) throw new Error(m + ': got ' + g + ', want ' + w); }};
 restoreFromURL();
 eq(traceOpenSeq, 6, 'a pending trace open is invalidated'); eq(selectedRange, '7d', 'range'); eq(displayTZ, 'utc', 'tz');
-eq(calls.join(), 'models:m1,load', 'models rebuilt, and a new zone refetches instead of just refiltering');
+eq(calls.join(), 'models:m1,reconcile,load', 'models rebuilt, an open reconcile panel reloads, and a new zone refetches instead of just refiltering');
 calls = []; restoreFromURL(); eq(calls.join(), 'models:m1,filter', 'same zone: refilter only');
 console.log('ok');
 """)

@@ -13,7 +13,18 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # (file, original, mutant) - each must turn the suite red on its own.
 MUTANTS = [
-    ("fixes.py", "waste.report(db_path, min_share=0, min_usd=0)", "waste.report(db_path, min_share=0)"),
+    ("fixes.py", "waste.report(db_path, min_share=0, min_usd=0,", "waste.report(db_path, min_share=0,"),
+    ("fixes.py", " OR message_id LIKE '{waste.AGENT_SUMMARY_ID_PREFIX}%'", ""),             # summary copies counted
+    ("fixes.py", 'if fix["cause"] not in lost.get(r[0], ())]', "]"),                        # lost evidence reads as 0
+    ("fixes.py", "{before['unmeasured'] + after['unmeasured']} more could not", "{0} more could not"),  # reason hides the count
+    ("fixes.py", "but {before['unmeasured'] + after['unmeasured']} sessions", "but {0} sessions"),        # same, decided side
+    ("fixes.py", 'if watch.execute("PRAGMA data_version").fetchone()[0] == before:', "if True:"),  # two DB states
+    ("waste.py", 'lost |= {"resident_output", "repeated_reads"}', "pass"),
+    ("waste.py", "if any(cid not in errs for cid in cids):", "if False:"),                           # lost flags read as 0
+    ("waste.py", "if any(cid not in errs for cid in cids):", "if cids and not any(cid in errs for cid in cids):"),  # one flag is enough
+    ("waste.py", "if unknown[0] or any(n is None for t in claude for n in _aligned(t, sizes, by_id)):", "if unknown[0]:"),
+    ("waste.py", "if any(cid not in loaded_ids for cid in searches):", "if False:"),             # unknown loads read as 0
+    ("fixes.py", 'if material and (before["unmeasured"] or after["unmeasured"]):', "if False:"),  # selective loss decides
     ("fixes.py", "if u > 0]", "]"),
     ("fixes.py", "when = date.fromisoformat(when).isoformat()", "date.fromisoformat(when)"),
     ("fixes.py", '("reduced" if delta > 0 else "increased")', '"reduced"'),

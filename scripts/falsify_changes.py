@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MUTANTS = [
     ("api.py", "            except (sqlite3.Error, OSError) as e:  # e.g. the settings file is locked", "            except ZeroDivisionError as e:  # e.g. the settings file is locked"),
     ("fixes.py", "MIN_SESSIONS = 10", "MIN_SESSIONS = 5"),
-    ("fixes.py", "    elif a < MIN_SESSIONS:", "    elif False:"),
+    ("fixes.py", "    elif a < MIN_SESSIONS or", "    elif False and"),
     ("fixes.py", "    if b < MIN_SESSIONS:", "    if False:"),
     ("fixes.py", "    if when > (today or date.today()).isoformat():", "    if False:"),
     ("fixes.py", "    if not note:", "    if False:"),

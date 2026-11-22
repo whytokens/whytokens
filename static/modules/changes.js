@@ -55,6 +55,33 @@ function mixHtml(m, interim) {
   return h + '</div>';
 }
 
+/** Cross-check against the last 3/5/7 days before the change: every window shown, skipped ones labelled. */
+function baselinesHtml(b) {
+  const rows = b.windows.map(w => `<li>Last ${w.days} days before: ` + (w.verdict === 'skipped'
+    ? `<span class="muted">skipped (${esc(w.reason)})</span>`
+    : `${(w.pct * 100).toFixed(1)}% over ${w.sessions} sessions, <strong>${esc(w.verdict)}</strong>`) + '</li>').join('');
+  return `<div class="chg-baselines"><p class="chg-baselines-head"><strong>${b.disagree ? 'Baselines disagree' : b.windows.some(w => w.verdict !== 'skipped') ? 'Baselines agree' : 'No baseline window qualified'}</strong>` +
+    ` <span class="muted">(shorter before-windows against the same after)</span></p>` +
+    (b.disagree ? '<p class="shp-warn" role="note">A shorter baseline points the other way; read this verdict with care.</p>' : '') +
+    `<ul class="muted">${rows}</ul></div>`;
+}
+
+const COUNTER_FMT = {
+  usd_per_prompt: v => '$' + v.toFixed(2),
+  reread_share: v => (v * 100).toFixed(1) + '%',
+};
+const ARROW = { up: 'up', down: 'down', flat: 'flat' };
+
+/** What else moved in this project over the same sessions. Every metric is listed, whichever way it went; no verdict. */
+function countersHtml(list) {
+  const rows = list.map(m => {
+    const f = COUNTER_FMT[m.id] || (v => v.toFixed(2));
+    const val = v => v == null ? 'n/a' : f(v);
+    return `<li>${esc(m.label)}: ${val(m.before)} -> ${val(m.after)}` + (m.direction ? ` <span class="muted">(${ARROW[m.direction]})</span>` : '') + '</li>';
+  }).join('');
+  return `<div class="chg-counters"><p><strong>Also moved</strong> <span class="muted">(observations, not a verdict)</span></p><ul class="muted">${rows}</ul></div>`;
+}
+
 /** Expanded body: before/after share bars, $ only when the verdict is in, the quality caveat. */
 export function detailHtml(c) {
   const interim = !!c.interim;
@@ -66,6 +93,8 @@ export function detailHtml(c) {
   if (c.state === 'reduced') h += c.saving_usd == null ? `<p class="muted">${esc(c.note)}</p>`
     : `<p>About <strong>${fmtCostBig(c.saving_usd)}</strong> less over the after period <span class="muted">(${esc(c.basis)})</span>.</p>`;
   h += `<p class="muted chg-caveat">${esc(c.caveat)}</p>`;
+  if (c.baselines && !interim) h += baselinesHtml(c.baselines);
+  if (c.counters && !interim) h += countersHtml(c.counters);
   if (c.mix) h += mixHtml(c.mix, interim);
   h += `<div class="chg-actions"><button class="filter-btn" data-act="edit" data-id="${c.fix.id}">Edit</button> ` +
     `<button class="filter-btn" data-act="delete" data-id="${c.fix.id}">Delete</button></div>` +

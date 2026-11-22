@@ -161,6 +161,34 @@ overhead headline, the Sessions Overhead column and the Overview "where to act" 
 That is every observation-tier cause: `uncached_input`, `large_context` and `fixed_prefix`
 (`uncached_input` was summed in until 2026-11-13).
 
+### `cost_state` — Claude Code's own cost record, one row per session (Claude only)
+
+`(session_id PK, total_cost_usd, start_time_ms, model_usage, covers_full, source_line)`. Newer
+Claude Code versions write a `cost-state` record into the main transcript (`<id>.jsonl`; subagent
+files carry none): `totalCostUSD`, `startTime` (epoch ms) and `modelUsage` (per model: tokens, the
+5m/1h cache-write split, web searches, `costUSD`). It is what the desktop `/usage` cost line
+shows; `start_time_ms` is its `startTime`. The scan keeps the **last** record per session (`source_line` is its line), including
+across incremental scans and when the new lines hold no turns; `model_usage` is the record's
+JSON as written. A one-time backfill (`cost_state_backfill_done_claude`) fills it for
+transcripts ingested before the table existed; drop-and-rescan reproduces it.
+
+**Coverage.** `covers_full` is 1 when `start_time_ms <= first turn of the session + 60 s` (the
+counters saw the whole session), 0 when a later Claude Code process restarted them ("partial":
+stored, never compared), and NULL when the session has no turns (not shown).
+
+**Comparison** (`cost_state.py`, computed at read time, never stored). Model ids drop a `[...]`
+suffix (`claude-opus-5-5[1m]` is `claude-opus-5-5`). Per session, `delta_pct = (wt - cs) / cs`,
+where `cs` is `total_cost_usd` and `wt` is whytokens' full cost, estimates included. Per model,
+the record's own tokens are repriced with pricing.py (plus `webSearchRequests` at
+`pricing.WEB_SEARCH_FEE_USD`): more than 1% off its `costUSD` labels the model
+`priced_differently` (Claude Code's own price differs, e.g. some versions price Fable 5.2 at
+Opus 5.5 rates, and it charges for local models whytokens prices at $0). Haiku 5.5 with any
+cache read, and a record with cache writes but no 5m/1h split, are `unverifiable` (the
+aggregate can't be repriced); a model only whytokens saw is `not_in_record`. A session is
+**flagged** when it is full coverage, `cs >= $0.10`, `|delta_pct| > 5%` and no model is
+`priced_differently`: whytokens is missing or overestimating something there. It is a
+checksum, not a replacement: an estimate at list prices, never a bill.
+
 ### `agents` — one row per subagent dispatch (Claude only)
 
 Keyed by the `agentId` Claude Code writes on both the subagent's turns (`turns.agent_id`) and
@@ -191,6 +219,18 @@ part of an agent never erases what another record supplied.
 | `note` | TEXT | free text, `''` when none. Editable |
 | `file_hash` | TEXT | sha256 of the file named with `--file` at record time (e.g. the CLAUDE.md you changed); NULL when none |
 | `recorded_at` | TEXT | local ISO-8601 time the row was written |
+
+A session where the fix's cause cannot be measured leaves that fix's cohort; it never counts as a
+zero share, so lost evidence cannot read as a saving. Judged from the recorded calls:
+`resident_output` and `repeated_reads` need every tool result's size (`tool_results.result_bytes`),
+`retry_loop` needs every call's `is_error` flag, `deferred_tool_load` needs every ToolSearch call's
+`loaded_tools`. Each side's `sessions` counts measured spending sessions only (the 10-session gate
+reads it); `unmeasured` counts the spending sessions set aside. A share that moved while any session
+was set aside gives `insufficient data` with a reason naming the count, never `reduced` or
+`increased`: the set-aside sessions could hold exactly the waste that moved. The Changes view shows
+that as `waiting` with no ETA. The baselines, counters and shape mix use the same measured sessions.
+Every number in a verdict comes from one database state: the read is retried if a scan commits
+during it, and fails after 30 tries rather than mix states.
 
 ### `processed_files` — incremental-scan bookkeeping
 
@@ -313,7 +353,7 @@ deleted). Every query parameter is bound as a SQL `?` placeholder.
 | `GET /api/daily` | `start`, `end`, `model`, `project`, `tz` | **SQL-side** daily `(day, model)` aggregation with **server-computed cost** |
 | `GET /api/experiments` (extension) | `task`, `arm`, `backend`, `model`, `include_dry` | eval-harness `experiments` satellite (read-only): rows + aggregated `groups`; empty when the table is absent |
 | `GET /api/live` | `session_id` \| `cwd` | one session read **straight from its transcript** — no DB, no scan — with server-computed `cost` |
-| `GET /api/pricing` | — | the single-source price table (`pricing.PRICING`) |
+| `GET /api/pricing` | — | the single-source price table (`pricing.PRICING`), plus `_fees: {web_search_usd}` (not a model row) |
 
 Notes on the parameterized endpoints:
 
@@ -326,6 +366,17 @@ Notes on the parameterized endpoints:
   same calendar, and a mixed pair puts a session on the far side of a range edge
   from its own turns. `hourly_by_model.hour` stays UTC either way; the client
   shifts it (see `aggregateHourly`).
+  Each hourly row also carries `utc_day`, the UTC date of its events, so the client
+  converts the hour with that date's own UTC offset. `daily_by_project` is the
+  turn-level `(day, project, branch, model)` feed behind the Projects table.
+  A turn is **priced by its own UTC date**; the display `day` only groups. Rows
+  that carry cost inputs (`daily_by_model`, `daily_by_project`, `tool_by_model`,
+  `effort_by_model`, `mcp_by_model`, `sessions_all[].by_model[].timestamp`,
+  `/api/session-breakdown` rows) are therefore also split by `rate_day`, the
+  pricing-tier epoch (latest dated-tier boundary on or before the turn's UTC day).
+  The same rows (`daily_by_model`, `daily_by_project`, `sessions_all[].by_model`,
+  `/api/sessions` `by_model`, `/api/session-breakdown` rows) are also split by `layer` and
+  carry `web_searches`; see [Cost layers](#cost-layers).
 - **`/api/sessions`** — `start`/`end` are inclusive `YYYY-MM-DD`, matched against
   `last_timestamp` in the **`tz` calendar**, which is also the calendar
   `last_date` is reported in — the two agree by construction. Default is local,
@@ -334,7 +385,11 @@ Notes on the parameterized endpoints:
   carrying a `last_date` outside the range that returned it. `limit` is clamped to
   `[1, 500]` (default 50); `offset` ≥ 0.
   `sort` is one of an **allowlist** — `recent` (default), `oldest`, `tokens`,
-  `turns` — never raw SQL. `total` is the full filtered count (pre-pagination) so
+  `turns`, `cc_cost` — never raw SQL. Each row (and each `/api/data` `sessions_all` row)
+  carries `cc_cost`, `cc_coverage` (`full|partial|none`), `cc_delta_pct` and `cc_flag`
+  from the `cost_state` comparison; `GET /api/reconcile?session=` without `usage` fills it
+  from a full-coverage record (`usage_source`: `cost-state` | `entered` | null) and adds
+  per-model `models` rows with their reprice label. `total` is the full filtered count (pre-pagination) so
   callers can build pagers.
 - **`/api/daily`** — aggregation happens in SQLite (`GROUP BY day, model`), not in
   the client. Cost is added per bucket via `pricing.calc_cost`, so the single
@@ -386,6 +441,30 @@ Notes on the parameterized endpoints:
 server/tooling endpoint (skill + hook), and the dashboard has the scanned row.
 `static/modules/api.js` mirrors the rest as `fetchData / fetchSession /
 fetchSessionBreakdown / fetchSessions / fetchDaily / fetchPricing / postRescan`.
+
+## Cost layers
+
+Every cost is the sum of three layers (fixed names, used in the UI, CLI and docs), named per
+`turns` row by `pricing.layer_sql` from its `message_id`:
+
+| layer | rows | why separate |
+|---|---|---|
+| `recorded` | ordinary turns (everything not below; Codex and coordinator rows too) | per-request usage the transcript wrote; what other transcript readers count |
+| `advisor` | `advisor:<message_id>:<idx>` | advisor iterations: in the transcript, but outside the envelope's top-level usage, so other tools drop them |
+| `estimated` | `agent_summary:*`, `advisor:<message_id>:est`, and the web-search fee | billed but never written down: subagent context forks (modelled), advisor calls with no recorded iteration (synthesised tokens), and web searches |
+
+**Web-search fee.** `pricing.WEB_SEARCH_FEE_USD` ($0.01) per successful `WebSearch` call: a
+`tool_results` row with `tool_name = 'WebSearch'`, a result (`result_bytes` not NULL: a pending call
+is not charged) and `is_error` not set (NULL or 0). Applied at
+read time, never as a synthetic turn: each aggregate row carries `web_searches`, the count for
+the turns it sums, so the fee is dated and filtered by its parent turn. The fee always lands in
+`estimated`, whatever the parent row's layer; the client reads its rate from `/api/pricing`
+`_fees.web_search_usd`. `tool_by_model`, `effort_by_model` and `/api/session` turns carry
+`web_searches` too (not split by layer), so every view's total includes the fee. `/api/daily`
+prices it server-side: each `(day, model)` row's `cost` includes it and the row carries
+`web_searches` and `layers: {recorded, advisor, estimated}` ($); `totals` carries the same two.
+The 5x long-prompt premium in `reconcile` scales token cost only, never the fee. `reconcile`
+totals include it; `session_check` returns `layers` (plus `web_searches`).
 
 ## Export document (`whytokens export --json`)
 
@@ -474,6 +553,19 @@ after, a `warning` when any shape's share moved by `MIX_SHIFT` (0.20) or more on
 and a `same_shape` before/after for each shape with at least 10 sessions on both sides. It is
 informational: `fixes.verify` (the 10-session gate, the materiality thresholds, the verdict) does
 not read it.
+
+A decided change (`reduced` or `increased`) also carries `baselines`: `{disagree, min_window_sessions,
+windows}`, one window per 3, 5 and 7 days before the fix, each `{days, sessions, pct, verdict}` with
+`verdict` `agrees`, `disagrees` (that window's own before-vs-after moves at least 1 point the other
+way) or `skipped` (under `min_window_sessions`, 5, with a `reason`; never counts). `disagree` is
+true when any window disagrees. The verdict and its gates are unchanged.
+
+The same rows carry `counters`: `[{id, label, before, after, direction}]`, always all four, for the same
+project and the same spending sessions as the verdict. `usd_per_prompt` and `prompts_per_session` use
+sessions with a prompt count (`MAX(prompt_seq)`); `compactions_per_session` is turns flagged
+`is_compact_summary` per session; `reread_share` is cache-read tokens over input + cache-read +
+cache-write tokens. `direction` is `up`, `down` or `flat` (null when a side has no data). These are
+observations: none is hidden when it moves against the change, and none feeds the verdict.
 
 Project tags: `budget.json` also holds `"project_tags": {project: text}` (at most 40 plain
 characters each; read-modify-write under a lock, so setting a budget or a tag never drops the

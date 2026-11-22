@@ -507,6 +507,16 @@ class TestFallbackSignal(unittest.TestCase):
                                  pricing._resolve_tiers(pricing.PRICING[key], "2026-11-09"))
         self.assertIsNone(pricing.get_pricing("qwen3.6-27b"))
 
+    def test_gpt_6_2_and_terra_have_their_own_rows(self):
+        import pricing
+        for model, rates in (("gpt-6.2-sol", (2.00, 10.00, 0.10, 2.50)),
+                             ("gpt-6.2-astra", (8.00, 40.00, 0.40, 10.00)),
+                             ("gpt-6.1-terra", (1.00, 5.00, 0.05, 1.25))):
+            with self.subTest(model):
+                self.assertEqual(pricing.match(model), (model, "exact"))
+                p = pricing.get_pricing(model)
+                self.assertEqual((p["input"], p["output"], p["cache_read"], p["cache_write"]), rates)
+
     def test_fallbacks_in_db_lists_only_guessed_models(self):
         import os
         import sqlite3
@@ -521,18 +531,20 @@ class TestFallbackSignal(unittest.TestCase):
                          "cache_read_tokens INT DEFAULT 0, cache_creation_tokens INT DEFAULT 0)")
             conn.executemany("INSERT INTO turns (model) VALUES (?)", [
                 ("claude-fable-5-2",), ("claude-fable-5-3",), ("claude-fable-5-3",),
-                ("claude-sonnet-6",), ("qwen3.6-27b",), (None,), ("",)])
+                ("claude-sonnet-6",), ("gpt-6.9-x",), ("gpt-6.2-sol",), ("qwen3.6-27b",), (None,), ("",)])
             conn.execute("INSERT INTO turns (model, output_tokens) VALUES ('<synthetic>', 0)")  # nothing to price
             conn.commit()
             conn.close()
             self.assertEqual(pricing.fallbacks_in_db(db), [
                 {"model": "claude-fable-5-3", "priced_as": "claude-fable-5", "how": "prefix", "turns": 2},
                 {"model": "claude-sonnet-6", "priced_as": "claude-sonnet-4-6", "how": "keyword", "turns": 1},
+                {"model": "gpt-6.9-x", "priced_as": "gpt-6-astra", "how": "keyword", "turns": 1},
                 # no row matches: $0, and said so rather than left out of the report
                 {"model": "qwen3.6-27b", "priced_as": None, "how": "unpriced", "turns": 1}])
             text = pricing.format_fallbacks(pricing.fallbacks_in_db(db))
             self.assertIn("claude-fable-5-3", text)
             self.assertIn("claude-fable-5", text)
+            self.assertIn("gpt-6.9-x -> gpt-6-astra (keyword match, 1 turns)", text)
             self.assertIn("qwen3.6-27b (1 turns)", text)
             self.assertIn("count as $0", text)
             self.assertNotIn("synthetic", text)

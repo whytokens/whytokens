@@ -141,7 +141,7 @@ const lacks = (h, n, what) => { if (h.includes(n)) throw new Error(what + ': une
 const recordButton = (p, c, n) => '<button class="wg-record" data-rproject="' + p + '" data-rnote="' + n + '">I made this change</button>';
 const base = { id: 's1', detail: 'd', evidence: [{ message_id: 'm1', at: '2026-11-01T10:00:00Z', tool: 'Bash', tokens: 9, usd: 1 }], action: null };
 // S1: rule, ranked calls with a Request link, estimate line with its basis
-const a1 = { id: 'read_ranges', title: 'Read whole files 2 times', rule: 'RULE TEXT', est_usd: 1.5, est_basis: 'Estimate, lower bound: x',
+const a1 = { id: 'read_ranges', title: 'Read whole files 2 times', rule: 'RULE TEXT', audience: 'agent', est_usd: 1.5, est_basis: 'Estimate, lower bound: x',
   calls: [{ message_id: 'm1', at: 't', tool: 'Read', file: 'big.py', result_tokens: 12000, prompt_seq: 7 }] };
 const s1 = nextStepCard({ ...base, cause: 'resident_output', action: a1 }, 'fix', 'why', true);
 has(s1, '<details open>', 'S1 open for the top session'); has(s1, 'RULE TEXT', 'S1 rule'); has(s1, 'big.py', 'S1 file');
@@ -162,6 +162,11 @@ lacks(s1, 'wg-record', 'no button without a project');
 const ord = nextStepCard({ ...base, cause: 'resident_output', action: a1 }, 'f', 'w', true, 'proj');
 const at = ['CLAUDE.md', 'RULE TEXT', 'about $1.50', 'wg-record', 'Marks today', '<details class="wg-evidence">', '<table>', 'Estimate, lower bound: x'].map(n => { has(ord, n, 'order'); return ord.indexOf(n); });
 if (at.some((p, i) => i && p < at[i - 1])) throw new Error('next-step card out of reading order: ' + at);
+// a human habit is never offered as a CLAUDE.md rule; anything not marked agent counts as human
+for (const who of ['you', undefined]) {
+  const h = nextStepCard({ ...base, cause: 'idle_gap', action: { ...a1, audience: who, rule: 'run /compact' } }, 'f', 'w', true);
+  lacks(h, 'CLAUDE.md', 'habit card ' + who); has(h, 'A habit for you', 'habit card ' + who); has(h, 'run /compact', 'habit text ' + who);
+}
 // S2: no action on resident_output / subagent_preamble: no rule, no table
 for (const c of ['resident_output', 'subagent_preamble']) {
   const h = nextStepCard({ ...base, cause: c }, 'fix', 'why', true);

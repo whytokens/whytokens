@@ -12,3 +12,6 @@ venv/
 run.log
 build/
 *.egg-info/
+
+# work-PC field-test bundles: work data, never committed
+field/

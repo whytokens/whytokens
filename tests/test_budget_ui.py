@@ -239,10 +239,10 @@ const modelRowsHTML = () => '';
 has(breakdownRowsHTML('s1', [1], 'd', 'LANE LINE'), 'whatif-row', 'extra row'); has(breakdownRowsHTML('s1', [1], 'd', 'LANE LINE'), 'LANE LINE', 'text');
 lacks(breakdownRowsHTML('s1', [1], 'd'), 'whatif-row', 'no line without a figure');
 const rows = breakdownRowsHTML('s1', [1], 'd');
-has(rows, '<td class="branch-cell" colspan="8"><table class="sub-table">', 'actors sit in one detail row as wide as the list');
+has(rows, '<td class="branch-cell" colspan="9"><table class="sub-table">', 'actors sit in one detail row as wide as the list');
 for (const h of ['Who', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost']) has(rows, '>' + h + '</th>', 'the detail table names its columns');
 if (rows.split('data-parent-session').length !== 2) throw new Error('one removable detail row, not one per actor');
-lacks(rows, 'colspan="12"', 'no cell wider than the eight-column list');
+lacks(rows, 'colspan="12"', 'no cell wider than the nine-column list');
 console.log('ok');
 """)
         self.assertEqual(out, "ok")

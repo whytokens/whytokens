@@ -210,20 +210,29 @@ def _results(row, sizes):
 
 
 OVERSIZED_TOKENS = 5_000  # a tool result at or above this many estimated tokens counts as oversized
-_RULES = {  # action id -> (title verb, rule text); rule text is draft, owner approves
+# action id -> (title verb, rule text, audience); rule text is draft, owner approves.
+# audience "agent": a CLAUDE.md rule, so the agent must be able to follow it on its own: no user-only
+# slash commands, nothing about when the human is away. audience "you": a habit for the human, never
+# shown as a CLAUDE.md rule. tests/test_waste_action.py TestRuleAudience enforces both.
+_RULES = {
     "read_ranges": ("Read whole files", "Before reading a file over 500 lines, Grep for the part you need, "
-                    "then Read only that range with offset and limit."),
+                    "then Read only that range with offset and limit.", "agent"),
     "bash_tail": ("Print long command output", "Pipe any command that can print more than 50 lines through "
-                  "`tail` or a summary; never dump full logs or test output."),
+                  "`tail` or a summary; when something fails, print the failing section, not the whole log.", "agent"),
     "search_limits": ("Search with full content", "Search with files-with-matches or a head limit first; "
-                      "ask for content only on the files you will open."),
+                      "ask for content only on the files you will open.", "agent"),
     "mcp_text": ("Pull big MCP results", "From `{server}`, prefer text results over screenshots or full dumps; "
-                 "request only the fields needed."),
-    "compact_before_break": ("Idle gaps on the main thread", "Before stepping away for more than 5 minutes, run /compact; "
-                             "after 4 hours, start a new session from the handoff file."),
-    "subagent_waits": ("Subagent waits past the cache TTL", "A subagent never sleeps or polls longer than 4 minutes; "
-                       "start long jobs in the background from the main thread."),
-    "small_jobs_inline": ("Short subagent jobs", "Do not spawn a subagent for a job under ~10 tool calls."),
+                 "request only the fields needed.", "agent"),
+    "compact_before_break": ("Idle gaps on the main thread", "Your prompt cache expires after {life} idle, so the first "
+                             "reply after a longer break re-writes the whole context. Before a long break in a big "
+                             "session, run /compact, or close it and resume later from a handoff note.", "you"),
+    "subagent_waits": ("Subagent waits past the cache TTL", "Do not give a subagent a job that blocks longer than {life} "
+                       "on one command (a long test run, a build, a sleep); run those from the main thread "
+                       "in the background.", "agent"),
+    "small_jobs_inline": ("Short subagent jobs", "Do not spawn a subagent for a job under ~10 turns, unless the point "
+                          "is to keep a large read out of the main context.", "agent"),
+    "split_or_compact": ("Split or compact here", "Watch the context size: before a session passes {k}K tokens, "
+                         "run /compact, or ask Claude to write a handoff note and start a fresh session from it.", "you"),
 }
 SMALL_JOB_TURNS = 10  # a subagent lane under this many turns is a job the main thread could have done
 
@@ -234,12 +243,17 @@ def idle_gap_action(evidence, gaps, types=None):
     est_usd is what the gaps cost minus what a warm cache would have billed: an upper bound."""
     side = sum(bool(e["agent_id"]) for e in evidence) * 2 > len(evidence)
     rid = "subagent_waits" if side else "compact_before_break"
-    verb, rule = _RULES[rid]
+    verb, rule, who = _RULES[rid]
+    # Word the lifetime from the tier each gap's prefix was cached at, on the lane this rule is about:
+    # subagent lanes run on the 5-minute tier, so their gaps must not set the main thread's lifetime.
+    own = [ttl for e, (_, _, _, ttl) in zip(evidence, gaps) if bool(e["agent_id"]) == side]
+    life = "1 hour" if min(own or [ttl for *_, ttl in gaps]) >= 3600 else "5 minutes"
     calls = sorted(({"message_id": e["message_id"], "at": e["at"], "minutes": round(g.total_seconds() / 60),
                      "tokens": n, "usd": e["usd"], "warm_usd": w,
-                     "side": bool(e["agent_id"]), "agent_type": (types or {}).get(e["agent_id"]) if e["agent_id"] else None} for e, (g, n, w) in zip(evidence, gaps)),
+                     "side": bool(e["agent_id"]), "agent_type": (types or {}).get(e["agent_id"]) if e["agent_id"] else None} for e, (g, n, w, _) in zip(evidence, gaps)),
                    key=lambda c: c["usd"], reverse=True)
-    return {"id": rid, "title": f"{verb}: {len(calls)} gap{'' if len(calls) == 1 else 's'}", "rule": rule, "calls": calls[:5],
+    return {"id": rid, "title": f"{verb}: {len(calls)} gap{'' if len(calls) == 1 else 's'}", "rule": rule.format(life=life),
+            "audience": who, "calls": calls[:5],
             "est_usd": sum(c["usd"] - c["warm_usd"] for c in calls),
             "est_basis": "Estimate, upper bound: what the gaps cost minus what the same tokens would have billed as cache reads."}
 
@@ -252,13 +266,13 @@ def small_jobs_action(evidence, turns_by_lane, types):
              for e in evidence if e["agent_id"] and turns_by_lane.get(e["agent_id"], SMALL_JOB_TURNS) < SMALL_JOB_TURNS]
     if not small:
         return None
-    verb, rule = _RULES["small_jobs_inline"]
+    verb, rule, who = _RULES["small_jobs_inline"]
     small.sort(key=lambda c: c["usd"], reverse=True)
     lanes = {e["agent_id"] for e in evidence if e["agent_id"]}
     loose = sum(not e["agent_id"] for e in evidence)  # unidentified writes: not countable as lanes
     return {"id": "small_jobs_inline", "title": f"{verb}: {len(small)} of {len(lanes)} subagents ran under {SMALL_JOB_TURNS} turns"
                                                 + (f" (+{loose} unidentified cold writes not counted)" if loose else ""),
-            "rule": rule, "calls": small[:5], "est_usd": sum(c["usd"] for c in small),
+            "rule": rule, "audience": who, "calls": small[:5], "est_usd": sum(c["usd"] for c in small),
             "est_basis": "Estimate, upper bound: the whole preamble write of each short subagent, assuming none of it would be needed inline."}
 
 
@@ -291,10 +305,10 @@ def next_step_action(calls):
         return None
     (rid, key), big = max(groups.items(), key=lambda kv: sum(c["result_tokens"] for c in kv[1]))
     top = sorted(big, key=lambda c: c["result_tokens"], reverse=True)[:5]
-    verb, rule = _RULES[rid]
-    avg = sum(c["result_tokens"] for c in big) / len(big)
+    verb, rule, who = _RULES[rid]
+    avg =sum(c["result_tokens"] for c in big) / len(big)
     return {"id": rid, "title": f"{verb} {len(big)} time{'' if len(big) == 1 else 's'}, ~{round(avg / 1000)}K tokens each",
-            "rule": rule.format(server=key),
+            "rule": rule.format(server=key), "audience": who,
             "calls": [{k: c[k] for k in ("message_id", "at", "tool", "file", "result_tokens", "prompt_seq")} for c in top],
             "est_usd": sum(c["excess_usd"] for c in big),
             "est_basis": f"Estimate, lower bound: the {len(big)} oversized results cut to {OVERSIZED_TOKENS:,} tokens, "
@@ -407,7 +421,8 @@ def _deferred_tool_load(turns, loads, claims):
     thread or one subagent), a load is waste for the names never called afterwards, reloaded while
     still in context (no compaction between), or duplicating another MCP server's tool. Priced as the
     next turn's cache-write above the lane's median write (inferred proxy) x the lane's later turns at
-    the cache-read rate, for the wasted share of that load. Those later turns' reads are claimed by no
+    the cache-read rate, for the wasted share of that load, each later turn capped at the cache reads it
+    recorded. Those later turns' reads are claimed by no
     other cause; turns idle_gap / cache_miss_rebuild claimed are skipped; one claim per next-turn."""
     lanes = {}
     for t in turns:
@@ -419,6 +434,7 @@ def _deferred_tool_load(turns, loads, claims):
     pairs = set()
     claimed = {e["message_id"] for c in ("idle_gap", "cache_miss_rebuild") for e in claims[c][2]}
     used, loaders = set(), {}
+    read_left = {}  # turn id -> cache-read tokens not yet claimed by an earlier load
     for lane, lt in lanes.items():
         last_call, compact_at = {}, [-1]
         for j, t in enumerate(lt):
@@ -451,14 +467,22 @@ def _deferred_tool_load(turns, loads, claims):
             # the schemas leave context at the next compaction (even one on the very next turn), so the
             # charge stops there; each later turn counts only if it read the cache and no other cause claimed it
             stop = min((k for k in compact_at if k > i), default=len(lt))
-            remaining = sum(1 for u in lt[i + 2:stop]
-                            if (u["cache_read_tokens"] or 0) and u["message_id"] not in claimed)
+            later = [u for u in lt[i + 2:stop] if (u["cache_read_tokens"] or 0) and u["message_id"] not in claimed]
             delta = max(0, (nxt["cache_creation_tokens"] or 0) - median)
-            if not delta or not remaining or nxt["id"] in used or nxt["message_id"] in claimed:
+            if not delta or not later or nxt["id"] in used or nxt["message_id"] in claimed:
                 continue
             used.add(nxt["id"])
-            tokens = int(delta * len(waste) / len(names) * remaining)
-            usd = pricing.calc_cost(nxt["model"], 0, 0, tokens, 0, nxt["timestamp"]) * nxt["mult"]
+            share = delta * len(waste) / len(names)
+            # a later turn can re-read no more of the schemas than it read from the cache at all, shared
+            # across every load still in context; each part is priced at the turn that read it
+            tokens = usd = 0
+            for u in later:
+                left = read_left.setdefault(u["id"], u["cache_read_tokens"])
+                take = min(share, left)
+                read_left[u["id"]] = left - take
+                tokens += take
+                usd += pricing.calc_cost(u["model"], 0, 0, take, 0, u["timestamp"]) * u["mult"]
+            tokens = int(tokens)
             claims["deferred_tool_load"][0] += usd
             claims["deferred_tool_load"][1].append(
                 {"loaded": len(names), "unused": unused, "reloaded": reloaded, "overlap": overlap})
@@ -529,10 +553,10 @@ def _split_action(evidence):
     """Next step for large_context: hand off or compact before the threshold, pointing at each crossing."""
     cross = [e for e in evidence if e["crossing"]]
     k = LARGE_CONTEXT_TOKENS // 1000
+    verb, rule, who = _RULES["split_or_compact"]
     return {"id": "split_or_compact",
-            "title": f"Split or compact here: context crossed {k}K {len(cross)} time{'' if len(cross) == 1 else 's'}",
-            "rule": f"Before the context passes {k}K tokens, write a handoff file and start a fresh session, "
-                    "or run /compact; do not carry one session past that size.",
+            "title": f"{verb}: context crossed {k}K {len(cross)} time{'' if len(cross) == 1 else 's'}",
+            "rule": rule.format(k=k), "audience": who,
             "calls": [{"message_id": e["message_id"], "at": e["at"], "context": e["context"],
                        "tokens": e["tokens"], "usd": e["usd"]} for e in cross[:5]],
             "est_usd": sum(e["usd"] for e in evidence),
@@ -666,11 +690,13 @@ def _retry_name(d):
 MIN_SHARE = 0.10  # Claude Code /usage flags behaviors at >=10% of spend; same default here
 
 
-def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd=.01):
+def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd=.01, unmeasured=None):
     """Return thresholded, disjoint cost findings for one session or a database.
 
     A cause is dropped when it is under min_share of its session's total $.
-    If ``rebuilds`` is a list, expected cache rebuilds (reported, not waste) are appended to it."""
+    If ``rebuilds`` is a list, expected cache rebuilds (reported, not waste) are appended to it.
+    If ``unmeasured`` is a dict, it gets session_id -> set of causes whose evidence is missing in
+    that session (a result size or an error flag), so a share of 0 there means "not measured"."""
     db_path = Path(db_path).resolve().as_posix()
     # quote: an unencoded '#' or '?' in the path would silently open a different database
     conn = sqlite3.connect(f"file:{quote(str(db_path), safe='/:')}?mode=ro", uri=True)
@@ -686,10 +712,11 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                          **{c: c if c in cols else "NULL" for c in ("message_id", "agent_id", "speed", "prompt_seq")})
         rows = conn.execute(sql + (" WHERE session_id=?" if session_id else "") +
                             " ORDER BY session_id, timestamp, id", (session_id,) if session_id else ()).fetchall()
-        loads = {}  # message_id -> tool names a ToolSearch result loaded
+        loads, loaded_ids = {}, set()  # message_id -> tool names a ToolSearch result loaded; call ids with a known load
         if "loaded_tools" in {r[1] for r in conn.execute("PRAGMA table_info(tool_results)")}:
-            for mid, names in conn.execute("SELECT message_id, loaded_tools FROM tool_results "
-                                           "WHERE loaded_tools IS NOT NULL AND message_id IS NOT NULL"):
+            for mid, names, cid in conn.execute("SELECT message_id, loaded_tools, call_id FROM tool_results "
+                                                "WHERE loaded_tools IS NOT NULL AND message_id IS NOT NULL"):
+                loaded_ids.add(cid)
                 try:
                     loads[mid] = list(dict.fromkeys(loads.get(mid, []) + json.loads(names)))
                 except (TypeError, ValueError):
@@ -744,7 +771,7 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                 # Only an agent's first cache write is its preamble; later writes are its own
                 # context growth, attributed like main-chain growth.
                 lane = lanes.setdefault(turn["agent_id"], {"seen": set(), "prev": None, "preamble": False,
-                                                           "at": None, "ttl": 300})
+                                                           "at": None, "ttl": 300, "prefix": 0})
                 compact = turn["is_compact_summary"]  # same guard as the main chain below
                 if compact:
                     lane["seen"].clear()  # compaction dropped what the lane had read; this turn's own reads are in context
@@ -755,10 +782,12 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                 if creation and not lane["preamble"]:
                     lane["preamble"] = True
                     _claim(claims, "subagent_preamble", turn, creation, creation, "Agent")
-                elif creation and lane["at"] and (lgap := _gap(lane["at"], turn["timestamp"])) and lgap.total_seconds() >= lane["ttl"]:
-                    # the lane polled past its own prefix's TTL: an idle gap, not the previous tool's output
-                    warm = pricing.calc_cost(turn["model"], 0, 0, creation, 0, turn["timestamp"]) * turn["mult"]
-                    _claim(claims, "idle_gap", turn, creation, (lgap, creation, warm), None)
+                elif (creation and lane["at"] and (lgap := _gap(lane["at"], turn["timestamp"])) and lgap.total_seconds() >= lane["ttl"]
+                      and (lost := min(creation, lane["prefix"] - (turn["cache_read_tokens"] or 0))) >= 1):
+                    # the lane polled past its own prefix's TTL: an idle gap, not the previous tool's output.
+                    # Only the part of the lane's cached prefix not read back can have expired.
+                    warm = pricing.calc_cost(turn["model"], 0, 0, lost, 0, turn["timestamp"]) * turn["mult"]
+                    _claim(claims, "idle_gap", turn, lost, (lgap, lost, warm, lane["ttl"]), None)
                 elif creation and not compact and prev and prev["repeated"] and _repeat_claim(claims, turn, creation, prev, unknown):
                     pass
                 elif creation and not compact and prev and prev["has_tool"]:
@@ -767,6 +796,7 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                 lane["ttl"] = 3600 if (turn["cache_creation_1h_tokens"] or 0) > 0 or (
                     (turn["cache_read_tokens"] or 0) and lane["ttl"] > 300) else 300
                 lane["at"] = turn["timestamp"]
+                lane["prefix"] = (turn["cache_read_tokens"] or 0) + creation
                 previous_turn = turn
                 continue
             compact = turn["is_compact_summary"]
@@ -777,10 +807,13 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                 has_tool, repeated, rep_idx = False, [], []
             gap = _gap(previous_turn["timestamp"], turn["timestamp"]) if previous_turn else None
             if creation and previous_main:
-                if gap and gap.total_seconds() >= previous_main["ttl"]:  # TTL of the tier the prefix was cached at
+                if (gap and gap.total_seconds() >= previous_main["ttl"]  # TTL of the tier the prefix was cached at
+                        and (lost := min(creation, previous_main["prefix"] - (turn["cache_read_tokens"] or 0))) >= 1):
+                    # only the part of the prefix cached before the gap and not read back can have expired;
+                    # the rest of the write is new context, left to the causes below
                     # same tokens as cache reads = what a warm (or compacted-and-warm) cache would have billed
-                    warm = pricing.calc_cost(turn["model"], 0, 0, creation, 0, turn["timestamp"]) * turn["mult"]
-                    _claim(claims, "idle_gap", turn, creation, (gap, creation, warm), None)
+                    warm = pricing.calc_cost(turn["model"], 0, 0, lost, 0, turn["timestamp"]) * turn["mult"]
+                    _claim(claims, "idle_gap", turn, lost, (gap, lost, warm, previous_main["ttl"]), None)
                 elif (why := _rebuild_reason(turn, previous_main)):
                     if why[0] == "unexpected":
                         _claim(claims, "cache_miss_rebuild", turn, creation, why[1], None)
@@ -806,6 +839,22 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
 
         _deferred_tool_load(turns, loads, claims)
         _retry_loop(turns, errs, claims, trcalls)
+        if unmeasured is not None:
+            # from the recorded calls themselves, not from which attribution branch happened to run
+            claude = [t for t in turns if (t["agent"] or "claude") in _MEASURED and not _synthetic(t)]
+            lost = set()
+            if unknown[0] or any(n is None for t in claude for n in _aligned(t, sizes, by_id)):
+                lost |= {"resident_output", "repeated_reads"}
+            cids = {cid for t in claude for cid, _ in trcalls.get(t["message_id"], ())} | {
+                c.get("id") for t in claude for c in _calls(t) if isinstance(c, dict)}
+            cids.discard(None)
+            if any(cid not in errs for cid in cids):  # one lost flag can end or hide a retry run
+                lost.add("retry_loop")
+            searches = {c.get("id") for t in claude for c in _calls(t) if isinstance(c, dict) and c.get("name") == "ToolSearch"}
+            if any(cid not in loaded_ids for cid in searches):  # which schemas it loaded is unknown
+                lost.add("deferred_tool_load")
+            if lost:
+                unmeasured[sid] = lost
         main = [t for t in turns if (t["agent"] or "claude") in _MEASURED and not t["is_sidechain"] and not _synthetic(t)]
         _large_context(main, claims)
         _fixed_prefix(main, claims)
@@ -850,9 +899,9 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                 detail, fix = (f"Sidechain turns wrote {sum(details):,} cache-create tokens for inherited preambles.",
                                "Delegate only reads big enough to pay back the setup; do jobs under ~10 turns in the main session.")
             elif cause == "idle_gap":
-                warm = sum(w for _, _, w in details)
-                minutes = max((g.total_seconds() / 60 for g, _, _ in details), default=0)
-                detail, fix = (f"{len(details)} idle gap{'' if len(details) == 1 else 's'} (longest {minutes:.0f} min) rewrote {sum(n for _, n, _ in details):,} cache tokens "
+                warm = sum(w for _, _, w, _ in details)
+                minutes = max((g.total_seconds() / 60 for g, *_ in details), default=0)
+                detail, fix = (f"{len(details)} idle gap{'' if len(details) == 1 else 's'} (longest {minutes:.0f} min) rewrote {sum(n for _, n, *_ in details):,} cache tokens "
                                f"for ${usd:.2f}; kept warm that context would have cost ${warm:.2f} (up to ${usd - warm:.2f} saved by compacting before the cache expired).",
                                ("Keep subagent waits under the cache TTL, or run long jobs in the background from the main thread."
                                 if sum(bool(e["agent_id"]) for e in evidence) * 2 > len(evidence) else
@@ -932,3 +981,121 @@ def report(db_path, session_id=None, min_share=MIN_SHARE, rebuilds=None, min_usd
                              "in_total": cause not in UNCOUNTED})
     # counted causes first: the top finding of a session is an attributed one, observations follow
     return sorted(findings, key=lambda finding: (finding["in_total"], finding["usd"]), reverse=True)
+
+
+# --- Carried re-reads: what each kind of context costs to keep re-reading (observation, bulk) ---
+# resident_output charges an item only to the next cache write. Every later call in the same lane
+# re-reads it from cache until a compaction, and this prices that carry by source. It overlaps
+# resident_output and repeated_reads, so it is an observation and never summed into any total.
+# Carry window for an item from call i: call i+1 writes it (the write resident_output charges), calls
+# i+2 .. re-read it, up to but NOT including the next is_compact_summary call (that call reads the
+# summary, not the old context: measured, its cache read is summary-sized). Own output is the full
+# output_tokens: prior thinking is re-sent on current models (measured on transcripts: the next
+# context grows by the whole output, thinking included, across user prompts and in tool loops).
+OWN_OUTPUT = "own output (text, tool args, thinking)"
+READ_PATH_UNKNOWN = "Read:(path unknown)"
+
+
+def carry(turns, results, classes=()):
+    """{label: usd} carried by one lane. ``turns``: dicts in call order with model, timestamp, mult,
+    output_tokens, cache_read_tokens, is_compact_summary, message_id, tool_calls. ``results``:
+    message_id -> [(call_id, tool_name, result_bytes)] with known sizes only. ``classes``:
+    [(name, compiled regex)] over Read file paths, first match wins. Attribution at a reading call
+    is capped at that call's cache_read_tokens (a base64 result's byte estimate can exceed it)."""
+    n = len(turns)
+    end, nxt = [n] * n, n  # end[i]: index of the next compaction call after i (exclusive cutoff)
+    for i in range(n - 1, -1, -1):
+        end[i] = nxt
+        if turns[i]["is_compact_summary"]:
+            nxt = i
+    items = []  # (first reading call, cutoff, label, tokens)
+    for i, t in enumerate(turns):
+        if i + 2 >= end[i]:
+            continue
+        items.append((i + 2, end[i], OWN_OUTPUT, t["output_tokens"] or 0))
+        paths = {c.get("id"): (c.get("input") or {}).get("file_path") for c in _calls(t) if c.get("id")}
+        for cid, tool, nbytes in results.get(t["message_id"], ()):
+            label = tool or "tool"
+            if label == "Read" and classes:
+                path = paths.get(cid)
+                label = (next((f"Read:{k}" for k, rx in classes if rx.search(path)), "Read:other")
+                         if path else READ_PATH_UNKNOWN)
+            items.append((i + 2, end[i], label, nbytes / RESULT_BYTES_PER_TOKEN))
+    live = [0.0] * (n + 1)  # attributed tokens resident at each call (difference array)
+    for a, b, _, tok in items:
+        live[a] += tok
+        live[b] -= tok
+    prefix, run = [0.0] * (n + 1), 0.0  # prefix sums of the capped per-token cache-read rate
+    for j, t in enumerate(turns):
+        run += live[j]
+        # a call before the window still holds context, but only reads inside the window are charged
+        rate = (pricing.calc_cost(t["model"], 0, 0, 1, 0, t["timestamp"]) * (t["mult"] or 1)
+                if t.get("in_window", True) else 0.0)
+        cr = t["cache_read_tokens"] or 0
+        prefix[j + 1] = prefix[j] + (rate * min(1.0, cr / run) if run > 0 else 0.0)
+    out = {}
+    for a, b, label, tok in items:
+        out[label] = out.get(label, 0.0) + tok * (prefix[b] - prefix[a])
+    return out
+
+
+def carried_rereads(db_path, since=None, cwd=None, classes=()):
+    """Carried re-read $ by source over Claude lanes (session + subagent), at API list rate.
+    Sessions whose result sizes are incomplete (scanner.session_result_bytes is NULL: calls stored
+    before per-call ingestion, transcripts gone) are excluded and counted, never read as 0."""
+    import scanner
+    db_path = Path(db_path).resolve().as_posix()
+    conn = sqlite3.connect(f"file:{quote(str(db_path), safe='/:')}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)")}
+        sql = f"""SELECT session_id, timestamp, model, input_tokens, output_tokens, cache_read_tokens,
+                         cache_creation_tokens, cache_creation_1h_tokens, tool_name, tool_calls, is_sidechain,
+                         is_compact_summary, message_id, COALESCE(agent_id, '') AS agent_id,
+                         {pricing.price_mult_sql(cols)} AS mult
+                  FROM turns WHERE COALESCE(agent, 'claude') = 'claude'"""
+        args = []
+        if since:  # whole lanes, so context built before the window is still carried into it
+            sql += " AND session_id IN (SELECT DISTINCT session_id FROM turns WHERE timestamp >= ?)"
+            args.append(since)
+        if cwd:
+            sql += " AND session_id IN (SELECT DISTINCT session_id FROM turns WHERE cwd LIKE ?)"
+            args.append(f"%{cwd}%")
+        rows = conn.execute(sql + " ORDER BY session_id, agent_id, timestamp, id", args).fetchall()
+        sized = {sid for sid, b in scanner.session_result_bytes(conn).items() if b is not None}
+        results = {}
+        for mid, cid, tool, nbytes in conn.execute("SELECT message_id, call_id, tool_name, result_bytes "
+                                                   "FROM tool_results WHERE result_bytes IS NOT NULL"):
+            results.setdefault(mid, []).append((cid, tool, nbytes))
+    finally:
+        conn.close()
+    lanes, excluded, excluded_cr = {}, set(), 0.0
+    spend = cache_read = 0.0
+    for r in rows:
+        in_window = not since or (r["timestamp"] or "") >= since
+        cost = pricing.calc_cost(r["model"], r["input_tokens"] or 0, r["output_tokens"] or 0,
+                                 r["cache_read_tokens"] or 0, r["cache_creation_tokens"] or 0,
+                                 r["timestamp"], r["cache_creation_1h_tokens"] or 0) * (r["mult"] or 1)
+        cr = pricing.calc_cost(r["model"], 0, 0, r["cache_read_tokens"] or 0, 0, r["timestamp"]) * (r["mult"] or 1)
+        if r["session_id"] not in sized:
+            if in_window:
+                excluded.add(r["session_id"])
+                excluded_cr += cr
+            continue
+        if in_window:
+            spend += cost
+            cache_read += cr
+        # Real spend with no lane to carry in, so its reads stay in rest: scanner-minted advisor/estimate
+        # rows (not calls of the lane), and a subagent call with no agent id (it would merge into main).
+        if _synthetic(r) or (r["is_sidechain"] and not r["agent_id"]):
+            continue
+        lanes.setdefault((r["session_id"], r["agent_id"]), []).append(dict(r, in_window=in_window))
+    by_source = {}
+    for turns in lanes.values():
+        for label, usd in carry(turns, results, classes).items():
+            by_source[label] = by_source.get(label, 0.0) + usd
+    return {"tier": "observation", "in_total": False, "basis": BASIS["pricing"],
+            "by_source": dict(sorted(by_source.items(), key=lambda kv: -kv[1])),
+            "rest_usd": cache_read - sum(by_source.values()), "cache_read_usd": cache_read, "spend_usd": spend,
+            "sessions": len({s for s, _ in lanes}), "lanes": len(lanes),
+            "excluded_sessions": len(excluded), "excluded_cache_read_usd": excluded_cr}

@@ -32,9 +32,14 @@ Three Codex-specific details, all verified against real ``~/.codex`` data:
    the existing partial-unique ``message_id`` index — making rescans idempotent.
 """
 
+import contextlib
 import glob
-import json
 import hashlib
+import io
+import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import policy
@@ -49,20 +54,89 @@ FALLBACK_MODEL = "gpt-5"
 NAME = "codex"
 
 
-def discover_files(codex_path=None):
-    """Return Codex rollout JSONL paths under sessions/ and archived_sessions/.
+ZST = ".jsonl.zst"  # Codex compresses finished rollouts to rollout-*.jsonl.zst
+ZST_HINT = ("install the zstd command-line tool (or run Python 3.14+) so "
+            "whytokens can read compressed Codex sessions")
 
-    Scoped deliberately to those two subtrees: ``~/.codex`` also holds unrelated
-    overlay-tool cruft (pets/, *.sqlite, ambient-suggestions/) that is NOT Codex CLI
-    session data and must never be parsed.
+
+def _zstd_exe():
+    """zstd on PATH, looking only in absolute PATH entries (Windows would also try the cwd)."""
+    # Not shutil.which: Python 3.11 on Windows searches the cwd first even with an explicit path.
+    exts = [""] if os.name != "nt" else [e.lower() for e in (os.environ.get("PATHEXT") or ".EXE").split(os.pathsep) if e]
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d or not os.path.isabs(d):
+            continue
+        for ext in exts:
+            p = os.path.join(d, "zstd" + ext)
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+    return None
+
+
+def zst_decoder():
+    """How .zst rollouts can be read here: "module" (3.14+ stdlib), "exe" (zstd on PATH) or None."""
+    try:
+        from compression import zstd  # noqa: F401
+        return "module"
+    except ImportError:
+        return "exe" if _zstd_exe() else None
+
+
+@contextlib.contextmanager
+def open_rollout(filepath):
+    """Text stream over a rollout, transparently decompressing ``.jsonl.zst``.
+
+    A failed or truncated decode raises, so the engine does not record the file as read.
     """
+    if not str(filepath).endswith(".zst"):
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            yield f
+        return
+    how = zst_decoder()
+    if how == "module":
+        from compression import zstd
+        with zstd.open(filepath, "rt", encoding="utf-8", errors="replace") as f:
+            yield f
+    elif how == "exe":
+        proc = subprocess.Popen([_zstd_exe(), "-dc", "--", str(filepath)],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            yield io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace")
+        finally:
+            proc.stdout.close()
+            rc = proc.wait()
+        if rc:
+            raise OSError(f"zstd exited {rc} reading {filepath}")
+    else:
+        raise OSError(f"no zstd decoder: {ZST_HINT}")
+
+
+def _find(codex_path, pattern):
     base = Path(codex_path or CODEX_PATH)
     files = []
     for sub in ("sessions", "archived_sessions"):
         d = base / sub
         if d.exists():
-            files.extend(glob.glob(str(d / "**" / "rollout-*.jsonl"), recursive=True))
-    files.sort()
+            files.extend(glob.glob(str(d / "**" / pattern), recursive=True))
+    return sorted(files)
+
+
+def unread_zst_files(codex_path=None):
+    """Compressed rollouts we cannot decode here (empty when a decoder exists)."""
+    return [] if zst_decoder() else _find(codex_path, "rollout-*" + ZST)
+
+
+def discover_files(codex_path=None):
+    """Return Codex rollout paths (.jsonl, plus .jsonl.zst when decodable).
+
+    Scoped deliberately to sessions/ and archived_sessions/: ``~/.codex`` also holds
+    unrelated overlay-tool cruft (pets/, *.sqlite, ambient-suggestions/) that is NOT
+    Codex CLI session data and must never be parsed. A rollout seen as both forms is
+    read twice and collapses on the synthetic message_id.
+    """
+    files = _find(codex_path, "rollout-*.jsonl")
+    if zst_decoder():
+        files = sorted(files + _find(codex_path, "rollout-*" + ZST))
     return files
 
 
@@ -155,11 +229,13 @@ def parse_file(filepath, start_line=0, strict=False):
 
     # Fallback session id from the filename's trailing uuid, used only if a
     # token_count somehow precedes the session_meta line.
-    fname_sid = Path(filepath).stem[-36:]
+    fname_sid = Path(filepath).name.removesuffix(".zst").removesuffix(".jsonl")[-36:]
 
     try:
-        with open(filepath, encoding="utf-8", errors="replace") as f:
-            for line_count, line in enumerate(f, 1):
+        with open_rollout(filepath) as f:
+            for n, line in enumerate(f, 1):
+                # A cut-off last line is not a line yet: counting it would hide its completion.
+                line_count = n if line.endswith("\n") else n - 1
                 line = line.strip()
                 if not line:
                     continue
@@ -169,6 +245,7 @@ def parse_file(filepath, start_line=0, strict=False):
                     if strict:
                         raise
                     continue
+                line_count = n  # an unterminated tail that parses is a whole record
                 if not isinstance(record, dict):
                     continue
 
@@ -242,9 +319,11 @@ def parse_file(filepath, start_line=0, strict=False):
                         # reset (resume/compaction): the new total IS the delta.
                         ti, tc, to, tr, _ = _usage_fields(total_obj)
                         pi, pc, po, pr = prev_total or (0, 0, 0, 0)
-                        inp    = ti - pi if ti >= pi else ti
-                        cached = tc - pc if tc >= pc else tc
-                        out    = to - po if to >= po else to
+                        # One decision for the whole tuple: classes can't reset separately.
+                        # (reasoning is optional, so it can't signal a reset.)
+                        if ti < pi or tc < pc or to < po:
+                            pi = pc = po = pr = 0
+                        inp, cached, out = ti - pi, tc - pc, to - po
                         reason = tr - pr if tr >= pr else tr
                         prev_total = (ti, tc, to, tr)
                     elif isinstance(last, dict):
@@ -306,7 +385,7 @@ def parse_file(filepath, start_line=0, strict=False):
                             sm["first_timestamp"] = ts
                         sm["model"] = model
     except Exception as e:  # noqa: BLE001 - match scanner's tolerant file handling
-        if strict:
+        if strict or str(filepath).endswith(".zst"):  # never record a half-decoded file as read
             raise
         print(f"  Warning: error reading {filepath}: {e}")
 
@@ -338,6 +417,9 @@ class CodexSource:
     def discover_files(self):
         return discover_files(self.codex_path)
 
+    def unread_files(self):
+        return unread_zst_files(self.codex_path)
+
     def parse_file(self, filepath, start_line=0):
         metas, turns, line_count = parse_file(filepath, start_line=start_line)
         # 4th element: Codex has no subagent dispatch concept, so always empty.
@@ -362,7 +444,11 @@ class CodexSource:
                 for t in turns:
                     yield t["message_id"], t["effort"]
 
-        return scanner.backfill_effort_once(conn, "effort_backfill_done_codex", pairs)
+        try:
+            return scanner.backfill_effort_once(conn, "effort_backfill_done_codex", pairs)
+        except Exception as e:  # noqa: BLE001 - an unreadable rollout must not abort the scan
+            print(f"  Warning: Codex effort backfill deferred ({e})")
+            return 0
 
     def backfill_details(self, conn):
         """Fill missing details without changing usage, IDs, or existing metadata.

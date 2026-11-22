@@ -25,7 +25,7 @@ import * as P from './pricing.mjs'; import fs from 'fs';
 const d = JSON.parse(fs.readFileSync('payload.json', 'utf8'));
 P.applyDefaultPricing(d.pricing);
 P.loadPricing();
-const { sessionCostBreakdown } = P;
+const { sessionCostBreakdown, costLayers } = P;
 %(SRC)s
 const eq = (got, want, what) => { if (!(Math.abs(got - want) <= 1e-9)) throw new Error(what + ': got ' + got + ', want ' + want); };
 """
@@ -68,6 +68,13 @@ class TestReviewWt4(unittest.TestCase):
                 self.assertEqual(out.returncode, 0, out.stderr[-600:])
 
 
+# the cards price a per-day row by its tier epoch, not its display day
+SEGS["RATE_DAY"] = """
+const row = { day: '2026-10-07', rate_day: '2026-10-06', model: d.model, input: 0, output: 0, cache_read: 1e6, cache_creation: 0 };
+const agg = aggregateCostBreakdown([row]);
+eq(agg.cache_read, 0.20, 'Oct 6 epoch cache-read rate, not the Oct 7 display day');
+"""
+
 # The body of aggregate() up to its totals, run on a session that spans midnight under range Today.
 SPAN = """
 const { rowCost, sessionCost, isEstimated } = P;
@@ -97,6 +104,40 @@ class TestCardsMatchCharts(unittest.TestCase):
         agg = _SRC[_SRC.index("function aggregate() {"):_SRC.index("  // By tool: aggregate from server-side")]
         agg = agg.replace("  if (!rawData) return;", "")
         body = (HEAD % {"SRC": _fn("aggregateCostBreakdown", "function sessionSignals(")}) + SPAN % {"AGG": agg}
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(_MOD / "pricing.js", Path(tmp) / "pricing.mjs")
+            (Path(tmp) / "payload.json").write_text(json.dumps({"pricing": pricing.PRICING, "model": MODEL}))
+            out = subprocess.run(["node", "--input-type=module", "-e", body], cwd=tmp, capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr[-600:])
+
+
+# Projects table: turn-level, filtered like Overview (range AND model), not whole sessions.
+PROJ = """
+const row = (day, model, n) => ({ day, model, project: 'p', branch: 'b', input: n, output: n, cache_read: 0, cache_creation: 0, turns: 1 });
+let rawData = { daily_by_model: [row('2026-11-12', d.model, 1e6), row('2026-11-13', d.model, 1e6), row('2026-11-13', 'other', 5e6)],
+  daily_by_project: [row('2026-11-12', d.model, 1e6), row('2026-11-13', d.model, 1e6), row('2026-11-13', 'other', 5e6)],
+  sessions_all: [{ model: d.model, last_date: '2026-11-13', project: 'p', branch: 'b', input: 7e6, output: 7e6, cache_read: 0, cache_creation: 0, turns: 3 }] };
+let selectedRange = 'today', selectedModels = new Set([d.model]), lastScopeSessions;
+const { rowCost, sessionCost, isEstimated } = P;
+const getRangeBounds = () => ({ start: '2026-11-13', end: '2026-11-13' }), applySessionFilters = x => x;
+%(AGG)s
+  return { byProject, byProjectBranch };
+}
+const r = aggregate();
+eq(r.byProject.length, 1, 'one project');
+eq(r.byProject[0].input, 1e6, 'only the in-range turns of the selected model');
+eq(r.byProject[0].turns, 1, 'turns');
+eq(r.byProject[0].sessions, 1, 'sessions still counted');
+eq(r.byProjectBranch[0].input, 1e6, 'branch row on the same basis');
+"""
+
+
+class TestProjectsTurnLevel(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_projects_filter_at_turn_level(self):
+        agg = _SRC[_SRC.index("function aggregate() {"):_SRC.index("  // By tool: aggregate from server-side")]
+        agg = agg.replace("  if (!rawData) return;", "")
+        body = (HEAD % {"SRC": _fn("aggregateCostBreakdown", "function sessionSignals(")}) + PROJ % {"AGG": agg}
         with tempfile.TemporaryDirectory() as tmp:
             shutil.copy(_MOD / "pricing.js", Path(tmp) / "pricing.mjs")
             (Path(tmp) / "payload.json").write_text(json.dumps({"pricing": pricing.PRICING, "model": MODEL}))

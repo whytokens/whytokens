@@ -30,8 +30,9 @@ import policy
 import scanner
 import shape
 from config import DB_PATH
+from . import claude as _claude
 from .claude import ClaudeSource
-from .codex import CodexSource
+from .codex import CodexSource, ZST_HINT
 from .coordinator import CoordinatorSource
 
 __all__ = ["ClaudeSource", "CodexSource", "CoordinatorSource", "get_sources", "scan_all"]
@@ -126,6 +127,12 @@ def _scan_source(conn, source, verbose):
                 scanner.insert_turns(conn, turns)
                 scanner.upsert_agents(conn, agents)
                 scanner.upsert_tool_results(conn, tool_results)
+                # Committed with the additive rollup: a scan killed before the reconcile
+                # leaves this set, and the next scan reconciles though no file changed.
+                scanner._meta_set(conn, RECONCILE_PENDING, "1")
+
+            if len(parsed) > 5 and parsed[5]:  # Claude's cost-state: updates even with no new turns
+                _claude.upsert_cost_state(conn, filepath, parsed[5])
 
             conn.execute("""
                 INSERT OR REPLACE INTO processed_files (path, mtime, lines, source)
@@ -153,6 +160,9 @@ def _scan_source(conn, source, verbose):
         "turns": total_turns, "sessions": len(sessions_seen),
         "_changed": bool(new_files or updated_files),
     }
+
+
+RECONCILE_PENDING = "reconcile_pending"
 
 
 class ScanBusy(RuntimeError):
@@ -253,6 +263,8 @@ def _scan_conn(conn, projects_dir, verbose, sources, extensions):
         # prompt_seq + tool_results for pre-existing rows (Claude only).
         if hasattr(source, "backfill_tool_results"):
             source.backfill_tool_results(conn)
+        if hasattr(source, "backfill_cost_state"):
+            source.backfill_cost_state(conn)
         # retry_loop inputs (is_error, Bash command_hash) for pre-existing rows (Claude only).
         if hasattr(source, "backfill_retry_inputs"):
             source.backfill_retry_inputs(conn)
@@ -270,6 +282,11 @@ def _scan_conn(conn, projects_dir, verbose, sources, extensions):
         # once changed is True and leak the private _changed key into stats.
         src_changed = s.pop("_changed", False)
         changed = changed or src_changed
+        unread = source.unread_files() if hasattr(source, "unread_files") else []
+        if unread:
+            s["unreadable"] = len(unread)
+            if verbose:
+                print(f"  [{source.name}] {len(unread)} compressed file(s) not read: {ZST_HINT}")
         stats[source.name] = s
     PROGRESS["phase"] = "finish"
 
@@ -282,6 +299,8 @@ def _scan_conn(conn, projects_dir, verbose, sources, extensions):
             source.sync_agents(conn)
         if hasattr(source, "sync_titles"):
             source.sync_titles(conn)
+        if hasattr(source, "sync_cost_state"):
+            source.sync_cost_state(conn)
         if hasattr(source, "reconcile"):
             source.reconcile(conn)
 
@@ -296,15 +315,18 @@ def _scan_conn(conn, projects_dir, verbose, sources, extensions):
                 conn.rollback()
                 print(f"whytokens: extension {ext.get('name')} on_scan failed: {e}", file=sys.stderr)
 
-    if changed:
+    if changed or scanner._meta_get(conn, RECONCILE_PENDING):
         scanner.reconcile_session_totals(conn)
         scanner.reconcile_session_models(conn)
+        conn.execute("DELETE FROM schema_meta WHERE key = ?", (RECONCILE_PENDING,))
+        conn.commit()
     shape.sync_shapes(conn)  # after the totals: it re-derives sessions whose turn count moved
 
     if verbose:
         print("\nScan complete:")
         for name, s in stats.items():
             print(f"  [{name}] new={s['new']} updated={s['updated']} "
-                  f"skipped={s['skipped']} turns={s['turns']} sessions={s['sessions']}")
+                  f"skipped={s['skipped']} turns={s['turns']} sessions={s['sessions']}"
+                  + (f" unreadable={s['unreadable']}" if s.get("unreadable") else ""))
 
     return stats

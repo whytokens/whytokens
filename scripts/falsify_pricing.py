@@ -29,6 +29,10 @@ MUTANTS = [
     ("pricing.py", 'return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "keyword"', 'return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "exact"', PRICING),
     # the fallback list includes models that have their own row
     ("pricing.py", 'if how in ("prefix", "keyword") or (how is None and model and tokens)]', "if how]", PRICING),
+    # keyword-priced ids (an unseen gpt-6.9-x) hidden from the report
+    ("pricing.py", 'if how in ("prefix", "keyword") or', 'if how in ("prefix",) or', PRICING),
+    # the formatter omits keyword-priced ids from the printed report
+    ("pricing.py", 'guessed = [f for f in found if f["priced_as"]]', 'guessed = [f for f in found if f["priced_as"] and f["how"] != "keyword"]', PRICING),
     # an unmatched model with tokens dropped from the report (silent $0), or a zero-token id reported
     ("pricing.py", '(how is None and model and tokens)]', "False]", PRICING),
     ("pricing.py", '(how is None and model and tokens)]', "(how is None and model)]", PRICING),

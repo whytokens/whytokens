@@ -328,6 +328,20 @@ class TestAgentSummaryLongPrompt(Base):
         self.assertTrue(all(self.prompt(r) <= 100_000 for r in rows.values()))
 
 
+    def test_v1_row_is_replaced_on_upgrade_not_kept_beside(self):
+        import sources
+        self.write_agent("claude-haiku-5-5", [45_000, 45_000, 45_000])
+        src = [sources.claude.ClaudeSource(projects_dirs=[str(self.proj)])]
+        sources.scan_all(db_path=self.db, verbose=False, sources=src)
+        conn = scanner.get_db(self.db)  # a v1 DB: the session-less key, marker unset
+        conn.execute("UPDATE turns SET message_id = REPLACE(message_id, ?, 'agent_summary:') "
+                     "WHERE message_id LIKE 'agent_summary:%'", ("agent_summary:%s:" % SESSION,))
+        conn.execute("DELETE FROM schema_meta WHERE key='subagent_estimates_v2_reparse_done_claude'")
+        conn.commit(); conn.close()
+        sources.scan_all(db_path=self.db, verbose=False, sources=src)
+        self.assertEqual(sorted(self.summaries(self.scan())), [self.KEY, self.KEY + "#1"])
+
+
 class TestIncremental(Base):
     def test_rescan_updates_summary_without_duplicates(self):
         p = self.path()

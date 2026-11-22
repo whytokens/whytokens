@@ -56,7 +56,8 @@ MUTANTS = [
     (WHAT, "if to != NEXT_TIER and not pricing.get_pricing(to):", "if False:"),
     (WHAT, 'priced = [m for m in out if m["to"]]', "priced = out"),
     (WHAT, "if to == NEXT_TIER else to", "if False else to"),
-    (API, 'status=400 if "error" in res else 200', "status=200"),
+    (API, 'tz=_qs1(q, "tz"), db_path=DB_PATH)\n            self._send_json(res, status=400 if "error" in res else 200)',
+     'tz=_qs1(q, "tz"), db_path=DB_PATH)\n            self._send_json(res, status=200)'),
     # no leakage into other totals
     (API, '"total_usd": sum(f["usd"] for f in findings if f.get("in_total", True)),',
      f'"total_usd": sum(f["usd"] for f in findings if f.get("in_total", True)) + {LEAK},'),

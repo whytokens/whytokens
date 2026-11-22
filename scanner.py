@@ -159,7 +159,7 @@ COLUMN_MIGRATIONS = {
 }
 
 CORE_TABLES = ("sessions", "turns", "processed_files", "schema_meta", "agents",
-               "tool_results", "fixes")
+               "tool_results", "fixes", "cost_state")
 CORE_INDEXES = ("idx_turns_session", "idx_turns_timestamp", "idx_sessions_first",
                 "idx_agents_type", "idx_tool_results_message", "idx_tool_results_session",
                 "idx_turns_agent_id", "idx_turns_message_id")
@@ -206,8 +206,13 @@ def backup_before_migration(conn):
     dest = sqlite3.connect(tmp)
     try:
         conn.backup(dest)
-    finally:
+        _redact_backup(dest)
+    except BaseException:
         dest.close()
+        for leftover in (tmp, Path(f"{tmp}-journal"), Path(f"{tmp}-wal"), Path(f"{tmp}-shm")):
+            leftover.unlink(missing_ok=True)  # an unredacted copy must not stay on disk
+        raise
+    dest.close()
     try:
         try:
             # A hard link publishes atomically and never replaces: a slower process, whose copy may
@@ -227,6 +232,20 @@ def backup_before_migration(conn):
     finally:
         tmp.unlink(missing_ok=True)
     return bak
+
+
+def _redact_backup(dest):
+    """The backup keeps nothing the data policy removes from the live DB: the same
+    rewrites, run on the copy before it is published (markers left to the live DB).
+    The raw-input opt-in skips only the tool-input rewrite, as on the live DB."""
+    dest.execute("PRAGMA journal_mode=DELETE")  # one file, no -wal left beside the backup
+    dest.execute("PRAGMA secure_delete=ON")  # freed pages are zeroed even if VACUUM is blocked
+    cols = lambda t: {r[1] for r in dest.execute(f"PRAGMA table_info({t})")}
+    no_meta = (lambda c, k: None), (lambda c, k, v: None)
+    if "tool_calls" in cols("turns"):
+        policy.migrate_tool_calls(dest, *no_meta)
+    if "topic_source" in cols("sessions"):
+        policy.clear_prompt_topics(dest, *no_meta)
 
 
 def init_db(conn):
@@ -313,6 +332,17 @@ def init_db(conn):
             message_id   TEXT,
             tool_name    TEXT,
             result_bytes INTEGER
+        );
+
+        -- Claude Code's own last `cost-state` record per session (sources/claude.py writes it;
+        -- cost_state.py compares it at read time). model_usage is the record's JSON as written.
+        CREATE TABLE IF NOT EXISTS cost_state (
+            session_id     TEXT PRIMARY KEY,
+            total_cost_usd REAL,
+            start_time_ms  INTEGER,
+            model_usage    TEXT,
+            covers_full    INTEGER,
+            source_line    INTEGER
         );
 
         -- Recorded waste fixes (`whytokens fix record`); `verify` compares before/after.
@@ -495,6 +525,10 @@ def worktree_main_root(cwd):
     marker = "/.claude/worktrees/"
     if marker in norm:
         return norm.split(marker, 1)[0]
+    # A UNC cwd would send the .git probes below to a remote share: never touch the network.
+    # shortcut: a mapped network drive (Z:) looks local here; detecting it needs GetDriveTypeW.
+    if norm.startswith("//"):
+        return None
     p = Path(cwd)
     for candidate in (p, *p.parents):
         git = candidate / ".git"
@@ -509,6 +543,8 @@ def worktree_main_root(cwd):
         if not content.startswith("gitdir:"):
             return None
         git_dir = Path(os.path.normpath(candidate / content[len("gitdir:"):].strip()))
+        if str(git_dir).replace("\\", "/").startswith("//"):
+            return None  # a gitdir on a share: same no-network rule
         try:
             rel = (git_dir / "commondir").read_text(encoding="utf-8").strip()
         except OSError:
@@ -910,7 +946,13 @@ def backfill_effort_once(conn, marker, pairs_fn, verbose=True):
     return filled
 
 
-def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=None):
+def _tok(v):
+    """A token count, or 0 for a malformed one (a string, a list): one bad field must not
+    abort the rest of the file."""
+    return v if isinstance(v, int) and not isinstance(v, bool) else int(v) if isinstance(v, float) else 0
+
+
+def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=None, errors_out=None):
     """Parse a JSONL file and return (session_metas, turns, line_count).
 
     ``info``, if a dict, collects per-message estimate inputs (see _note_message).
@@ -940,6 +982,7 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=No
     """
     seen_messages = {}  # message_id -> turn dict (dedup streaming records)
     turns_no_id = []    # turns without a message_id (kept as-is)
+    msg_calls = {}      # message_id -> every tool call across the message's streamed records
     session_meta = {}   # session_id -> dict
     line_count = 0
     prompt_seq = 0
@@ -1065,11 +1108,22 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=No
 
                 if rtype == "assistant":
                     msg = record.get("message") or {}
+                    if not isinstance(msg, dict):  # a malformed record: skip it, keep the rest
+                        continue
                     usage = msg.get("usage") or {}
+                    if not isinstance(usage, dict):
+                        usage = {}
                     model = msg.get("model", "")
                     message_id = msg.get("id", "")
                     if info is not None and message_id:
                         _note_message(info, message_id, msg, usage, record)
+                    if message_id:
+                        # Streamed records of one message each carry some blocks;
+                        # collect before the zero-usage skip so none are lost.
+                        seen = msg_calls.setdefault(message_id, [])
+                        for c in extract_tool_calls(msg.get("content", [])):
+                            if not c.get("id") or all(c.get("id") != o.get("id") for o in seen):
+                                seen.append(c)
                     if calls_out is not None:
                         content = msg.get("content")
                         for b in content if isinstance(content, list) else []:
@@ -1077,15 +1131,15 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=No
                                 calls_out.setdefault(b["id"], {"call_id": b["id"], "session_id": session_id}).update(
                                     message_id=message_id or None, tool_name=b.get("name"))
 
-                    input_tokens = usage.get("input_tokens", 0) or 0
-                    output_tokens = usage.get("output_tokens", 0) or 0
-                    cache_read = usage.get("cache_read_input_tokens", 0) or 0
-                    cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
+                    input_tokens = _tok(usage.get("input_tokens"))
+                    output_tokens = _tok(usage.get("output_tokens"))
+                    cache_read = _tok(usage.get("cache_read_input_tokens"))
+                    cache_creation = _tok(usage.get("cache_creation_input_tokens"))
                     cache_creation_detail = usage.get("cache_creation", {})
                     if not isinstance(cache_creation_detail, dict):
                         cache_creation_detail = {}
-                    cache_creation_5m = cache_creation_detail.get("ephemeral_5m_input_tokens", 0) or 0
-                    cache_creation_1h = cache_creation_detail.get("ephemeral_1h_input_tokens", 0) or 0
+                    cache_creation_5m = _tok(cache_creation_detail.get("ephemeral_5m_input_tokens"))
+                    cache_creation_1h = _tok(cache_creation_detail.get("ephemeral_1h_input_tokens"))
 
                     # Only record turns that have actual token usage
                     if input_tokens + output_tokens + cache_read + cache_creation == 0:
@@ -1205,7 +1259,13 @@ def _parse_file(filepath, start_line=0, agents_out=None, info=None, calls_out=No
 
     except Exception as e:
         print(f"  Warning: error reading {filepath}: {e}")
+        if errors_out is not None:  # the parse stopped early: the caller must not checkpoint it
+            errors_out.append(f"{type(e).__name__}: {e} (line {line_count})")
 
+    for mid, t in seen_messages.items():
+        if msg_calls.get(mid):
+            t["tool_calls"] = json.dumps(msg_calls[mid])
+            t["tool_name"] = msg_calls[mid][0]["name"]
     turns = turns_no_id + list(seen_messages.values())
     return list(session_meta.values()), turns, line_count
 
@@ -1340,7 +1400,7 @@ def _apply_estimates(filepath, turns, full_turns, info):
     turns.extend(extra)
 
 
-def parse_jsonl_file(filepath, start_line=0, agents_out=None, calls_out=None):
+def parse_jsonl_file(filepath, start_line=0, agents_out=None, calls_out=None, errors_out=None):
     """_parse_file plus the transcript-gap estimates (see _apply_estimates).
 
     Estimates need whole-message / whole-timeline context, so an incremental
@@ -1350,13 +1410,18 @@ def parse_jsonl_file(filepath, start_line=0, agents_out=None, calls_out=None):
     """
     info = _new_info()
     if start_line == 0:
-        metas, turns, n = _parse_file(filepath, 0, agents_out, info, calls_out)
+        metas, turns, n = _parse_file(filepath, 0, agents_out, info, calls_out, errors_out)
         full = list(turns)
     else:
-        metas, turns, n = _parse_file(filepath, start_line, agents_out, None, calls_out)
-        if n <= start_line or not (turns or is_subagent_record({}, filepath)):
+        tail_calls = {} if calls_out is None else calls_out
+        metas, turns, n = _parse_file(filepath, start_line, agents_out, None, tail_calls, errors_out)
+        # Messages whose tail records only added tool calls (zero usage, so no turn):
+        # re-emit their whole-file turn so the merged calls reach the row.
+        touched = ({c["message_id"] for c in tail_calls.values() if c.get("message_id")}
+                   - {t.get("message_id") for t in turns})
+        if n <= start_line or not (turns or touched or is_subagent_record({}, filepath)):
             return metas, turns, n
-        _, full, _ = _parse_file(filepath, 0, None, info)
+        _, full, _ = _parse_file(filepath, 0, None, info, None, errors_out)
         # prompt_seq counts from line 1: take it from the whole-file parse.
         seq = {t["message_id"]: t.get("prompt_seq") for t in full if t.get("message_id")}
         for t in turns:
@@ -1366,6 +1431,13 @@ def parse_jsonl_file(filepath, start_line=0, agents_out=None, calls_out=None):
         for t in turns:
             if t.get("message_id") in compact:
                 t["is_compact_summary"] = 1
+        # A streamed message's calls span records, some before start_line.
+        turns.extend(f for f in full if f.get("message_id") in touched)
+        calls = {t["message_id"]: t for t in full if t.get("message_id")}
+        for t in turns:
+            f = calls.get(t.get("message_id"))
+            if f is not None:
+                t["tool_calls"], t["tool_name"] = f.get("tool_calls"), f.get("tool_name")
         # Id-less turns can't be keyed: the incremental ones are the tail of the
         # whole file's id-less turns, in order.
         inc = [t for t in turns if not t.get("message_id")]
@@ -1499,6 +1571,9 @@ def upsert_sessions(conn, sessions):
 
             conn.execute("""
                 UPDATE sessions SET
+                    -- a restored older transcript moves the start earlier; '' never wins
+                    first_timestamp = CASE WHEN ? != '' AND (COALESCE(first_timestamp, '') = ''
+                                           OR ? < first_timestamp) THEN ? ELSE first_timestamp END,
                     last_timestamp = MAX(last_timestamp, ?),
                     total_input_tokens = total_input_tokens + ?,
                     total_output_tokens = total_output_tokens + ?,
@@ -1511,12 +1586,63 @@ def upsert_sessions(conn, sessions):
                     topic_source = ?
                 WHERE session_id = ?
             """, (
+                s["first_timestamp"] or "", s["first_timestamp"] or "", s["first_timestamp"] or "",
                 s["last_timestamp"],
                 s["total_input_tokens"], s["total_output_tokens"],
                 s["total_cache_read"], s["total_cache_creation"],
                 s["turn_count"], model_to_set, s.get("agent", "claude"),
                 topic_to_set, source_to_set, s["session_id"]
             ))
+
+
+def _merge_stored_calls(conn, turns):
+    """A message's calls are the union over every copy read: a branch copy or a
+    re-read tail may carry fewer than the stored row, and the transcript that had
+    the rest may be gone. Keyed by call id: stored calls the new set lacks are
+    appended; id-less calls cannot be matched, so the new set's stand."""
+    for t in turns:
+        if not t.get("message_id") or t.get("estimated"):
+            continue
+        row = conn.execute("SELECT tool_calls FROM turns WHERE message_id = ? "
+                           "AND message_id IS NOT NULL AND message_id != ''",
+                           (t["message_id"],)).fetchone()
+        if not row or not row[0]:
+            continue
+        try:
+            stored = json.loads(row[0])
+        except ValueError:
+            continue
+        if not isinstance(stored, list):
+            continue
+        new = json.loads(t["tool_calls"]) if t.get("tool_calls") else []
+        ids = {c.get("id") for c in new}
+        extra = [c for c in stored if isinstance(c, dict) and c.get("id") and c["id"] not in ids]
+        if extra:
+            known = {c["id"] for c in stored if isinstance(c, dict) and c.get("id")}
+            merged = policy.redact_calls(
+                [c for c in stored if isinstance(c, dict) and c.get("id")]
+                + [c for c in new if not c.get("id") or c["id"] not in known])
+            t["tool_calls"] = json.dumps(merged)
+            t["tool_name"] = merged[0].get("name")
+
+
+def _drop_stored_id_less(conn, turns):
+    """An id-less turn has no unique key, so a re-read of a transcript already
+    stored would insert it again. Skip one already stored under the same session,
+    time, model and usage.
+    shortcut: two genuinely distinct id-less records identical in all of these would
+    collapse to one; none seen in a real corpus (id-less turns predate message ids)."""
+    keep = []
+    for t in turns:
+        if not t.get("message_id") and conn.execute(
+                """SELECT 1 FROM turns WHERE COALESCE(message_id, '') = '' AND session_id = ?
+                   AND timestamp IS ? AND model IS ? AND input_tokens = ? AND output_tokens = ?
+                   AND cache_read_tokens = ? AND cache_creation_tokens = ? LIMIT 1""",
+                (t["session_id"], t["timestamp"], t["model"], t["input_tokens"],
+                 t["output_tokens"], t["cache_read_tokens"], t["cache_creation_tokens"])).fetchone():
+            continue
+        keep.append(t)
+    return keep
 
 
 def insert_turns(conn, turns):
@@ -1528,6 +1654,10 @@ def insert_turns(conn, turns):
     # A re-parse emits a subagent file's whole AgentSummary row set (`summary_of`, set
     # by _apply_estimates); a regroup or a lost fire can shrink it, so drop that file's
     # estimate rows the new set no longer has.
+    turns = [t for t in turns if not (is_advisor_turn(t) and t["message_id"].endswith(":est")
+             and conn.execute("SELECT 1 FROM turns WHERE message_id GLOB ? AND message_id IS NOT NULL "
+                              "AND message_id != '' LIMIT 1",
+                              (t["message_id"][:-len("est")] + "[0-9]*",)).fetchone())]
     summaries = {}
     for t in turns:
         if t.get("summary_of"):
@@ -1545,6 +1675,16 @@ def insert_turns(conn, turns):
                  and (m == base or (m[len(base):len(base) + 1] == "#" and m[len(base) + 1:].isdigit()))]
         conn.executemany("DELETE FROM turns WHERE message_id = ? AND message_id IS NOT NULL "
                          "AND message_id != ''", [(m,) for m in stale])
+        # The v1 estimator keyed a file's summary without the session id; the new set
+        # replaces it here, where it is known to exist, rather than by a blind delete.
+        sid, _, stem = base[len(AGENT_SUMMARY_ID_PREFIX):].rpartition(":")
+        if sid:
+            v1 = AGENT_SUMMARY_ID_PREFIX + stem
+            conn.execute("""DELETE FROM turns WHERE estimated = 1 AND session_id = ?
+                            AND message_id IS NOT NULL AND message_id != ''
+                            AND (message_id = ? OR message_id GLOB ?)""", (sid, v1, v1 + "#[0-9]*"))
+    _merge_stored_calls(conn, turns)
+    turns = _drop_stored_id_less(conn, turns)
     conn.executemany("""
         INSERT INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
@@ -1579,13 +1719,39 @@ def insert_turns(conn, turns):
             prompt_seq               = COALESCE(excluded.prompt_seq, turns.prompt_seq)
         -- Precedence: a real (non-estimated) row always replaces an estimated one,
         -- every token field, and clears the flag even on equal counts. Between two
-        -- real rows the larger output wins (the final tally). An estimate never
+        -- real rows the final record wins: the larger output; on equal output the one
+        -- with a stop_reason over one without (the final record can add only billing
+        -- detail: a 1h cache split, fast mode); else, both alike, larger total input,
+        -- then on a tie a larger 1h split or a fast flag gained without losing the other
+        -- (so two copies each carrying one detail cannot swap on every replay).
+        -- An estimate never
         -- replaces a real row, except one still mid-stream (no stop_reason yet:
         -- a pre-fix row, or a scan that caught the message open) when it is larger.
         -- Two estimates update whenever the values move (agent_summary grows).
         WHERE (COALESCE(excluded.estimated, 0) = 0
                AND (excluded.output_tokens > turns.output_tokens
-                    OR COALESCE(turns.estimated, 0) = 1))
+                    OR COALESCE(turns.estimated, 0) = 1
+                    OR (excluded.output_tokens = turns.output_tokens
+                        AND ((COALESCE(excluded.stop_reason, '') != ''
+                              AND COALESCE(turns.stop_reason, '') = '')
+                             OR ((COALESCE(excluded.stop_reason, '') = '')
+                                 = (COALESCE(turns.stop_reason, '') = '')
+                                 AND (excluded.input_tokens + excluded.cache_read_tokens
+                                      + excluded.cache_creation_tokens
+                                    > turns.input_tokens + turns.cache_read_tokens
+                                      + turns.cache_creation_tokens
+                                      OR (excluded.input_tokens + excluded.cache_read_tokens
+                                          + excluded.cache_creation_tokens
+                                        = turns.input_tokens + turns.cache_read_tokens
+                                          + turns.cache_creation_tokens
+                                        AND excluded.cache_creation_1h_tokens
+                                              >= COALESCE(turns.cache_creation_1h_tokens, 0)
+                                        AND (COALESCE(excluded.speed, '') != ''
+                                             OR COALESCE(turns.speed, '') = '')
+                                        AND (excluded.cache_creation_1h_tokens
+                                               > COALESCE(turns.cache_creation_1h_tokens, 0)
+                                             OR (COALESCE(excluded.speed, '') != ''
+                                                 AND COALESCE(turns.speed, '') = '')))))))))
            OR (COALESCE(excluded.estimated, 0) = 1
                AND COALESCE(turns.estimated, 0) = 1
                AND (excluded.output_tokens != turns.output_tokens
@@ -1612,6 +1778,14 @@ def insert_turns(conn, turns):
          t.get("speed") or "", t.get("estimated", 0), t.get("prompt_seq"))
         for t in turns
     ])
+    # The precedence rule above gates the whole row on usage; a message's merged tool
+    # calls can change with usage equal (an upgraded row, an equal-usage append), so
+    # they are written on their own. Real rows only: estimates carry no calls.
+    conn.executemany(
+        "UPDATE turns SET tool_calls = ?, tool_name = ? WHERE message_id = ? AND message_id IS NOT NULL AND message_id != '' "
+        "AND COALESCE(estimated, 0) = 0 AND tool_calls IS NOT ?",
+        [(t["tool_calls"], t["tool_name"], t["message_id"], t["tool_calls"])
+         for t in turns if t.get("tool_calls") and t.get("message_id") and not t.get("estimated")])
 
 
 def upsert_tool_results(conn, rows):

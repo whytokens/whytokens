@@ -54,6 +54,11 @@ MUTANTS = [
 
 def main():
     src = API.read_text(encoding="utf-8")
+    base = subprocess.run([sys.executable, "-m", "unittest", "tests.test_live"],
+                          cwd=str(API.parent), capture_output=True, text=True)
+    if base.returncode != 0:  # a suite that cannot load or pass "catches" every mutant
+        print("the unmutated suite does not pass; no mutant result means anything:", base.stderr[-600:])
+        return 2
     shutil.copy(API, BAK)
     survived = 0
     try:

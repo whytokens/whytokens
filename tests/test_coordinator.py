@@ -203,6 +203,27 @@ class ScanTest(unittest.TestCase):
                 c.close()
             self.assertEqual(row, ("2026-10-10T02:22:47.998Z", "2026-10-10T02:30:00.000Z"))
 
+    def test_rescan_repairs_stored_bounds_without_new_blobs(self):
+        # A DB written before the upsert moved starts earlier keeps a late start;
+        # only the coordinator's own reconcile repairs it when no blob changes.
+        with tempfile.TemporaryDirectory() as d:
+            root, db = Path(d) / "blobs", Path(d) / "u.db"
+            root.mkdir()
+            (root / "1").write_bytes(blob(conv(R1, R2)))
+            self._scan(root, db)
+            c = sqlite3.connect(db)
+            c.execute("UPDATE sessions SET first_timestamp = last_timestamp WHERE session_id='cse_X'")
+            c.commit()
+            c.close()
+            self._scan(root, db)
+            c = sqlite3.connect(db)
+            try:
+                row = c.execute("SELECT first_timestamp FROM sessions "
+                                "WHERE session_id='cse_X'").fetchone()
+            finally:
+                c.close()
+            self.assertEqual(row, ("2026-10-10T02:22:47.998Z",))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -44,7 +44,7 @@ from pathlib import Path
 # from the per-turn `cwd`, so "relocated" needs no parsing. None carry usage.
 KNOWN_RECORD_TYPES = frozenset({
     "atis-latch", "bridge-session", "api-request-blob", "api-request",
-    "file-history-delta", "cost-state", "api-request-shape",
+    "file-history-delta", "cost-state", "api-request-shape",  # cost-state: read by sources/claude.py
     "artifact-autoreact-ledger", "artifact-comment-monitor", "dev-mods",
     "agent-setting", "worktree-state", "pr-link", "launched",
     "assistant", "user", "system", "attachment", "queue-operation",
@@ -188,11 +188,15 @@ KNOWN_CODEX_PAYLOAD_TYPES = frozenset({
     "token_count", "tool_search_call", "tool_search_output",
     "turn_aborted", "user_message", "view_image_tool_call", "web_search_call",
     "web_search_end",
+    # Seen only in compressed (.jsonl.zst) rollouts; neither carries token usage.
+    "compaction", "bem_item_promoted",
 })
 
 # Keys of ``token_count.info``. ``*_token_usage`` are the usage sub-objects.
 KNOWN_CODEX_INFO_KEYS = frozenset({
     "last_token_usage", "total_token_usage", "model_context_window",
+    # Bool flag beside the usage objects; usage is taken from total_token_usage deltas.
+    "last_usage_includes_reasoning",
 })
 
 # Keys of each ``*_token_usage`` object — the highest-value Codex canary: a new
@@ -498,12 +502,16 @@ def inspect_codex_record(record):
 
     etype = record.get("type")
     payload = record.get("payload")
+    payload_drift = []
     if not isinstance(payload, dict):
+        if "payload" in record:
+            payload_drift.append(f"payload:{type(payload).__name__}")
         payload = {}
     ptype = payload.get("type")
 
     result = {
         **empty,
+        "shape_drift": payload_drift,
         "type": etype,
         "payload_type": ptype,
         "unknown_envelope_keys": sorted(k for k in record if k not in KNOWN_CODEX_ENVELOPE_KEYS),
@@ -555,16 +563,13 @@ def _iter_codex_jsonl(codex_paths):
     """Yield Codex rollout file paths under sessions/ + archived_sessions/ (sorted).
 
     Scoped to those two subtrees so unrelated ~/.codex cruft is never inspected.
+    Compressed (.jsonl.zst) rollouts are included only when a decoder exists.
     """
+    from sources import codex
     files = []
     for base in codex_paths:
-        base = Path(base)
-        for sub in ("sessions", "archived_sessions"):
-            d = base / sub
-            if d.exists():
-                files.extend(glob.glob(str(d / "**" / "rollout-*.jsonl"), recursive=True))
-    files.sort()
-    return files
+        files.extend(codex.discover_files(base))
+    return sorted(files)
 
 
 def codex_doctor_scan(codex_paths, file_limit=None):
@@ -577,7 +582,9 @@ def codex_doctor_scan(codex_paths, file_limit=None):
     """
     from collections import Counter
 
+    from sources import codex
     files = _iter_codex_jsonl(codex_paths)
+    unread_zst = sum(len(codex.unread_zst_files(b)) for b in codex_paths)
     if file_limit is not None:
         files = files[:file_limit]
 
@@ -591,11 +598,12 @@ def codex_doctor_scan(codex_paths, file_limit=None):
     versions = Counter()
     records_scanned = 0
     files_scanned = 0
+    failed = 0
 
     for fp in files:
         files_scanned += 1
         try:
-            with open(fp, encoding="utf-8", errors="replace") as f:
+            with codex.open_rollout(fp) as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -622,11 +630,13 @@ def codex_doctor_scan(codex_paths, file_limit=None):
                         nonzero_zero_only_usage_keys[k] += 1
                     for k in info["shape_drift"]:
                         shape_drift[k] += 1
-        except OSError:
+        except Exception:  # noqa: BLE001 - truncated/corrupt rollout: report it, keep going
+            failed += 1
             continue
 
     return {
         "files_scanned": files_scanned,
+        "unread_zst": unread_zst + failed,
         "records_scanned": records_scanned,
         "versions": dict(versions),
         "unknown_types": dict(unknown_types),
@@ -662,6 +672,9 @@ def format_codex_doctor_report(report):
     lines.append("=" * 60)
     lines.append(f"  Files scanned:   {report['files_scanned']}")
     lines.append(f"  Records scanned: {report['records_scanned']}")
+    if report.get("unread_zst"):
+        from sources.codex import ZST_HINT
+        lines.append(f"  NOT READ: {report['unread_zst']} compressed rollout(s); {ZST_HINT}")
 
     def section(title, counts):
         lines.append("-" * 60)

@@ -112,7 +112,7 @@ class TestNextStepAction(unittest.TestCase):
         self.assertEqual(f["action"]["calls"][0]["minutes"], 8)
         self.assertIn("agent_type", f["action"]["calls"][0])
         ev = [{"message_id": "m", "at": "t", "usd": 2.0, "agent_id": "a1"}]
-        got = waste.idle_gap_action(ev, [(timedelta(minutes=9), 5, 0.5)], {"a1": "Explore"})
+        got = waste.idle_gap_action(ev, [(timedelta(minutes=9), 5, 0.5, 300)], {"a1": "Explore"})
         self.assertEqual(got["calls"][0]["agent_type"], "Explore")
 
     def test_short_subagent_lanes_give_small_jobs_inline(self):
@@ -168,3 +168,55 @@ class TestRulePick(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRuleAudience(unittest.TestCase):
+    """A next-step rule the card offers for CLAUDE.md must be one the agent can follow by itself."""
+    USER_ONLY = r"(?<![\w`])/(compact|clear|model|resume|fast|config|context|cost|usage|login|exit)\b"
+    HUMAN = ("stepping away", "step away", "your break", "come back", "when you return")
+
+    def test_every_emitted_id_has_a_rule_with_an_audience(self):
+        import re
+        src = Path(waste.__file__).read_text(encoding="utf-8")
+        ids = set(re.findall(r'"id": "(\w+)"', src)) | set(re.findall(r'return "(\w+)", (?:tool|"search")', src))
+        ids |= set(re.findall(r'rid = "(\w+)" if side else "(\w+)"', src)[0])
+        self.assertTrue(ids)
+        for rid in ids:
+            self.assertIn(rid, waste._RULES, rid)
+        for rid, (_, _, who) in waste._RULES.items():
+            self.assertIn(who, ("agent", "you"), rid)
+
+    def test_agent_rules_need_no_human(self):
+        import re
+        for rid, (_, rule, who) in waste._RULES.items():
+            if who != "agent":
+                continue
+            self.assertIsNone(re.search(self.USER_ONLY, rule), f"{rid}: user-only slash command in a CLAUDE.md rule")
+            for p in self.HUMAN:
+                self.assertNotIn(p, rule.lower(), f"{rid}: depends on the human's presence")
+            self.assertIsNone(re.search(r"\b\d+ minutes?\b", rule), f"{rid}: hard-coded cache lifetime, use {{life}}")
+
+    def test_actions_carry_audience_and_observed_lifetime(self):
+        ev = [{"message_id": "m", "at": "t", "usd": 2.0, "agent_id": None}]
+        short = waste.idle_gap_action(ev, [(timedelta(minutes=9), 5, 0.5, 300)])
+        self.assertEqual(short["audience"], "you")
+        self.assertIn("5 minutes", short["rule"])
+        self.assertIn("1 hour", waste.idle_gap_action(ev, [(timedelta(minutes=70), 5, 0.5, 3600)])["rule"])
+        side = waste.idle_gap_action([dict(ev[0], agent_id="a")], [(timedelta(minutes=9), 5, 0.5, 300)])
+        self.assertEqual(side["audience"], "agent")
+        self.assertNotIn("{", side["rule"])
+
+    def test_subagent_gaps_do_not_set_the_main_thread_lifetime(self):
+        # main-thread gaps on the 1h tier plus a minority subagent gap on the 5m tier:
+        # the main-thread rule must say 1 hour (the subagent's 5 minutes leaked in before)
+        main = {"message_id": "m", "at": "t", "usd": 2.0, "agent_id": None}
+        sub = dict(main, message_id="s", agent_id="a1")
+        a = waste.idle_gap_action([main, main, sub], [(timedelta(minutes=70), 5, 0.5, 3600),
+                                                       (timedelta(minutes=95), 5, 0.5, 3600),
+                                                       (timedelta(minutes=9), 5, 0.5, 300)])
+        self.assertEqual(a["id"], "compact_before_break")
+        self.assertIn("1 hour", a["rule"])
+        self.assertNotIn("5 minutes", a["rule"])
+        # a main thread really on the 5m tier (API key, usage credits) still says 5 minutes
+        b = waste.idle_gap_action([main], [(timedelta(minutes=20), 5, 0.5, 300)])
+        self.assertIn("5 minutes", b["rule"])

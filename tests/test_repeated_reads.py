@@ -1,5 +1,6 @@
 """repeated_reads keys on (path, offset, limit), forgets a path on write and on compaction,
 and caps its claim by the repeated Reads' result size."""
+import json
 import shutil
 import tempfile
 import unittest
@@ -17,12 +18,26 @@ def read(offset=None, limit=None, path="/src/big.py"):
     return ("Read", {"file_path": path, **({"offset": offset} if offset is not None else {}), **({"limit": limit} if limit is not None else {})})
 
 
+def _streamed():
+    """Turn 2 is ONE message (one id) streamed over three records: Read other, Edit big, Read big."""
+    sid = "streamed"
+    other = read(path="/src/other.py")
+    edit = ("Edit", {"file_path": "/src/big.py"})
+    rec = lambda n, tools, **kw: _rec(sid, n, _ts(3), read=20_000, create=30_000, tools=tools, result_tokens=30_400 if tools else None, **kw)
+    # _rec keys the message id on n (shared here); tool_use ids must differ per record
+    shared = [r.replace(f"tu-{sid}-2-0", f"tu-{sid}-2-{i}")
+              for i, r in enumerate((rec(2, [other]), rec(2, [edit]), rec(2, [read()])))]
+    return [_rec(sid, 1, _ts(0), read=0, create=20_000, tools=[read()], result_tokens=30_400)] + shared + [
+        _rec(sid, 3, _ts(6), read=50_000, create=30_000)]
+
+
 G = {t: 30_000 for t in range(2, 11)}
 SESSIONS = {
     "ranged": _main_chain("ranged", 10, 20_000, tool_at={t: [read(1 + 50 * t, 50)] for t in (2, 4, 6, 8, 10)}, growth=G),
     "same_range": _main_chain("same_range", 10, 20_000, tool_at={t: [read(1, 50)] for t in (2, 4, 6, 8, 10)}, growth=G),
     "edited": _main_chain("edited", 10, 20_000, tool_at={2: [read()], 3: [("Edit", {"file_path": "/src/big.py"})], 4: [read()], 5: [("Write", {"file_path": "/src/big.py"})], 6: [read()], 7: [("Edit", {"file_path": "/src/big.py"})], 8: [read()], 9: [("Edit", {"file_path": "/src/big.py"})], 10: [read()]}, growth=G),
     "whole_twice": _main_chain("whole_twice", 10, 20_000, tool_at={t: [read()] for t in (2, 4, 6, 8, 10)}, growth=G),
+    "streamed": _streamed(),
     "compacted": [
         _rec("compacted", 1, _ts(0), read=0, create=20_000, tools=[read()], result_tokens=30_400),
         _rec("compacted", 2, _ts(1), read=20_000, create=5_000, compact=True, result_tokens=None),
@@ -66,6 +81,35 @@ class TestRepeatedReads(unittest.TestCase):
 
     def test_a_re_read_after_an_edit_is_not_a_repeat(self):
         self.assertNotIn("repeated_reads", self.causes("edited"))
+
+    def test_a_streamed_message_keeps_every_record_s_calls_in_order(self):
+        conn = get_db(self.db)
+        try:
+            rows = conn.execute("SELECT tool_calls FROM turns WHERE session_id='streamed' AND message_id='msg-streamed-2'").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(len(rows), 1)
+        calls = json.loads(rows[0][0])
+        self.assertEqual([c["name"] for c in calls], ["Read", "Edit", "Read"])
+
+    def test_a_reparse_restores_calls_an_old_scan_stored_with_equal_usage(self):
+        conn = get_db(self.db)
+        try:
+            conn.execute("UPDATE turns SET tool_calls = ? WHERE message_id = 'msg-streamed-2'", ('[{"name": "Read"}]',))
+            conn.execute("DELETE FROM processed_files")
+            conn.commit()
+        finally:
+            conn.close()
+        scan_all(db_path=self.db, verbose=False, sources=[ClaudeSource(projects_dirs=[str(Path(self.tmp) / "projects")])])
+        conn = get_db(self.db)
+        try:
+            row = conn.execute("SELECT tool_calls FROM turns WHERE message_id = 'msg-streamed-2'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual([c["name"] for c in json.loads(row[0])], ["Read", "Edit", "Read"])
+
+    def test_an_edit_in_an_earlier_streamed_record_forgets_earlier_reads(self):
+        self.assertNotIn("repeated_reads", self.causes("streamed"))
 
     def test_a_re_read_after_compaction_is_not_a_repeat(self):
         self.assertNotIn("repeated_reads", self.causes("compacted"))

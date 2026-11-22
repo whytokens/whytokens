@@ -29,7 +29,11 @@ MUTANTS = [
     ("waste.py", "stop = min((k for k in compact_at if k > i), default=len(lt))", "stop = len(lt)"),
     # combined review: compaction on the very next turn, later turns counted one by one, retryable backfill
     ("waste.py", "stop = min((k for k in compact_at if k > i), default=len(lt))", "stop = min((k for k in compact_at if k > i + 1), default=len(lt))"),
-    ("waste.py", 'if (u["cache_read_tokens"] or 0) and u["message_id"] not in claimed)', "if True)"),
+    ("waste.py", 'if (u["cache_read_tokens"] or 0) and u["message_id"] not in claimed]', 'if (u["cache_read_tokens"] or 0)]'),
+    ("waste.py", "take = min(share, left)", "take = share"),                # claim past the reads recorded
+    ("waste.py", "read_left[u[\"id\"]] = left - take", "pass"),               # loads re-spend one turn's reads
+    ("waste.py", 'calc_cost(u["model"], 0, 0, take, 0, u["timestamp"]) * u["mult"]',
+     'calc_cost(nxt["model"], 0, 0, take, 0, nxt["timestamp"]) * nxt["mult"]'),  # priced at the write turn
     ("sources/claude.py", "if complete:  # COALESCE", "if True:  # COALESCE"),
     ("mcp_config.py", '"**/.mcp.json"', '"nothing/.mcp.json"'),
 ]
