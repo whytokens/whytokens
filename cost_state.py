@@ -44,9 +44,11 @@ def label(model, u, day):
         return "unverifiable"  # the 5x tier is per request; an aggregate can't tell
     if n("cacheCreationInputTokens") and "cacheCreationEphemeral1hInputTokens" not in u:
         return "unverifiable"  # older records carry no 5m/1h split, and the two rates differ
-    re = (pricing.calc_cost(model, n("inputTokens"), n("outputTokens"), n("cacheReadInputTokens"),
-                            n("cacheCreationInputTokens"), day,
-                            cache_creation_1h=n("cacheCreationEphemeral1hInputTokens"))
+    # a Foundry -fast id bills at the shared premium (pricing.price_mult); web-search fees are not scaled
+    re = (pricing.price_mult("", "", model)
+          * pricing.calc_cost(model, n("inputTokens"), n("outputTokens"), n("cacheReadInputTokens"),
+                              n("cacheCreationInputTokens"), day,
+                              cache_creation_1h=n("cacheCreationEphemeral1hInputTokens"))
           + n("webSearchRequests") * pricing.WEB_SEARCH_FEE_USD)
     # the 1e-9 keeps float noise at exactly the tolerance on the clean side
     return "priced_differently" if abs(re - n("costUSD")) > REPRICE_TOL * n("costUSD") + 1e-9 else "clean"

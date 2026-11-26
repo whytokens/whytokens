@@ -218,6 +218,22 @@ tr:hover td { background: var(--raised); }
 .filter-check { display: flex; align-items: center; gap: 7px; height: 30px; color: var(--muted); font-size: 12px; white-space: nowrap; cursor: pointer; }
 .filter-check input { margin: 0; }
 .session-filter-bar .filter-btn { height: 30px; padding: 0 12px; border-radius: 5px; font-size: 12px; }
+/* Sessions table: fixed column widths so Show more, sorting and expanding never move a column;
+   Session takes the rest, other cells truncate (full text in title=). */
+.sessions-table { table-layout: fixed; min-width: 1120px; }
+.sessions-table > colgroup > col:nth-child(2) { width: 130px; }
+.sessions-table > colgroup > col:nth-child(3) { width: 80px; }
+.sessions-table > colgroup > col:nth-child(4) { width: 140px; }
+.sessions-table > colgroup > col:nth-child(5) { width: 70px; }
+.sessions-table > colgroup > col:nth-child(6) { width: 100px; }
+.sessions-table > colgroup > col:nth-child(7) { width: 125px; }
+.sessions-table > colgroup > col:nth-child(8) { width: 100px; }
+.sessions-table > colgroup > col:nth-child(9) { width: 170px; }
+.sessions-table tr.session-row > td:not(.session-topic) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Toggle and title share the first line; a long title wraps beside the toggle, not under it. */
+.session-head { display: flex; align-items: flex-start; line-height: 18px; }
+.session-head .row-toggle { flex: none; }
+.session-head .session-title { min-width: 0; overflow-wrap: anywhere; }
 /* Sessions table: labels share one top line, the provenance badge hangs under its label, numbers right-align. */
 .sessions-table th { vertical-align: top; }
 @media (min-width: 1280px) { .sessions-table th { white-space: nowrap; } } /* narrower: labels wrap rather than widen the table */
@@ -240,6 +256,9 @@ tr:hover td { background: var(--raised); }
   .table-card > table > thead th { position: sticky; top: var(--filter-bar-h, 68px); z-index: 2; background: var(--card);
     border-bottom-color: transparent; box-shadow: inset 0 -1px 0 var(--border); } /* a collapsed border does not travel with a sticky cell */
 }
+/* The Sessions table is 1120px wide at minimum; with the rail open it does not fit until ~1440px, so up to there its
+   card keeps its own sideways scroll (and its header does not pin) rather than pushing the page wider. */
+@media (min-width: 1280px) and (max-width: 1439px) { div.table-card:has(> .sessions-table) { overflow-x: auto; } }
 .filter-check input { accent-color: var(--accent); }
 .pricing-input { width: 86px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 5px 7px; font: inherit; font-size: 12px; font-family: monospace; }
 .pricing-source { color: var(--muted); font-size: 11px; }
@@ -249,7 +268,7 @@ tr:hover td { background: var(--raised); }
 .detail-stat .value { font-size: 14px; font-weight: 700; line-height: 1.3; overflow-wrap: anywhere; }
 .detail-workspace-header { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 18px; }
 .detail-title-group { min-width: 0; }
-.detail-title { color: var(--accent); font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+.detail-title { color: var(--accent); font-size: 20px; font-weight: 700; margin-bottom: 4px; overflow-wrap: anywhere; }
 .detail-subtitle { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .detail-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .timeline-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 12px; }

@@ -51,6 +51,10 @@ MUTANTS = [
      "    import socket; socket.create_connection(('127.0.0.1', 9))\n    scanner.backfill_worktree_projects_once(conn, verbose=verbose)\n"),
     ("sources/__init__.py", "    scanner.backfill_worktree_projects_once(conn, verbose=verbose)\n",
      "    import subprocess; subprocess.Popen(['x'])\n    scanner.backfill_worktree_projects_once(conn, verbose=verbose)\n"),
+    # connector names come from the desktop app only under the same opt-in
+    ("config.py", "    return blob.parent.parent / \"claude-code-sessions\" if blob else None",
+     "    return DESKTOP_BLOB_DIR.parent.parent / \"claude-code-sessions\""),
+    ("api.py", "    if uuids and sessions_dir:", "    if uuids:\n        sessions_dir = config.DESKTOP_BLOB_DIR.parent.parent / \"claude-code-sessions\""),
     # server
     ("api.py", "if not self.allow_any_host and _host_name(host) not in self.allowed_hosts:", "if False:"),
     ("api.py", 'unsafe_host and bound in ("0.0.0.0", "::")', "unsafe_host"),

@@ -352,6 +352,56 @@ class TestDesktopCacheOptIn(unittest.TestCase):
                     mock.patch.dict(os.environ, {"WHYTOKENS_DESKTOP_CACHE": "1"}):
                 self.assertEqual(len(CoordinatorSource().discover_files()), 1)
 
+    def test_connector_names_read_only_when_opted_in(self):
+        import budget
+        import project_threads
+        import shape
+        uid = "1a94f017-80ef-437a-acea-51927abc5b59"
+        rows = [{"session_id": "s1", "project": "p", "shape": "connector", "detail": uid}]
+        with tempfile.TemporaryDirectory() as d:
+            blob = Path(d, "Claude", "IndexedDB", "blob")
+            sess = Path(d, "Claude", "claude-code-sessions", "a", "o")
+            sess.mkdir(parents=True)
+            (sess / "local_1.json").write_text(json.dumps(
+                {"remoteMcpServersConfig": [{"uuid": uid, "name": "Robinhood"}]}), encoding="utf-8")
+            db = Path(d, "x.db")
+            db.write_bytes(b"")
+
+            def detail(env):
+                api._shapes_cache = project_threads._names_cache = None
+                with mock.patch.object(config, "DESKTOP_BLOB_DIR", blob), mock.patch.dict(os.environ, env),                         mock.patch.object(shape, "session_rows", return_value=rows),                         mock.patch.object(shape, "peers", return_value={}),                         mock.patch.object(shape, "breakdown", return_value=[]),                         mock.patch.object(budget, "load_tags", return_value={}),                         mock.patch.object(api, "get_waste", return_value={"findings": []}),                         mock.patch.object(project_threads, "connector_names",
+                                          wraps=project_threads.connector_names) as spy:
+                    if not env:
+                        os.environ.pop("WHYTOKENS_DESKTOP_CACHE", None)
+                    e = api.get_shapes(str(db))["sessions"]["s1"]
+                    return e["detail"], e["detail_id"], spy.call_count
+            self.assertEqual(detail({}), ("claude.ai connector", uid, 0))
+            self.assertEqual(detail({"WHYTOKENS_DESKTOP_CACHE": "1"}), ("Robinhood", uid, 1))
+            api._shapes_cache = project_threads._names_cache = None
+
+    def test_connector_name_refreshes_when_the_session_file_changes_and_the_db_does_not(self):
+        import budget
+        import project_threads
+        import shape
+        uid = "1a94f017-80ef-437a-acea-51927abc5b59"
+        rows = [{"session_id": "s1", "project": "p", "shape": "connector", "detail": uid}]
+        with tempfile.TemporaryDirectory() as d:
+            blob = Path(d, "Claude", "IndexedDB", "blob")
+            sess = Path(d, "Claude", "claude-code-sessions", "a", "o")
+            sess.mkdir(parents=True)
+            f = sess / "local_1.json"
+            db = Path(d, "x.db")
+            db.write_bytes(b"")
+
+            def name(n):
+                f.write_text(json.dumps({"remoteMcpServersConfig": [{"uuid": uid, "name": n}]}), encoding="utf-8")
+                with mock.patch.object(config, "DESKTOP_BLOB_DIR", blob),                         mock.patch.dict(os.environ, {"WHYTOKENS_DESKTOP_CACHE": "1"}),                         mock.patch.object(shape, "session_rows", return_value=rows),                         mock.patch.object(shape, "peers", return_value={}),                         mock.patch.object(shape, "breakdown", return_value=[]),                         mock.patch.object(budget, "load_tags", return_value={}),                         mock.patch.object(api, "get_waste", return_value={"findings": []}):
+                    return api.get_shapes(str(db))["sessions"]["s1"]["detail"]
+            api._shapes_cache = project_threads._names_cache = None
+            self.assertEqual(name("Robinhood"), "Robinhood")
+            self.assertEqual(name("Robinhood Legend"), "Robinhood Legend")  # same mtime tick is possible; size differs
+            api._shapes_cache = project_threads._names_cache = None
+
 
 class TestEgressBoundary(PolicyCase):
     """Ingestion and analysis open no sockets and spawn no processes."""

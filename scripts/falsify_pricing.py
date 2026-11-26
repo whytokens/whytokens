@@ -19,11 +19,11 @@ PRICING, MISS, RANGE, HTTP = "tests.test_pricing", "tests.test_cache_miss", "tes
 # (file, original, mutant, test module) - each must turn that module red on its own.
 MUTANTS = [
     # a guessed prefix match reported as the id's own row
-    ("pricing.py", 'return key, "exact" if _DATED.fullmatch(model[len(key):]) else "prefix"', 'return key, "exact"', PRICING),
+    ("pricing.py", 'return key, "exact" if _DATED.fullmatch(base[len(key):]) else "prefix"', 'return key, "exact"', PRICING),
     # a dated snapshot of a listed model reported as a guess
-    ("pricing.py", 'return key, "exact" if _DATED.fullmatch(model[len(key):]) else "prefix"', 'return key, "prefix"', PRICING),
+    ("pricing.py", 'return key, "exact" if _DATED.fullmatch(base[len(key):]) else "prefix"', 'return key, "prefix"', PRICING),
     # prefix scan no longer first-wins in table order (a 5.2 id falls to the 5.0 row)
-    ("pricing.py", "    for key in PRICING:\n        if model.startswith(key) and", "    for key in reversed(list(PRICING)):\n        if model.startswith(key) and", PRICING),
+    ("pricing.py", "    for key in PRICING:\n        if base.startswith(key) and", "    for key in reversed(list(PRICING)):\n        if base.startswith(key) and", PRICING),
     ("pricing.py", '    (("fable-5-2", "mythos-5-2"), "claude-fable-5-2"),\n', "", PRICING),
     ("pricing.py", 'return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "keyword"', 'return key, "keyword"', PRICING),
     ("pricing.py", 'return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "keyword"', 'return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "exact"', PRICING),
@@ -54,7 +54,7 @@ MUTANTS = [
     ("static/modules/app.js", "if (displayTZ === 'utc') d.setUTCDate(", "if (false) d.setUTCDate(", RANGE),
     ("static/modules/app.js", "d.setUTCDate(d.getUTCDate() - (days - 1));", "d.setUTCDate(d.getUTCDate() - days);", RANGE),
     # version boundary: a dated 5.0 id ("claude-fable-5-20260610") read as 5.2, prefix or keyword
-    ("pricing.py", "if model.startswith(key) and not _splits_number(key, model, 0):", "if model.startswith(key):", PRICING),
+    ("pricing.py", "if base.startswith(key) and not _splits_number(key, base, 0):", "if model.startswith(key):", PRICING),
     ("pricing.py", "if any(_contains(m, w) for w in words):", "if any(w in m for w in words):", PRICING),
     ("pricing.py", "    return _ascii_digit(word[-1:]) and _ascii_digit(s[end:end + 1])", "    return False", PRICING),
     ("pricing.py", "    return c.isascii() and c.isdigit()", "    return c.isdigit()", PRICING),  # Unicode digit: Python and JS disagree

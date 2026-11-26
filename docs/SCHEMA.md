@@ -42,7 +42,7 @@ knows its own model) then summed.
 | `reasoning_tokens` | INTEGER | informational; reasoning is already inside `output_tokens` and never billed separately (Codex) |
 | `agent_id` | TEXT | dispatched-subagent id (matches `agents.agent_id`); NULL on main-chain turns |
 | `effort` | TEXT | reasoning effort of the turn (`high`/`medium`/`low`/`xhigh`); `''` when the source didn't report one — Claude Code only writes it from 2.1.215 |
-| `speed` | TEXT | `usage.speed` as the source reported it; `fast` bills every token class at 2x (`pricing.price_mult`). Older rows are filled once by `ClaudeSource.backfill_speed` |
+| `speed` | TEXT | `usage.speed` as the source reported it; `fast` bills every token class at 2x (`pricing.price_mult`), as does a Claude `model` ending in Foundry's `-fast` (base model rates, never 4x). Older rows are filled once by `ClaudeSource.backfill_speed` |
 | `skill` | TEXT | skill active when the turn was produced (`next-task`, `local-delegate`, …), from the record's top-level `attributionSkill`; `''` outside any skill |
 | `mcp_server` | TEXT | MCP server whose tool result this turn consumed (`github`, `Claude Browser`, or a claude.ai connector UUID), from `attributionMcpServer`; `''` otherwise. Orthogonal to the agent/skill/main split — do not sum across both |
 | `mcp_tool` | TEXT | that MCP tool (`workitem`, `get_equity_quotes`, …), from `attributionMcpTool`; `''` otherwise |

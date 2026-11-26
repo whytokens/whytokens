@@ -361,6 +361,29 @@ class PageOddities(unittest.TestCase):
         init = self.cut("async function init(", "\ninit();")
         self.assertIn("loadData().then(triggerRescan);", init)  # F5 picks up new turns
 
+    def test_rescan_checks_status_while_the_scan_runs(self):
+        # F5 used to check status before the POST and again only after the scan ended,
+        # so the "scanning" banner never showed for the scan F5 itself started.
+        self.node("let scanning = false;\n" + self.cut("async function triggerRescan(", "// ── Data loading") + r"""
+const assert = require('node:assert/strict');
+const btn = {disabled: false, textContent: ''};
+globalThis.document = {getElementById: () => btn};
+const timers = []; globalThis.setTimeout = (f, ms) => timers.push([f, ms]);
+let finish; const postRescan = () => new Promise(r => { finish = r; });
+let checks = 0; const refreshStatus = () => { checks++; };
+const loadData = async () => {};
+(async () => {
+  const done = triggerRescan();
+  timers.filter(([, ms]) => ms < 3000).forEach(([f]) => f());   // fire the early check, POST still pending
+  assert.equal(checks, 1, 'status checked while the scan runs');
+  finish({new: 0, updated: 0}); await done;
+  scanning = true; timers.length = 0; btn.disabled = false;     // a poll loop is already running
+  triggerRescan();
+  timers.filter(([, ms]) => ms < 3000).forEach(([f]) => f());
+  assert.equal(checks, 2, 'no second poll loop');  // only the post-scan check, not the early one
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+
     def test_csv_cells_cannot_start_a_formula(self):
         self.node(self.cut("function csvField(", "function csvTimestamp(") + r"""
 const assert = require('node:assert/strict');

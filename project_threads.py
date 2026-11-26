@@ -40,6 +40,56 @@ def default_blob_dir():
     return base / "Claude" / "IndexedDB" / "https_claude.ai_0.indexeddb.blob"
 
 
+
+_names_cache = None  # (key, names): one entry, rebuilt when the file listing or the wanted set changes
+
+
+def _session_files(root):
+    """[(mtime_ns, size, path)] of the desktop session files, newest first."""
+    files = []
+    for f in Path(root).glob("*/*/local_*.json"):
+        try:
+            st = f.stat()
+            files.append((st.st_mtime_ns, st.st_size, f))
+        except OSError:  # deleted between the glob and the stat
+            continue
+    files.sort(key=lambda t: t[0], reverse=True)
+    return files
+
+
+def names_state(root):
+    """Fingerprint of the connector-name source (file count, newest file's mtime and size), so a
+    caller can tell when connector_names would answer differently."""
+    files = _session_files(root)
+    return (len(files), files[0][0], files[0][1]) if files else (0, 0, 0)
+
+
+def connector_names(root, wanted=None):
+    """{uuid: display name} for claude.ai connectors, read from the desktop app's Code-tab
+    session files (``<root>/*/*/local_*.json``, key ``remoteMcpServersConfig``). Newest file
+    wins a rename; reading stops once every ``wanted`` uuid has a name (the files run to
+    hundreds of MB). Missing or unreadable files are skipped; a missing root gives {}."""
+    global _names_cache
+    files = _session_files(root)
+    # A uuid no file names would otherwise re-read every file on each rescan.
+    key = (str(root), None if wanted is None else frozenset(wanted), names_state(root))
+    if _names_cache and _names_cache[0] == key:
+        return dict(_names_cache[1])
+    names = {}
+    for _, _, f in files:
+        try:
+            cfg = json.loads(f.read_text(encoding="utf-8")).get("remoteMcpServersConfig") or []
+        except (OSError, ValueError, AttributeError):
+            continue
+        for s in cfg if isinstance(cfg, list) else []:
+            if isinstance(s, dict) and isinstance(s.get("uuid"), str) and isinstance(s.get("name"), str):
+                names.setdefault(s["uuid"], s["name"])
+        if wanted is not None and wanted <= names.keys():
+            break
+    _names_cache = (key, names)
+    return dict(names)
+
+
 # --- snappy (raw block format) ---------------------------------------------
 
 def _varint(b, i):

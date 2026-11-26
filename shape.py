@@ -14,6 +14,7 @@ Image input is not recorded by ingestion, so it is not a category here.
 """
 
 import json
+import re
 import sqlite3
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -53,6 +54,21 @@ def category(tool_name):
         parts = tool_name.split("__")
         return "connector", (parts[1] if len(parts) > 2 and parts[1] else None)
     return _CATEGORY_OF.get(tool_name), None
+
+
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def is_connector_uuid(server):
+    """claude.ai connectors reach the transcript as mcp__<uuid>__tool; local servers keep their name."""
+    return bool(server) and _UUID.fullmatch(server) is not None
+
+
+def connector_label(server, names=None):
+    """Readable connector server: a known uuid's name, else a generic label; never a guess."""
+    if not is_connector_uuid(server):
+        return server
+    return (names or {}).get(server) or "claude.ai connector"
 
 
 def derive(names):

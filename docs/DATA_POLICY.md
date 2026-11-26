@@ -45,8 +45,9 @@ while the raw opt-in is on. Transcripts themselves are never modified.
 ## Desktop-app cache (opt-in)
 
 Claude Projects thread titles and coordinator spend are read from the claude.ai cache of the
-Claude desktop app (`config.DESKTOP_BLOB_DIR`, read-only). This is off unless
-`WHYTOKENS_DESKTOP_CACHE=1`.
+Claude desktop app (`config.DESKTOP_BLOB_DIR`, read-only), and claude.ai connector names (uuid to
+name only) from its Code-tab session files (`config.desktop_sessions_dir()`, read-only). This is off
+unless `WHYTOKENS_DESKTOP_CACHE=1`; without it a connector shows as "claude.ai connector".
 
 ## Network
 

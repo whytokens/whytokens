@@ -41,8 +41,8 @@ export function shapeCell(d, id) {
   if (!d) return '<td class="muted">…</td>';
   const e = shapeOf(d, id);
   if (!e) return '<td class="muted">–</td>';
-  return `<td class="shp-shape">${esc(shapeLabel(d, e.shape))}` +
-    (e.detail ? ` <span class="muted">${esc(e.detail)}</span>` : '') + '</td>';
+  return `<td class="shp-shape" title="${esc([shapeLabel(d, e.shape), e.detail].filter(Boolean).join(' '))}">${esc(shapeLabel(d, e.shape))}` +
+    (e.detail ? ` <span class="muted"${e.detail_id ? ` title="${esc(e.detail + ' (' + e.detail_id + ')')}"` : ''}>${esc(e.detail)}</span>` : '') + '</td>';
 }
 
 /** Sessions "vs peers" cell; outliers get shp-outlier. */

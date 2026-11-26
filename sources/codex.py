@@ -99,7 +99,10 @@ def open_rollout(filepath):
             yield f
     elif how == "exe":
         proc = subprocess.Popen([_zstd_exe(), "-dc", "--", str(filepath)],
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                # the dashboard runs under pythonw (no console): without this each
+                                # zstd.exe pops its own console window on Windows
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         try:
             yield io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace")
         finally:

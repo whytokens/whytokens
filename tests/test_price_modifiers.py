@@ -265,6 +265,74 @@ class LongPromptTest(PriceModifierTest):
     test_upsert_rewrites_speed_of_a_row_frozen_mid_stream = None
     test_waste_prices_wasted_tokens_at_the_turn_multiplier = None
 
+# Foundry fast deployments carry a -fast model id suffix and may not set usage.speed; they bill
+# at the base model's rates x 2. claude-opus-4-8 ($5 in / $25 out per MTok):
+#   f_id     -FAST id, no speed, 1,000,000 in        $5.00 x 2 = $10.00
+#   f_both   -fast id and speed fast, 100,000 out    $2.50 x 2 = $5.00 (not 4x)
+#   f_std    base id, 1,000,000 in                   $5.00
+FOUNDRY_TOTAL = 20.00
+
+
+def _foundry(mid, model, usage):
+    rec = _record(mid, usage)
+    rec["message"]["model"] = model
+    return rec
+
+
+FOUNDRY_RECORDS = [
+    _foundry("f_id", MODEL + "-FAST", {"input_tokens": 1_000_000}),
+    _foundry("f_both", MODEL + "-fast", {"output_tokens": 100_000, "speed": "fast"}),
+    _foundry("f_std", MODEL, {"input_tokens": 1_000_000}),
+]
+
+
+class FoundryFastIdTest(PriceModifierTest):
+    """Same end-to-end paths as PriceModifierTest, on -fast model ids."""
+    RECORDS, TOTAL = FOUNDRY_RECORDS, FOUNDRY_TOTAL
+
+    def test_python_and_sql_multipliers_agree(self):
+        with contextlib.closing(self.conn()) as c:
+            cols = {r[1] for r in c.execute("PRAGMA table_info(turns)")}
+            for r in c.execute(f"SELECT *, {pricing.price_mult_sql(cols)} AS mult FROM turns"):
+                py = pricing.price_mult(r["speed"], r["inference_geo"], r["model"], 0)
+                self.assertAlmostEqual(r["mult"], py, msg=r["message_id"])
+                self.assertEqual(py, 1.0 if r["message_id"] == "f_std" else 2.0, msg=r["message_id"])
+
+    def test_db_without_speed_column_still_prices_a_fast_id(self):
+        c = sqlite3.connect(":memory:")
+        c.execute("CREATE TABLE turns (model, input_tokens)")
+        c.executemany("INSERT INTO turns VALUES (?, 1000)",
+                      [(MODEL + "-fast",), (MODEL + "-fastest",), ("gpt-5.3-codex-fast",)])
+        mults = [r[0] for r in c.execute(f"SELECT {pricing.price_mult_sql({'model', 'input_tokens'})} FROM turns")]
+        self.assertEqual(mults, [2.0, 1.0, 1.0])
+
+    def test_fast_id_prices_at_its_base_models_row(self):
+        for model in (MODEL + "-fast", MODEL + "-FAST"):
+            self.assertEqual(pricing.match(model), (MODEL, "exact"), model)
+            self.assertEqual(pricing.get_pricing(model), pricing.get_pricing(MODEL))
+        self.assertNotEqual(pricing.match(MODEL + "-fastest")[1], "exact")
+        # the keyword fallback still sees the whole id, and other vendors' -fast ids are not fast mode
+        self.assertEqual(pricing.match("claude-opus-fast"), ("claude-opus-4-8", "keyword"))
+        self.assertEqual(pricing.match("gpt-5.3-codex-fast"), ("gpt-5.3-codex", "prefix"))
+        self.assertEqual(pricing.price_mult("", "", "gpt-5.3-codex-fast"), 1.0)
+
+    def test_repricing_a_fast_id_keeps_it_fast(self):
+        row = {"model": MODEL + "-fast", "input": 1_000_000, "output": 0, "cache_read": 0,
+               "cache_creation": 0, "cache_creation_1h": 0, "timestamp": "2026-09-20T10:00:00Z",
+               "speed": "", "inference_geo": ""}
+        self.assertAlmostEqual(pricing.reprice_turn(row, row["model"]), 10.00, places=4)
+        self.assertAlmostEqual(pricing.reprice_turn(row, "claude-sonnet-5-5"),
+                               2 * pricing.calc_cost("claude-sonnet-5-5", 1_000_000, 0, 0, 0, row["timestamp"]),
+                               places=4)
+
+    # Fast-mode envelope / US-geo specifics don't apply to this fixture.
+    test_db_without_speed_column_still_prices_us = None
+    test_scan_records_speed_and_advisor_is_not_fast = None
+    test_backfill_fills_rows_ingested_before_the_column = None
+    test_upsert_rewrites_speed_of_a_row_frozen_mid_stream = None
+    test_waste_prices_wasted_tokens_at_the_turn_multiplier = None
+
+
 class DatedTierAggregateTest(unittest.TestCase):
     """CLI aggregates must price each turn at ITS date's tier: Sonnet 5.5 cache
     reads were $0.20 through 2026-10-06 and $0.10 from 2026-10-07, so 1M on each
@@ -297,6 +365,37 @@ class DatedTierAggregateTest(unittest.TestCase):
         finally:
             cli.DB_PATH = old
         self.assertIn("Est. total cost:  $0.3000", out.getvalue())
+        self.assertIn("cost=$0.3000", out.getvalue())  # the By Model line prices per day too
+
+
+class FastIdRecognitionTest(unittest.TestCase):
+    """Which ids are Foundry fast deployments: Claude family only, Python and SQL agreeing."""
+    FAST = [MODEL + "-fast", MODEL + "-FAST", MODEL + "-fast[1m]", "anthropic." + MODEL + "-fast",
+            "us.anthropic." + MODEL + "-fast", "azure/" + MODEL + "-fast"]
+    STANDARD = ["gpt-5.3-codex-claude-fast", "gpt-claude-fast", MODEL + "-fastest", MODEL + "-fast\0",
+                "x.anthropic." + MODEL + "-fast", "1x.anthropic." + MODEL + "-fast", "other/gpt-fast", MODEL, MODEL + "[1m]"]
+
+    def sql_mult(self, model):
+        c = sqlite3.connect(":memory:")
+        c.execute("CREATE TABLE turns (model)")
+        c.execute("INSERT INTO turns VALUES (?)", (model,))
+        return c.execute(f"SELECT {pricing.price_mult_sql({'model'})} FROM turns").fetchone()[0]
+
+    def test_only_claude_family_ids_are_fast_in_python_and_sql(self):
+        for m in self.FAST:
+            self.assertEqual((pricing.price_mult("", "", m), self.sql_mult(m)), (2.0, 2.0), m)
+        for m in self.STANDARD:
+            self.assertEqual((pricing.price_mult("", "", m), self.sql_mult(m)), (1.0, 1.0), repr(m))
+
+    def test_context_suffix_does_not_hide_fast_and_base_model_keeps_it(self):
+        self.assertEqual(pricing.base_model(MODEL + "-fast[1m]"), MODEL + "[1m]")
+        self.assertEqual(pricing.base_model(MODEL + "-FAST"), MODEL)
+        self.assertEqual(pricing.base_model("gpt-5.3-codex-claude-fast"), "gpt-5.3-codex-claude-fast")
+
+    def test_nul_in_id_is_never_fast_in_python_or_sql(self):
+        m = MODEL + "\0x-fast"
+        self.assertEqual((pricing.price_mult("", "", m), self.sql_mult(m)), (1.0, 1.0))
+
 
 if __name__ == "__main__":
     unittest.main()

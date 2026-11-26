@@ -1889,11 +1889,11 @@ function renderSessionsTable(sessions) {
     // Level 1 is eight columns; token counts, cache share and vs peers sit in the row's detail (sessionTotalsRowHTML).
     const sessLabel = llm ? llm.labelHTML(llm.llmState.labels[s.full_session_id]) : '';
     return `<tr class="session-row" data-session-row="${esc(s.full_session_id)}" data-session-day="${esc(s.last_date || '')}">
-      <td class="session-topic"><button class="row-toggle" type="button" aria-expanded="false" data-breakdown="${esc(s.full_session_id)}" title="Tokens, cache share and who spent this session: main thread vs each subagent">&#9656;</button><button class="link-btn session-title${s.topic ? '' : ' muted'}" data-session="${esc(s.full_session_id)}" onclick="openSessionDetail(this.dataset.session)" title="Open trace">${esc(s.topic || 'Untitled')}</button>${sessLabel}
+      <td class="session-topic"><div class="session-head"><button class="row-toggle" type="button" aria-expanded="false" data-breakdown="${esc(s.full_session_id)}" title="Tokens, cache share and who spent this session: main thread vs each subagent">&#9656;</button><button class="link-btn session-title${s.topic ? '' : ' muted'}" data-session="${esc(s.full_session_id)}" onclick="openSessionDetail(this.dataset.session)" title="Open trace">${esc(s.topic || 'Untitled')}</button>${sessLabel}</div>
         <div class="session-sub muted" title="${esc(s.project)}">${esc(s.project)} · <span class="session-id">${esc(s.session_id)}&hellip;</span></div></td>
       <td class="muted">${esc(fmtLocalDateTime(s.last_ts, displayTZ) || s.last)}</td>
       <td class="muted">${esc(s.duration_min)}m</td>
-      <td><span class="model-tag">${esc(s.model)}</span></td>
+      <td title="${esc(s.model)}"><span class="model-tag">${esc(s.model)}</span></td>
       <td class="num">${s.turns}</td>
       ${cell}
       ${ccCell(s)}
@@ -2251,7 +2251,8 @@ function renderSessionDetail(d) {
   const cold = coldRestarts(d.turns);
   document.getElementById('trace-empty').classList.add('hidden');
   document.getElementById('session-detail-view').classList.remove('hidden');
-  document.getElementById('session-detail-title').textContent = 'Session Drilldown — ' + s.display_id + '…';
+  const titleEl = document.getElementById('session-detail-title');
+  titleEl.textContent = titleEl.title = s.topic || 'Untitled';
   document.getElementById('session-detail-subtitle').textContent = [s.session_id, s.project, s.model].filter(Boolean).join(' · ');
   renderTraceWhatif(d);
   loadShapes().then(p => { if (selectedSessionDetail === d) document.getElementById('session-detail-shape').innerHTML = traceLineHtml(p, s.session_id); });
@@ -3006,6 +3007,9 @@ async function triggerRescan() {
   if (btn.disabled) return; // a scan (manual or auto) is already running
   btn.disabled = true;
   btn.textContent = '↻ Scanning...';
+  // The POST waits for the whole scan; check status once it has started so the banner
+  // picks the scan up (it then polls itself). Skip if a poll loop is already running.
+  setTimeout(() => { if (!scanning) refreshStatus(); }, 500);
   try {
     const d = await postRescan();
     btn.textContent = d.error ? '↻ Rescan (error)'

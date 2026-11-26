@@ -376,10 +376,11 @@ def _rebuild_reason(turn, prev):
         return "expected", f"idle {gap.total_seconds() / 60:.0f} min, past the {prev['ttl'] // 60} min cache TTL"
     if turn["is_compact_summary"] or prev["compact"]:
         return "expected", "context compaction"
-    if turn["model"] != prev["model"]:
+    if pricing.base_model(turn["model"]) != pricing.base_model(prev["model"]):
         return "expected", f"model switch ({prev['model']} to {turn['model']})"
     # Requests at different speeds share no cached prefix, so turning fast mode on or off rewrites it.
-    was_fast, is_fast = prev.get("speed") == "fast", "speed" in turn.keys() and turn["speed"] == "fast"
+    was_fast = pricing.is_fast(prev.get("speed"), prev["model"])
+    is_fast = pricing.is_fast(turn["speed"] if "speed" in turn.keys() else None, turn["model"])
     if was_fast != is_fast:
         return "expected", f"speed switch ({'fast' if was_fast else 'standard'} to {'fast' if is_fast else 'standard'})"
     return "unexpected", (f"read {read:,} of {prefix:,} cached tokens inside the TTL with no compaction, model or speed switch: "

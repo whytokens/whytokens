@@ -73,6 +73,16 @@ class TestZstDecoders(unittest.TestCase):
         self.assertEqual([t["message_id"] for t in got[1]], [t["message_id"] for t in want[1]])
         self.assertEqual(got[2], want[2])
 
+    def test_exe_runs_without_a_console_window(self):
+        _, d = _home("rollout-a.jsonl.zst")
+        p = _exe_decoder()
+        with p[0], p[1], p[2] as popen:
+            parse_file(str(d / "rollout-a.jsonl.zst"))
+        self.assertEqual(popen.call_args.kwargs.get("creationflags"),
+                         getattr(codex.subprocess, "CREATE_NO_WINDOW", 0))
+        if os.name == "nt":
+            self.assertNotEqual(popen.call_args.kwargs["creationflags"], 0)
+
     def test_exe_nonzero_exit_raises(self):
         _, d = _home("rollout-a.jsonl.zst")
         with mock.patch.object(codex, "zst_decoder", return_value="exe"), \

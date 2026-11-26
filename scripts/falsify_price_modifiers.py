@@ -1,4 +1,4 @@
-"""Guard the guard: break each fast-mode / US-geo / Haiku 5.5 long-prompt pricing rule in a temp copy of
+"""Guard the guard: break each fast-mode (speed or -fast id) / US-geo / Haiku 5.5 long-prompt pricing rule in a temp copy of
 the repo and confirm tests/test_price_modifiers.py (or the module a mutant names) goes red for every one.
 
     python scripts/falsify_price_modifiers.py
@@ -15,9 +15,9 @@ ROOT = Path(__file__).resolve().parent.parent
 MUTANTS = [
     ("pricing.py", "THEN 2.0 ELSE 1.0 END\" if", "THEN 1.0 ELSE 1.0 END\" if"),
     ("pricing.py", "THEN 1.1 ELSE 1.0 END\"", "THEN 1.0 ELSE 1.0 END\""),
-    ("pricing.py", "(2.0 if speed", "(1.0 if speed"),
+    ("pricing.py", "(2.0 if is_fast(speed", "(1.0 if is_fast(speed"),
     ("pricing.py", "(1.1 if inference_geo", "(1.0 if inference_geo"),
-    ("pricing.py", "if \"speed\" in cols else \"1.0\"", "if \"speed\" in cols else \"speed\""),
+    ("pricing.py", "if \"speed\" in cols else []", "if \"speed\" in cols else [\"speed\"]"),
     ("pricing.py", "    return x if any(x.values()) else None", "    return None"),
     ("scanner.py", '"speed": usage.get("speed", "") or "",', '"speed": "",'),
     ("scanner.py", '                            speed="",\n', ""),
@@ -28,7 +28,7 @@ MUTANTS = [
     ("api.py", "                pricing.surcharge_cost(r[\"model\"], r, r[\"rate_day\"]))", "                0)"),
     ("cli.py", "            surcharge_cost(r[\"model\"], r, timestamp))", "            0)"),
     ("waste.py", "row[\"timestamp\"], h1) * row[\"mult\"]", "row[\"timestamp\"], h1)"),
-    ("static/modules/pricing.js", "  if (!x) return c;", "  return c;"),
+    ("static/modules/pricing.js", "  if (!x) return withFee(c, r);", "  return withFee(c, r);"),
     # Haiku 5.5 long prompts (5x over 100K)
     ("pricing.py", "THEN {LONG_PROMPT_MULT} ELSE 1.0 END\"", "THEN 1.0 ELSE 1.0 END\""),
     ("pricing.py", "f\" > {LONG_PROMPT_TOKENS}", "f\" >= {LONG_PROMPT_TOKENS}"),
@@ -37,6 +37,36 @@ MUTANTS = [
     ("pricing.py", " + {t}cache_creation_tokens\"", "\""),
     ("api.py", "+ t.get(\"cache_creation_tokens\", 0)) for t in turns)", "+ 0) for t in turns)"),
     ("pricing.py", "if set(LONG_PROMPT_COLS) <= set(cols) else", "if False else"),
+    # Foundry -fast model ids: fast mode at the base model's rates, in Python, SQL, repricing and waste
+    ("pricing.py", "speed == \"fast\" or _fast_id(model)", "speed == \"fast\""),
+    ("pricing.py", "m = _strip_context((model or \"\").lower())[0]", "m = _strip_context(model or \"\")[0]"),
+    ("pricing.py", "m = _strip_context((model or \"\").lower())[0]", "m = (model or \"\").lower()"),
+    ("pricing.py", " and bool(_CLAUDE_ID.match(m))", ""),
+    ("pricing.py", "return \"\\0\" not in m and", "return"),
+    ("pricing.py", "(?:.*/)?(?:(?:[a-z]{2}\\.)?anthropic\\.)?claude-\"", ".*claude-\""),
+    ("pricing.py", "(?:.*/)?(?:(?:[a-z]{2}\\.)?anthropic\\.)?claude-\"", "claude-\""),
+    ("pricing.py", "(?:(?:[a-z]{2}\\.)?anthropic\\.)?claude-\"", "(?:anthropic\\.)?claude-\""),
+    ("pricing.py", " AND ({globs})", ""),
+    ("pricing.py", " AND instr({t}model, char(0)) = 0", ""),
+    ("pricing.py", "for s in (\"\",) + CONTEXT_SUFFIXES)", "for s in (\"\",))"),
+    ("pricing.py", "for ns in (\"\", \"*/\")", "for ns in (\"\",)"),
+    ("pricing.py", "\"[a-z][a-z].anthropic.\"", "\"??.anthropic.\""),
+    ("pricing.py", "return model[:len(stem) - len(FAST_SUFFIX)] + model[len(stem):]", "return model[:len(stem) - len(FAST_SUFFIX)]"),
+    ("pricing.py", "fast_when.append(f\"((", "fast_when.append(\"0\" or f\"(("),
+    # reconciliation: the fast premium dropped, or applied to the web-search fee too
+    ("cost_state.py", "pricing.price_mult(\"\", \"\", model)\n          * pricing.calc_cost(", "1.0 * pricing.calc_cost(", "tests.test_cost_state"),
+    ("cost_state.py", "    re = (pricing.price_mult(\"\", \"\", model)\n          * pricing.calc_cost(model, n(\"inputTokens\"), n(\"outputTokens\"), n(\"cacheReadInputTokens\"),\n                              n(\"cacheCreationInputTokens\"), day,\n                              cache_creation_1h=n(\"cacheCreationEphemeral1hInputTokens\"))\n          + n(\"webSearchRequests\") * pricing.WEB_SEARCH_FEE_USD)",
+     "    re = pricing.price_mult(\"\", \"\", model) * (pricing.calc_cost(model, n(\"inputTokens\"), n(\"outputTokens\"), n(\"cacheReadInputTokens\"),\n                              n(\"cacheCreationInputTokens\"), day,\n                              cache_creation_1h=n(\"cacheCreationEphemeral1hInputTokens\"))\n          + n(\"webSearchRequests\") * pricing.WEB_SEARCH_FEE_USD)", "tests.test_cost_state"),
+    ("pricing.py", "{' OR '.join(fast_when)}", "{' AND '.join(fast_when)}"),
+    ("pricing.py", "    if base in PRICING:", "    base = model\n    if base in PRICING:"),
+    ("pricing.py", "    m = model.lower()\n    for words", "    m = base.lower()\n    for words"),
+    ("pricing.py", "speed = \"fast\" if is_fast(row.get(\"speed\"), row.get(\"model\")) else row.get(\"speed\")",
+     "speed = row.get(\"speed\")"),
+    ("waste.py", "if pricing.base_model(turn[\"model\"]) != pricing.base_model(prev[\"model\"]):",
+     "if turn[\"model\"] != prev[\"model\"]:", "tests.test_cache_miss"),
+    ("waste.py", "pricing.is_fast(prev.get(\"speed\"), prev[\"model\"])", "prev.get(\"speed\") == \"fast\"",
+     "tests.test_cache_miss"),
+    ("waste.py", "else None, turn[\"model\"])", "else None, \"\")", "tests.test_cache_miss"),
     # Dated tiers resolve per turn day in CLI aggregates (Sonnet 5.5 cache-read cut)
     ("cli.py", "    costs = dated_costs(conn)\n", "    costs = {r[\"model\"]: row_cost(r) for r in by_model}\n"),
     ("pricing.py", "(LONG_PROMPT_MULT if long_prompt else 1.0)", "1.0"),

@@ -91,6 +91,29 @@ class DeriveTests(unittest.TestCase):
         self.assertEqual(shape.derive(calls(mcp__slack__post=4, mcp__drive__get=2, Read=1)), ("connector", "slack"))
         self.assertEqual(shape.derive(calls(Edit=6, Read=1)), ("edit", None))
 
+    def test_connector_uuid_gets_a_readable_label(self):
+        uid = "1a94f017-80ef-437a-acea-51927abc5b59"
+        self.assertEqual(shape.connector_label(uid), "claude.ai connector")
+        self.assertEqual(shape.connector_label(uid, {uid: "Robinhood"}), "Robinhood")
+        self.assertEqual(shape.connector_label("ebay", {"ebay": "nope"}), "ebay")  # named server unchanged
+        self.assertIsNone(shape.connector_label(None))
+
+    def test_connector_names_from_desktop_session_files(self):
+        import os
+        import project_threads
+        uid = "1a94f017-80ef-437a-acea-51927abc5b59"
+        with tempfile.TemporaryDirectory() as root:
+            d = Path(root, "acct", "org")
+            d.mkdir(parents=True)
+            old, new = d / "local_a.json", d / "local_b.json"
+            old.write_text(json.dumps({"remoteMcpServersConfig": [{"uuid": uid, "name": "Old name"}]}), encoding="utf-8")
+            new.write_text(json.dumps({"remoteMcpServersConfig": [{"uuid": uid, "name": "Robinhood"}, {"uuid": "x"}]}), encoding="utf-8")
+            (d / "local_c.json").write_text("{not json", encoding="utf-8")
+            os.utime(old, (1, 1))
+            self.assertEqual(project_threads.connector_names(root), {uid: "Robinhood"})
+            self.assertEqual(project_threads.connector_names(root, {uid}), {uid: "Robinhood"})  # stops at the newest file
+        self.assertEqual(project_threads.connector_names(Path(root, "gone")), {})
+
     def test_threshold_edge(self):
         at = calls(Edit=4, Read=3, Bash=3)        # 4 of 10 = 40%: passes
         below = calls(Edit=4, Read=3, Bash=3) + calls(Grep=1)  # 4 of 11 = 36%: mixed
@@ -465,6 +488,18 @@ console.log(JSON.stringify(['a', 'b', 'c'].filter(keep)));
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(json.loads(out.stdout), ["a", "c"])
 
+
+    def test_a_clipped_connector_name_hovers_as_its_name_not_the_bare_uuid(self):
+        import subprocess
+        url = (Path(__file__).resolve().parent.parent / "static" / "modules" / "shapes.js").as_uri()
+        out = subprocess.run([__import__("shutil").which("node"), "--input-type=module", "-e", f"""
+globalThis.document = {{ createElement: () => ({{ set textContent(v) {{ this.innerHTML = v.replace(/&/g, '&amp;').replace(/</g, '&lt;'); }} }}) }};
+const {{ shapeCell }} = await import('{url}');
+const d = {{ labels: {{ connector: 'connector' }}, sessions: {{ s: {{ shape: 'connector', detail: 'Robinhood Legend', detail_id: 'u-1' }} }} }};
+console.log(shapeCell(d, 's'));
+"""], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn('<span class="muted" title="Robinhood Legend (u-1)">Robinhood Legend</span>', out.stdout)
 
 
 class TestTagDbPathIsNotParsedAsAUri(unittest.TestCase):

@@ -170,11 +170,12 @@ def match(model):
     model released after this table was written lands there (see fallbacks_in_db)."""
     if not model:
         return None, None
-    if model in PRICING:
-        return model, "exact"
+    base = base_model(model)
+    if base in PRICING:
+        return base, "exact"
     for key in PRICING:
-        if model.startswith(key) and not _splits_number(key, model, 0):
-            return key, "exact" if _DATED.fullmatch(model[len(key):]) else "prefix"
+        if base.startswith(key) and not _splits_number(key, base, 0):
+            return key, "exact" if _DATED.fullmatch(base[len(key):]) else "prefix"
     # Substring fallback: match model family by keyword. Deliberately narrow —
     # non-priced providers (gpt-4o, glm-*, local models like qwen*) must stay
     # unmatched so they cost $0 rather than being mispriced.
@@ -183,6 +184,39 @@ def match(model):
         if any(_contains(m, w) for w in words):
             return ("gpt-5.4-mini" if key == "gpt-5.4" and "mini" in m else key), "keyword"
     return None, None
+
+
+FAST_SUFFIX = "-fast"  # Foundry names the fast-mode deployment of a Claude model <id>-fast
+
+
+CONTEXT_SUFFIXES = ("[1m]",)  # Claude Code's context-window tag on a model id; same model and rates
+# A Claude id: optional "<anything>/" namespace (azure/, vertex_ai/), optional "[xx.]anthropic." provider
+# (see pricing_check.canonical), then the claude- family. price_mult_sql spells the same rule as GLOBs.
+_CLAUDE_ID = re.compile(r"(?:.*/)?(?:(?:[a-z]{2}\.)?anthropic\.)?claude-", re.DOTALL)
+_CLAUDE_GLOBS = tuple(f"{ns}{prov}claude-*" for ns in ("", "*/")
+                      for prov in ("", "anthropic.", "[a-z][a-z].anthropic."))
+
+
+def _strip_context(m):
+    for s in CONTEXT_SUFFIXES:
+        if m.endswith(s):
+            return m[:-len(s)], m[-len(s):]
+    return m, ""
+
+
+def _fast_id(model):
+    m = _strip_context((model or "").lower())[0]
+    # Claude family only: other vendors' -fast ids (even ones mentioning claude) are other models
+    return "\0" not in m and m.endswith(FAST_SUFFIX) and bool(_CLAUDE_ID.match(m))
+
+
+def base_model(model):
+    """The model id without a Foundry fast-mode suffix: it bills at its base model's rates
+    (times the fast multiplier, see is_fast)."""
+    if not _fast_id(model):
+        return model or ""
+    stem = _strip_context(model.lower())[0]
+    return model[:len(stem) - len(FAST_SUFFIX)] + model[len(stem):]
 
 
 def _splits_number(word, s, at):
@@ -291,9 +325,9 @@ def calc_cost(model, inp, out, cache_read, cache_creation, timestamp=None,
 
 
 # Per-turn price multiplier, applied to every token class: fast mode bills 2x
-# (usage.speed == "fast") and US-only inference 1.1x (usage.inference_geo ==
+# (usage.speed == "fast", or a Foundry model id ending in -fast) and US-only inference 1.1x (usage.inference_geo ==
 # "us"); the two stack (platform.claude.com/docs/en/about-claude/pricing,
-# 2026-09-24). Codex rows carry neither, so they stay at 1x. Cost is linear in
+# 2026-09-24). Codex rows carry neither (the -fast rule is Claude ids only), so they stay at 1x. Cost is linear in
 # tokens, so aggregates carry the premium as extra tokens, SUM(tokens * (mult - 1)),
 # priced at the row's normal rates -- exact even with rates edited in the dashboard.
 #
@@ -345,12 +379,17 @@ SURCHARGE_COLS = (("input_tokens", "input"), ("output_tokens", "output"),
                   ("cache_creation_1h_tokens", "cache_creation_1h"))
 
 
+def is_fast(speed, model=""):
+    """Fast mode: the envelope says so, or the model id carries Foundry's -fast suffix."""
+    return speed == "fast" or _fast_id(model)
+
+
 def price_mult(speed, inference_geo, model="", prompt_tokens=0):
     """One turn's multiplier in Python (per-turn paths with no SQL); must agree
     with price_mult_sql. ``prompt_tokens`` = input + cache_read + cache_creation."""
     long_prompt = (LONG_PROMPT_MODEL in (model or "").lower()
                    and prompt_tokens > LONG_PROMPT_TOKENS)
-    return ((2.0 if speed == "fast" else 1.0) * (1.1 if inference_geo == "us" else 1.0)
+    return ((2.0 if is_fast(speed, model) else 1.0) * (1.1 if inference_geo == "us" else 1.0)
             * (LONG_PROMPT_MULT if long_prompt else 1.0))
 
 
@@ -358,7 +397,13 @@ def price_mult_sql(cols, t=""):
     """SQL for one turn's multiplier. ``cols`` is the turns table's column set: a
     DB that predates turns.speed still prices US-only rows (geo-only multiplier)
     rather than erroring. ``t`` is an optional table-alias prefix like 't.'."""
-    fast = f"CASE WHEN {t}speed = 'fast' THEN 2.0 ELSE 1.0 END" if "speed" in cols else "1.0"
+    fast_when = [f"{t}speed = 'fast'"] if "speed" in cols else []
+    if "model" in cols:  # LIKE is ASCII case-insensitive, like is_fast's .lower()
+        lm = f"lower({t}model)"  # ASCII lower, like _fast_id's; LIKE/GLOB stop at a NUL, hence the instr
+        stems = " OR ".join(f"{lm} LIKE '%{FAST_SUFFIX}{s}'" for s in ("",) + CONTEXT_SUFFIXES)
+        globs = " OR ".join(f"{lm} GLOB '{g}'" for g in _CLAUDE_GLOBS)
+        fast_when.append(f"(({stems}) AND ({globs}) AND instr({t}model, char(0)) = 0)")
+    fast = f"CASE WHEN {' OR '.join(fast_when)} THEN 2.0 ELSE 1.0 END" if fast_when else "1.0"
     geo = (f"CASE WHEN {t}inference_geo = 'us' THEN 1.1 ELSE 1.0 END"
            if "inference_geo" in cols else "1.0")
     # LIKE is case-insensitive for ASCII in SQLite, matching .lower() above.
@@ -435,6 +480,7 @@ def reprice_turn(row, to_model):
     mode, US-only inference and the long-prompt tier survive repricing. Repricing a
     turn onto its own model equals its recorded cost."""
     prompt = (row["input"] or 0) + (row["cache_read"] or 0) + (row["cache_creation"] or 0)
-    return price_mult(row.get("speed"), row.get("inference_geo"), to_model, prompt) * calc_cost(
+    speed = "fast" if is_fast(row.get("speed"), row.get("model")) else row.get("speed")  # a -fast id stays fast on any target
+    return price_mult(speed, row.get("inference_geo"), to_model, prompt) * calc_cost(
         to_model, row["input"] or 0, row["output"] or 0, row["cache_read"] or 0,
         row["cache_creation"] or 0, row.get("timestamp"), cache_creation_1h=row["cache_creation_1h"] or 0)

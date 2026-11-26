@@ -272,6 +272,18 @@ class TestIngest(Base):
         conn.close()
 
 
+class TestFastLabel(unittest.TestCase):
+    def test_fast_id_at_the_fast_premium_is_clean_and_web_search_is_not_doubled(self):
+        u = {"inputTokens": 1_000_000, "cacheCreationEphemeral1hInputTokens": 0, "webSearchRequests": 1000}
+        base = pricing.calc_cost("claude-opus-4-8", 1_000_000, 0, 0, 0, "2026-09-20")
+        fee = 1000 * pricing.WEB_SEARCH_FEE_USD
+        u["costUSD"] = 2 * base + fee
+        self.assertEqual(cost_state.label("claude-opus-4-8-fast", u, "2026-09-20"), "clean")
+        self.assertEqual(cost_state.label("claude-opus-4-8", u, "2026-09-20"), "priced_differently")
+        u["costUSD"] = 2 * (base + fee)
+        self.assertEqual(cost_state.label("claude-opus-4-8-fast", u, "2026-09-20"), "priced_differently")
+
+
 class TestCompare(Base):
     def test_bracket_suffix_joins_the_base_model(self):
         self.write(_prompt(), _asst("m1", 1000), _cs({MODEL + "[1m]": _usage(1000)}))

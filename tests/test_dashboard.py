@@ -165,6 +165,7 @@ class TestGetDashboardData(unittest.TestCase):
         data = get_session_detail("sess-abc123", db_path=self.db_path)
         self.assertEqual(data["session"]["session_id"], "sess-abc123")
         self.assertEqual(data["session"]["cache_read"], 500)
+        self.assertIn("topic", data["session"])
         self.assertEqual(len(data["turns"]), 2)
         self.assertEqual(data["turns"][0]["input"], 500)
 

@@ -39,6 +39,11 @@ FIXTURES = {
     "fast_off": _session("fast_off", [(3, 20_000, 400, {"speed": "fast"}), (6, 0, 20_400, {"speed": "standard"})]),
     # fast all the way through and then a miss: the speed did not change, so it is still unexplained
     "fast_miss": _session("fast_miss", [(3, 20_000, 400, {"speed": "fast"}), (6, 0, 20_400, {"speed": "fast"})]),
+    # Foundry names the fast deployment <model>-fast: switching to it is a speed switch, not a model switch,
+    # and staying on it through a miss is still unexplained
+    "foundry_on": _session("foundry_on", [(3, 20_000, 400, {}), (6, 0, 20_400, {"model": MODEL + "-fast"})]),
+    "foundry_miss": _session("foundry_miss", [(3, 20_000, 400, {"model": MODEL + "-fast"}),
+                                              (6, 0, 20_400, {"model": MODEL + "-fast"})]),
     # 45 min gap: idle_gap owns it, so no second claim
     "idle": _session("idle", [(3, 20_000, 400, {}), (48, 0, 20_400, {})]),
 }
@@ -80,7 +85,8 @@ class TestCacheMissRebuild(unittest.TestCase):
     def test_expected_rebuilds_are_reported_not_waste(self):
         for sid, why in (("compact", "compaction"), ("switch", "model switch"),
                          ("fast_on", "speed switch (standard to fast)"),
-                         ("fast_off", "speed switch (fast to standard)")):
+                         ("fast_off", "speed switch (fast to standard)"),
+                         ("foundry_on", "speed switch (standard to fast)")):
             with self.subTest(sid):
                 causes, rebuilds = self._run(sid)
                 self.assertNotIn("cache_miss_rebuild", causes)
@@ -90,9 +96,11 @@ class TestCacheMissRebuild(unittest.TestCase):
                 self.assertGreater(rebuilds[0]["usd"], 0)
 
     def test_a_miss_at_an_unchanged_speed_is_still_waste(self):
-        causes, rebuilds = self._run("fast_miss")
-        self.assertIn("cache_miss_rebuild", causes)
-        self.assertEqual(rebuilds, [])
+        for sid in ("fast_miss", "foundry_miss"):
+            with self.subTest(sid):
+                causes, rebuilds = self._run(sid)
+                self.assertIn("cache_miss_rebuild", causes)
+                self.assertEqual(rebuilds, [])
 
     def test_gap_past_the_ttl_is_idle_gap_not_a_rebuild(self):
         causes, rebuilds = self._run("ttl")

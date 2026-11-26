@@ -639,7 +639,7 @@ def get_session_detail(session_id, db_path=None):
             session_id, project_name, first_timestamp, last_timestamp,
             total_input_tokens, total_output_tokens,
             total_cache_read, total_cache_creation, model, turn_count,
-            git_branch
+            git_branch, topic
         FROM sessions
         WHERE session_id = ?
     """, (session_id,)).fetchone()
@@ -718,6 +718,7 @@ def get_session_detail(session_id, db_path=None):
         "session": {
             "session_id":       session["session_id"],
             "display_id":       session["session_id"][:8],
+            "topic":            session["topic"] or "",
             "project":          session["project_name"] or "unknown",
             "branch":           session["git_branch"] or "",
             "first":            (session["first_timestamp"] or "")[:16].replace("T", " "),
@@ -943,16 +944,27 @@ def get_shapes(db_path=None):
         return {**base, "rows": [], "sessions": {}, "outliers": 0}
     # ponytail: single-entry cache keyed on DB state, like the waste payload; tags are read fresh above.
     global _shapes_cache
-    key = _db_state_key(db_path)
+    sessions_dir = config.desktop_sessions_dir()  # None unless opted in
+    if sessions_dir:
+        import project_threads
+    # the connector names come from the desktop session files, which change without the DB doing so
+    key = (_db_state_key(db_path), sessions_dir, project_threads.names_state(sessions_dir) if sessions_dir else None)
     if _shapes_cache and _shapes_cache[0] == key:
         return {**base, **_shapes_cache[1]}
     rows = shape.session_rows(db_path)
     peers = shape.peers(rows)
+    names = None
+    uuids = {r["detail"] for r in rows if shape.is_connector_uuid(r["detail"])}
+    if uuids and sessions_dir:
+        names = project_threads.connector_names(sessions_dir, uuids)
     sessions = {}
     for r in rows:
         p = peers.get(r["session_id"], {})
-        sessions[r["session_id"]] = {"shape": r["shape"], "detail": r["detail"], "x": p.get("x"), "basis": p.get("basis"),
+        sessions[r["session_id"]] = {"shape": r["shape"], "detail": shape.connector_label(r["detail"], names),
+                                     "x": p.get("x"), "basis": p.get("basis"),
                                      "n": p.get("n"), "median": p.get("median")}
+        if shape.is_connector_uuid(r["detail"]):
+            sessions[r["session_id"]]["detail_id"] = r["detail"]
     body = {"rows": shape.breakdown(rows, get_waste(db_path)["findings"]), "sessions": sessions,
             "outliers": sum(1 for p in peers.values() if shape.is_outlier(p["x"]))}
     _shapes_cache = (key, body)

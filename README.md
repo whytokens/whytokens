@@ -34,12 +34,12 @@ Requires Python 3.11 or newer. No third-party dependencies.
 
 ```sh
 # one-off, no install
-uvx --from git+https://github.com/whytokens/whytokens@v0.5.0 whytokens dashboard
+uvx --from git+https://github.com/whytokens/whytokens@v0.5.1 whytokens dashboard
 
 # or install the command
-pipx install git+https://github.com/whytokens/whytokens@v0.5.0
+pipx install git+https://github.com/whytokens/whytokens@v0.5.1
 # or, with uv
-uv tool install git+https://github.com/whytokens/whytokens@v0.5.0
+uv tool install git+https://github.com/whytokens/whytokens@v0.5.1
 whytokens dashboard
 
 # or from a clone

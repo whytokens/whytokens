@@ -487,7 +487,7 @@ class TestFallbackSignal(unittest.TestCase):
                 # a dated snapshot of a listed model is that model, not a guess
                 ("claude-haiku-4-5-20251001", ("claude-haiku-4-5", "exact")),
                 ("claude-fable-5-3", ("claude-fable-5", "prefix")),
-                ("claude-fable-5-2-fast", ("claude-fable-5-2", "prefix")),
+                ("claude-fable-5-2-fast", ("claude-fable-5-2", "exact")),  # Foundry fast id: base row, x2 elsewhere
                 ("claude-sonnet-6", ("claude-sonnet-4-6", "keyword")),
                 ("new-opus-9", ("claude-opus-4-8", "keyword")),
                 ("gpt-5.9-mini", ("gpt-5.4-mini", "keyword")),

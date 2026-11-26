@@ -64,10 +64,19 @@ def desktop_cache_dir():
     """The desktop-app cache dir, or None unless the user opted in.
 
     Reading another app's private cache is opt-in: set
-    WHYTOKENS_DESKTOP_CACHE=1. Scope when on: only ``DESKTOP_BLOB_DIR``, read-only.
+    WHYTOKENS_DESKTOP_CACHE=1. Scope when on: ``DESKTOP_BLOB_DIR`` and the connector names in
+    ``desktop_sessions_dir()``, read-only.
     """
     on = os.environ.get("WHYTOKENS_DESKTOP_CACHE", "").strip().lower() in ("1", "true", "yes", "on")
     return DESKTOP_BLOB_DIR if on else None
+
+
+def desktop_sessions_dir():
+    """The same app's Code-tab session files (the only local uuid-to-name map for claude.ai
+    connectors), or None unless the user opted in. Derived at call time so a patched
+    ``DESKTOP_BLOB_DIR`` moves it too."""
+    blob = desktop_cache_dir()
+    return blob.parent.parent / "claude-code-sessions" if blob else None
 
 
 def claude_projects_dirs(base):
